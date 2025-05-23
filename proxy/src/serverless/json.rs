@@ -84,7 +84,7 @@ impl OutputMode<'_> {
     fn key(&mut self, key: &str) -> ValueSer<'_> {
         match self {
             OutputMode::Array(values) => values.entry(),
-            OutputMode::Object(map) => map.entry(key),
+            OutputMode::Object(map) => map.key(key),
         }
     }
 
@@ -117,9 +117,9 @@ pub(crate) fn pg_text_row_to_json(
         let value = entries.key(column.name());
 
         match pg_value {
-            Some(v) if raw_output => value.str(v),
+            Some(v) if raw_output => value.value(v),
             Some(v) => pg_text_to_json(value, v, column.type_())?,
-            None => value.null(),
+            None => value.value(json::RawValue::NULL),
         }
     }
 
@@ -135,31 +135,30 @@ fn pg_text_to_json(output: ValueSer, val: &str, pg_type: &Type) -> Result<(), Js
         // todo: we should fetch this from postgres.
         let delimiter = ',';
 
-        let mut array = output.list();
-        pg_array_parse(&mut array, val, elem_type, delimiter)?;
-        array.finish();
+        json::value_as_list!(|output| pg_array_parse(output, val, elem_type, delimiter)?);
         return Ok(());
     }
 
     match *pg_type {
-        Type::BOOL => output.bool(val == "t"),
+        Type::BOOL => output.value(val == "t"),
         Type::INT2 | Type::INT4 => {
             let val = val.parse::<i32>()?;
-            output.int(val);
+            output.value(val);
         }
         Type::FLOAT4 | Type::FLOAT8 => {
             let fval = val.parse::<f64>()?;
             if fval.is_finite() {
-                output.float(fval);
+                output.value(fval);
             } else {
                 // Pass Nan, Inf, -Inf as strings
                 // JS JSON.stringify() does converts them to null, but we
                 // want to preserve them, so we pass them as strings
-                output.str(val);
+                output.value(val);
             }
         }
-        Type::JSON | Type::JSONB => output.raw(RawValue::new_unchecked(val.as_bytes())),
-        _ => output.str(val),
+        // we assume that the string value is valid json.
+        Type::JSON | Type::JSONB => output.value(RawValue::new_unchecked(val.as_bytes())),
+        _ => output.value(val),
     }
 
     Ok(())
@@ -269,9 +268,8 @@ fn pg_array_parse_item<'a>(
 
     if pg_array.strip_prefix('{').is_some() {
         // nested array.
-        let mut nested = output.list();
-        pg_array = pg_array_parse_inner(&mut nested, pg_array, elem, delim)?;
-        nested.finish();
+        pg_array =
+            json::value_as_list!(|output| pg_array_parse_inner(output, pg_array, elem, delim))?;
         return Ok(pg_array);
     }
 
@@ -300,7 +298,7 @@ fn pg_array_parse_item<'a>(
     // we might have an item string:
     // check for null
     if item == "NULL" {
-        output.null();
+        output.value(RawValue::NULL);
     } else {
         pg_text_to_json(output, item, elem)?;
     }

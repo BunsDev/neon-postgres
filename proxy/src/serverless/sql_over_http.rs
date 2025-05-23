@@ -993,41 +993,40 @@ impl BatchQueryData {
             }
         };
 
-        let mut json_output = vec![];
-        let mut obj = ValueSer::new(&mut json_output).object();
-        let mut results = obj.entry("results").list();
+        let result = 'result: {
+            let json = json::value_to_string!(|val| json::value_as_object!(|val| {
+                let results = val.key("results");
+                json::value_as_list!(|results| {
+                    for stmt in self.queries {
+                        let query = pin!(query_to_json(
+                            config,
+                            &mut transaction,
+                            stmt,
+                            results.entry(),
+                            parsed_headers,
+                        ));
 
-        let mut stmts = self.queries.into_iter();
-        let result = 'tx: loop {
-            let Some(stmt) = stmts.next() else {
-                results.finish();
-                obj.finish();
+                        match select(query, pin!(cancel.cancelled())).await {
+                            // TODO: maybe we should check that the transaction bit is set here
+                            Either::Left((Ok(_), _cancelled)) => {}
+                            Either::Left((Err(e), _cancelled)) => break 'result Err(e),
+                            Either::Right((_cancelled, _)) => {
+                                if let Err(err) = cancel_token.cancel_query(NoTls).await {
+                                    tracing::warn!(?err, "could not cancel query");
+                                }
+                                // TODO: after cancelling, wait to see if we can get a status. maybe the connection is still safe.
+                                discard.discard();
 
-                break 'tx Ok(String::from_utf8(json_output).expect("json is valid utf8"));
-            };
-
-            let query = pin!(query_to_json(
-                config,
-                &mut transaction,
-                stmt,
-                results.entry(),
-                parsed_headers,
-            ));
-
-            match select(query, pin!(cancel.cancelled())).await {
-                // TODO: maybe we should check that the transaction bit is set here
-                Either::Left((Ok(_), _cancelled)) => {}
-                Either::Left((Err(e), _cancelled)) => break 'tx Err(e),
-                Either::Right((_cancelled, _)) => {
-                    if let Err(err) = cancel_token.cancel_query(NoTls).await {
-                        tracing::warn!(?err, "could not cancel query");
+                                return Err(SqlOverHttpError::Cancelled(
+                                    SqlOverHttpCancel::Postgres,
+                                ));
+                            }
+                        }
                     }
-                    // TODO: after cancelling, wait to see if we can get a status. maybe the connection is still safe.
-                    discard.discard();
+                });
+            }));
 
-                    return Err(SqlOverHttpError::Cancelled(SqlOverHttpCancel::Postgres));
-                }
-            }
+            Ok(json)
         };
 
         let commit_result = match &result {
@@ -1064,110 +1063,106 @@ async fn query_to_json(
 ) -> Result<ReadyForQueryStatus, SqlOverHttpError> {
     let query_start = Instant::now();
 
-    let mut json_obj = output.object();
+    let ready = json::value_as_object!(|output| {
+        let array_mode = data.array_mode.unwrap_or(parsed_headers.default_array_mode);
+        let raw_output = parsed_headers.raw_output;
 
-    let array_mode = data.array_mode.unwrap_or(parsed_headers.default_array_mode);
-    let raw_output = parsed_headers.raw_output;
+        output.key("rowAsArray").value(array_mode);
 
-    json_obj.entry("rowAsArray").bool(array_mode);
+        let query_params = data.params;
+        let mut row_stream = client
+            .query_raw_txt(&data.query, query_params)
+            .await
+            .map_err(SqlOverHttpError::Postgres)?;
+        let query_acknowledged = Instant::now();
 
-    let query_params = data.params;
-    let mut row_stream = client
-        .query_raw_txt(&data.query, query_params)
-        .await
-        .map_err(SqlOverHttpError::Postgres)?;
-    let query_acknowledged = Instant::now();
-
-    let mut json_fields = json_obj.entry("fields").list();
-
-    for c in row_stream.statement.columns() {
-        let mut json_field = json_fields.entry().object();
-
-        json_field.entry("name").str(c.name());
-        json_field.entry("dataTypeID").int(c.type_().oid());
-        json_field.entry("tableID").int(c.table_oid());
-        json_field.entry("columnID").int(c.column_id());
-        json_field.entry("dataTypeSize").int(c.type_size());
-        json_field.entry("dataTypeModifier").int(c.type_modifier());
-        json_field.entry("format").str("text");
-
-        json_field.finish();
-    }
-
-    json_fields.finish();
-
-    // Manually drain the stream into a vector to leave row_stream hanging
-    // around to get a command tag. Also check that the response is not too big.
-    let mut json_rows = json_obj.entry("rows").list();
-    let mut rows = 0;
-    while let Some(row) = row_stream.next().await {
-        let row = row.map_err(SqlOverHttpError::Postgres)?;
-
-        rows += 1;
-        let v = json_rows.entry();
-        pg_text_row_to_json(v, &row, raw_output, array_mode)?;
-
-        // we don't have a streaming response support yet so this is to prevent OOM
-        // from a malicious query (eg a cross join)
-        if json_rows.as_buffer().len() > config.max_response_size_bytes {
-            return Err(SqlOverHttpError::ResponseTooLarge(
-                config.max_response_size_bytes,
-            ));
-        }
-
-        // assumption: parsing pg text and converting to json takes CPU time.
-        // let's assume it is slightly expensive, so we should consume some cooperative budget.
-        // Especially considering that `RowStream::next` might be pulling from a batch
-        // of rows and never hit the tokio mpsc for a long time (although unlikely).
-        tokio::task::consume_budget().await;
-    }
-    json_rows.finish();
-
-    let query_resp_end = Instant::now();
-    let RowStream {
-        command_tag,
-        status: ready,
-        ..
-    } = row_stream;
-
-    let command_tag = command_tag.unwrap_or_default();
-
-    info!(
-        rows,
-        ?ready,
-        command_tag,
-        acknowledgement = ?(query_acknowledged - query_start),
-        response = ?(query_resp_end - query_start),
-        "finished executing query"
-    );
-
-    // grab the command tag and number of rows affected
-    let (command_tag_name, command_tag_rest) = command_tag
-        .split_once(' ')
-        .map_or((&*command_tag, None), |(a, b)| (a, Some(b)));
-
-    json_obj.entry("command").str(command_tag_name);
-
-    let command_tag_count = command_tag_rest
-        .and_then(|rest| {
-            if command_tag_name == "INSERT" {
-                // INSERT returns OID first and then number of rows
-                let (_oid, count) = rest.split_once(' ')?;
-                Some(count)
-            } else {
-                // other commands return number of rows (if any)
-                Some(rest)
+        let json_fields = output.key("fields");
+        json::value_as_list!(|json_fields| {
+            for c in row_stream.statement.columns() {
+                let json_field = json_fields.entry();
+                json::value_as_object!(|json_field| {
+                    json_field.entry("name", c.name());
+                    json_field.entry("dataTypeID", c.type_().oid());
+                    json_field.entry("tableID", c.table_oid());
+                    json_field.entry("columnID", c.column_id());
+                    json_field.entry("dataTypeSize", c.type_size());
+                    json_field.entry("dataTypeModifier", c.type_modifier());
+                    json_field.entry("format", "text");
+                });
             }
-        })
-        .and_then(|count| count.parse::<i64>().ok());
+        });
 
-    if let Some(command_tag_count) = command_tag_count {
-        json_obj.entry("rowCount").int(command_tag_count);
-    } else {
-        json_obj.entry("rowCount").null();
-    }
+        // Manually drain the stream into a vector to leave row_stream hanging
+        // around to get a command tag. Also check that the response is not too big.
+        let json_rows = output.key("rows");
+        let rows = json::value_as_list!(|json_rows| {
+            let mut rows = 0;
+            while let Some(row) = row_stream.next().await {
+                let row = row.map_err(SqlOverHttpError::Postgres)?;
 
-    json_obj.finish();
+                rows += 1;
+                let v = json_rows.entry();
+                pg_text_row_to_json(v, &row, raw_output, array_mode)?;
+
+                // we don't have a streaming response support yet so this is to prevent OOM
+                // from a malicious query (eg a cross join)
+                if json_rows.as_buffer().len() > config.max_response_size_bytes {
+                    return Err(SqlOverHttpError::ResponseTooLarge(
+                        config.max_response_size_bytes,
+                    ));
+                }
+
+                // assumption: parsing pg text and converting to json takes CPU time.
+                // let's assume it is slightly expensive, so we should consume some cooperative budget.
+                // Especially considering that `RowStream::next` might be pulling from a batch
+                // of rows and never hit the tokio mpsc for a long time (although unlikely).
+                tokio::task::consume_budget().await;
+            }
+            rows
+        });
+
+        let query_resp_end = Instant::now();
+        let RowStream {
+            command_tag,
+            status: ready,
+            ..
+        } = row_stream;
+
+        let command_tag = command_tag.unwrap_or_default();
+
+        info!(
+            rows,
+            ?ready,
+            command_tag,
+            acknowledgement = ?(query_acknowledged - query_start),
+            response = ?(query_resp_end - query_start),
+            "finished executing query"
+        );
+
+        // grab the command tag and number of rows affected
+        let (command_tag_name, command_tag_rest) = command_tag
+            .split_once(' ')
+            .map_or((&*command_tag, None), |(a, b)| (a, Some(b)));
+
+        output.entry("command", command_tag_name);
+
+        let command_tag_count = command_tag_rest
+            .and_then(|rest| {
+                if command_tag_name == "INSERT" {
+                    // INSERT returns OID first and then number of rows
+                    let (_oid, count) = rest.split_once(' ')?;
+                    Some(count)
+                } else {
+                    // other commands return number of rows (if any)
+                    Some(rest)
+                }
+            })
+            .and_then(|count| count.parse::<i64>().ok());
+
+        output.entry("rowCount", command_tag_count);
+
+        ready
+    });
 
     Ok(ready)
 }
