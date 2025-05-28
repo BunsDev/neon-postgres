@@ -5,6 +5,62 @@
 //! Licensed by David Tolnay under MIT or Apache-2.0.
 //!
 //! With modifications by Conrad Ludgate on behalf of Neon.
+//!
+//! # Examples
+//!
+//! To represent the following JSON as a compact string
+//!
+//! ```json
+//! {
+//!   "results": {
+//!     "rows": [
+//!       {
+//!         "id": 1,
+//!         "value": null
+//!       },
+//!       {
+//!         "id": 2,
+//!         "value": "hello"
+//!       }
+//!     ]
+//!   }
+//! }
+//! ```
+//!
+//! We can use the following code:
+//!
+//! ```
+//! // create the outer object
+//! let s = json::value_to_string!(|v| json::value_as_object!(|v| {
+//!     // create an entry with key "results" and start an object value associated with it.
+//!     let results = v.key("results");
+//!     json::value_as_object!(|results| {
+//!         // create an entry with key "rows" and start an list value associated with it.
+//!         let rows = results.key("rows");
+//!         json::value_as_list!(|rows| {
+//!             // create a list entry and start an object value associated with it.
+//!             let row = rows.entry();
+//!             json::value_as_object!(|row| {
+//!                 // add entry "id": 1
+//!                 row.entry("id", 1);
+//!                 // add entry "value": null
+//!                 row.entry("value", json::RawValue::NULL);
+//!             });
+//!
+//!             // create a list entry and start an object value associated with it.
+//!             let row = rows.entry();
+//!             json::value_as_object!(|row| {
+//!                 // add entry "id": 2
+//!                 row.entry("id", 2);
+//!                 // add entry "value": "hello"
+//!                 row.entry("value", "hello");
+//!             });
+//!         });
+//!     });
+//! }));
+//!
+//! assert_eq!(s, r#"{"results":{"rows":[{"id":1,"value":null},{"id":2,"value":"hello"}]}}"#);
+//! ```
 
 mod macros;
 mod raw;
@@ -71,6 +127,7 @@ pub trait ValueEncoder {
 /// Serialize a json object.
 pub struct ObjectSer<'buf> {
     value: ValueSer<'buf>,
+    start: usize,
 }
 
 impl<'buf> ObjectSer<'buf> {
@@ -78,7 +135,8 @@ impl<'buf> ObjectSer<'buf> {
     #[inline]
     pub fn new(value: ValueSer<'buf>) -> Self {
         value.buf.push(b'{');
-        Self { value }
+        let start = value.buf.len();
+        Self { value, start }
     }
 
     /// Borrow the underlying buffer
@@ -103,7 +161,7 @@ impl<'buf> ObjectSer<'buf> {
         let start = self.value.buf.len();
 
         // push separator if necessary
-        if self.value.buf.len() > self.value.start + 1 {
+        if self.value.buf.len() > self.start {
             self.value.buf.push(b',');
         }
         // push key
@@ -138,6 +196,7 @@ pub trait KeyEncoder {
 /// Serialize a json object.
 pub struct ListSer<'buf> {
     value: ValueSer<'buf>,
+    start: usize,
 }
 
 impl<'buf> ListSer<'buf> {
@@ -145,7 +204,8 @@ impl<'buf> ListSer<'buf> {
     #[inline]
     pub fn new(value: ValueSer<'buf>) -> Self {
         value.buf.push(b'[');
-        Self { value }
+        let start = value.buf.len();
+        Self { value, start }
     }
 
     /// Borrow the underlying buffer
@@ -165,7 +225,7 @@ impl<'buf> ListSer<'buf> {
         let start = self.value.buf.len();
 
         // push separator if necessary
-        if self.value.buf.len() > self.value.start + 1 {
+        if self.value.buf.len() > self.start {
             self.value.buf.push(b',');
         }
 

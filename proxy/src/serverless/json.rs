@@ -430,17 +430,15 @@ mod tests {
     }
 
     fn pg_text_to_json(val: &str, pg_type: &Type) -> Value {
-        let mut output = vec![];
-        super::pg_text_to_json(ValueSer::new(&mut output), val, pg_type).unwrap();
-        serde_json::from_slice(&output).unwrap()
+        let output = json::value_to_string!(|v| super::pg_text_to_json(v, val, pg_type).unwrap());
+        serde_json::from_str(&output).unwrap()
     }
 
     fn pg_array_parse(pg_array: &str, pg_type: &Type) -> Value {
-        let mut output = vec![];
-        let mut list = ValueSer::new(&mut output).list();
-        super::pg_array_parse(&mut list, pg_array, pg_type, ',').unwrap();
-        list.finish();
-        serde_json::from_slice(&output).unwrap()
+        let output = json::value_to_string!(|v| json::value_as_list!(|v| {
+            super::pg_array_parse(v, pg_array, pg_type, ',').unwrap();
+        }));
+        serde_json::from_str(&output).unwrap()
     }
 
     #[test]
