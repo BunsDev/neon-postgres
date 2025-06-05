@@ -5,12 +5,14 @@ This far, only contains a test that we don't break and that the data is persiste
 """
 
 from typing import cast
-
 import psycopg2
 from fixtures.common_types import Lsn
+from enum import Enum
+import psycopg2
+import pytest
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import Endpoint, NeonEnv, wait_replica_caughtup
-from fixtures.pg_version import PgVersion
+from fixtures.utils import USE_LFC
 from pytest import raises
 
 
@@ -23,7 +25,22 @@ def stop_and_check_lsn(ep: Endpoint, expected_lsn: Lsn | None):
         assert lsn == expected_lsn, f"{expected_lsn=} != {lsn=}"
 
 
-def test_replica_promotes(neon_simple_env: NeonEnv, pg_version: PgVersion):
+class PromoteMethod(Enum):
+    COMPUTE_CTL = False
+    POSTGRES = True
+
+
+QUERY_OPTIONS = PromoteMethod.POSTGRES, PromoteMethod.COMPUTE_CTL
+
+# test two primaries
+# test promote failed
+# test promote handler disconnects
+# test prewarm fails before promotion -> promotion should not be impacted
+
+
+@pytest.mark.skipif(not USE_LFC, reason="LFC is disabled, skipping")
+@pytest.mark.parametrize("query", QUERY_OPTIONS, ids=["postgres", "compute-ctl"])
+def test_replica_promotes(neon_simple_env: NeonEnv, query: PromoteMethod):
     """
     Test that a replica safely promotes, and can commit data updates which
     show up when the primary boots up after the promoted secondary endpoint
@@ -38,6 +55,11 @@ def test_replica_promotes(neon_simple_env: NeonEnv, pg_version: PgVersion):
 
     with primary.connect() as primary_conn:
         primary_cur = primary_conn.cursor()
+
+        # TODO remove? default neon version should be 1.6
+        if query is PromoteMethod.COMPUTE_CTL:
+            primary_cur.execute("create extension neon version '1.6'")
+
         primary_cur.execute(
             "create table t(pk bigint GENERATED ALWAYS AS IDENTITY, payload integer)"
         )
@@ -55,12 +77,14 @@ def test_replica_promotes(neon_simple_env: NeonEnv, pg_version: PgVersion):
         primary_cur.execute("show neon.safekeepers")
         safekeepers = primary_cur.fetchall()[0][0]
 
-    wait_replica_caughtup(primary, secondary)
+    if query is PromoteMethod.COMPUTE_CTL:
+        primary.http_client().offload_lfc()
+    else:
+        wait_replica_caughtup(primary, secondary)
 
     with secondary.connect() as secondary_conn:
         secondary_cur = secondary_conn.cursor()
         secondary_cur.execute("select count(*) from t")
-
         assert secondary_cur.fetchone() == (100,)
 
         with raises(psycopg2.Error):
@@ -71,28 +95,41 @@ def test_replica_promotes(neon_simple_env: NeonEnv, pg_version: PgVersion):
         secondary_cur.execute("select count(*) from t")
         assert secondary_cur.fetchone() == (100,)
 
+    primary_endpoint_id: str = primary.endpoint_id
     stop_and_check_lsn(primary, expected_primary_lsn)
 
     # Reconnect to the secondary to make sure we get a read-write connection
     promo_conn = secondary.connect()
     promo_cur = promo_conn.cursor()
-    promo_cur.execute(f"alter system set neon.safekeepers='{safekeepers}'")
-    promo_cur.execute("select pg_reload_conf()")
+    http_client = secondary.http_client()
+    if query is PromoteMethod.COMPUTE_CTL:
+        # TODO Do we need to prewarm if LFC is full?
+        # PG:2025-06-10 15:54:36.203 GMT [1079329] LOG:  LFC: skip prewarm because LFC is already filled
+        http_client.prewarm_lfc(primary_endpoint_id)
 
-    promo_cur.execute("SELECT * FROM pg_promote()")
-    assert promo_cur.fetchone() == (True,)
+        # control plane knows safekeepers, here we simulate it by querying primary
+        lsn = primary.terminate_flush_lsn
+        assert lsn
+        safekeepers_lsn = {"safekeepers": safekeepers, "wal_flush_lsn": lsn}
+        promote = http_client.promote(safekeepers_lsn)
+        assert promote["status"] == "completed"
+    else:
+        promo_cur.execute(f"alter system set neon.safekeepers='{safekeepers}'")
+        promo_cur.execute("select pg_reload_conf()")
+        promo_cur.execute("SELECT * FROM pg_promote()")
+        assert promo_cur.fetchone() == (True,)
+
     promo_cur.execute(
         """
-            SELECT pg_current_wal_insert_lsn(),
-                   pg_current_wal_lsn(),
-                   pg_current_wal_flush_lsn()
-            """
+        SELECT pg_current_wal_insert_lsn(),
+               pg_current_wal_lsn(),
+               pg_current_wal_flush_lsn()
+        """
     )
     log.info(f"Secondary: LSN after promotion is {promo_cur.fetchone()}")
 
     # Reconnect to the secondary to make sure we get a read-write connection
-    with secondary.connect() as new_primary_conn:
-        new_primary_cur = new_primary_conn.cursor()
+    with secondary.connect() as conn, conn.cursor() as new_primary_cur:
         new_primary_cur.execute("select count(*) from t")
         assert new_primary_cur.fetchone() == (100,)
 
@@ -101,7 +138,7 @@ def test_replica_promotes(neon_simple_env: NeonEnv, pg_version: PgVersion):
         )
         assert new_primary_cur.fetchall() == [(it,) for it in range(101, 201)]
 
-        new_primary_cur = new_primary_conn.cursor()
+        new_primary_cur = conn.cursor()
         new_primary_cur.execute("select payload from t")
         assert new_primary_cur.fetchall() == [(it,) for it in range(1, 201)]
 
@@ -116,13 +153,11 @@ def test_replica_promotes(neon_simple_env: NeonEnv, pg_version: PgVersion):
         )
         log.info(f"Secondary: LSN after workload is {new_primary_cur.fetchone()}")
 
-    with secondary.connect() as second_viewpoint_conn:
-        new_primary_cur = second_viewpoint_conn.cursor()
+    with secondary.connect() as conn, conn.cursor() as new_primary_cur:
         new_primary_cur.execute("select payload from t")
         assert new_primary_cur.fetchall() == [(it,) for it in range(1, 201)]
 
-    # wait_for_last_flush_lsn(env, secondary, env.initial_tenant, env.initial_timeline)
-
+    secondary.stop()
     # secondaries don't sync safekeepers on finish so LSN will be None
     stop_and_check_lsn(secondary, None)
 
