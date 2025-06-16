@@ -34,8 +34,9 @@ pub(in crate::http) async fn configure(
     // error: future cannot be sent between threads safely
     {
         let mut state = compute.state.lock().unwrap();
-        if !matches!(state.status, ComputeStatus::Empty | ComputeStatus::Running) {
-            return JsonResponse::invalid_status(state.status);
+        while !matches!(state.status, ComputeStatus::Empty | ComputeStatus::Running) {
+            // wait until we are not concurrently configuring
+            state = compute.state_changed.wait(state).unwrap();
         }
 
         // Pass the tracing span to the main thread that performs the startup,
