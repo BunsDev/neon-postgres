@@ -937,7 +937,7 @@ impl Endpoint {
                             );
                         }
                         ComputeStatus::Empty
-                        | ComputeStatus::ConfigurationPending
+                        | ComputeStatus::ConfigurationPending(_)
                         | ComputeStatus::Configuration
                         | ComputeStatus::TerminationPending { .. }
                         | ComputeStatus::Terminated => {

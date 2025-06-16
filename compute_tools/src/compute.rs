@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use compute_api::privilege::Privilege;
 use compute_api::responses::{
-    ComputeConfig, ComputeCtlConfig, ComputeMetrics, ComputeStatus, LfcOffloadState,
+    ComputeConfig, ComputeCtlConfig, ComputeMetrics, ComputeStatus, Configuration, LfcOffloadState,
     LfcPrewarmState, TlsConfig,
 };
 use compute_api::spec::{
@@ -557,7 +557,7 @@ impl ComputeNode {
     pub fn wait_spec(&self) -> Result<ParsedSpec> {
         info!("no compute spec provided, waiting");
         let mut state = self.state.lock().unwrap();
-        while state.status != ComputeStatus::ConfigurationPending {
+        while state.status != ComputeStatus::ConfigurationPending(Configuration::Full) {
             state = self.state_changed.wait(state).unwrap();
         }
 
@@ -1668,7 +1668,7 @@ impl ComputeNode {
     /// Similar to `apply_config()`, but does a bit different sequence of operations,
     /// as it's used to reconfigure a previously started and configured Postgres node.
     #[instrument(skip_all)]
-    pub fn reconfigure(&self) -> Result<()> {
+    pub fn reconfigure(&self, skip_pg_catalog_updates: bool) -> Result<()> {
         let spec = self.state.lock().unwrap().pspec.clone().unwrap().spec;
 
         let tls_config = self.tls_config(&spec);
@@ -1716,7 +1716,7 @@ impl ComputeNode {
             tls_config,
         )?;
 
-        if !spec.skip_pg_catalog_updates {
+        if !skip_pg_catalog_updates && !spec.skip_pg_catalog_updates {
             let max_concurrent_connections = spec.reconfigure_concurrency;
             // Temporarily reset max_cluster_size in config
             // to avoid the possibility of hitting the limit, while we are reconfiguring:
@@ -1800,11 +1800,18 @@ impl ComputeNode {
                     let mut state = self.state.lock().unwrap();
                     'status_update: loop {
                         match state.status {
-                            // let's update the state to config pending
-                            ComputeStatus::ConfigurationPending | ComputeStatus::Running => {
+                            // A reconfiguration was already requested, there's no need to update it.
+                            ComputeStatus::ConfigurationPending(Configuration::Full)
+                            | ComputeStatus::ConfigurationPending(Configuration::Tls) => {
+                                info!("configuration already queued, skipping TLS reconfiguration");
+                                break 'status_update;
+                            }
+
+                            // Reconfigure TLS for the running compute
+                            ComputeStatus::Running => {
                                 info!("reconfiguring compute due to TLS certificate renewal");
                                 state.set_status(
-                                    ComputeStatus::ConfigurationPending,
+                                    ComputeStatus::ConfigurationPending(Configuration::Tls),
                                     &self.state_changed,
                                 );
                                 break 'status_update;

@@ -100,7 +100,7 @@ pub enum ComputeStatus {
     // provided by control-plane.
     Empty,
     // Compute configuration was requested.
-    ConfigurationPending,
+    ConfigurationPending(Configuration),
     // Compute node has spec and initial startup and
     // configuration is in progress.
     Init,
@@ -127,13 +127,36 @@ impl Display for ComputeStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ComputeStatus::Empty => f.write_str("empty"),
-            ComputeStatus::ConfigurationPending => f.write_str("configuration-pending"),
+            ComputeStatus::ConfigurationPending(Configuration::Full) => {
+                f.write_str("configuration-pending[full]")
+            }
+            ComputeStatus::ConfigurationPending(Configuration::Tls) => {
+                f.write_str("configuration-pending[tls]")
+            }
             ComputeStatus::Init => f.write_str("init"),
             ComputeStatus::Running => f.write_str("running"),
             ComputeStatus::Configuration => f.write_str("configuration"),
             ComputeStatus::Failed => f.write_str("failed"),
             ComputeStatus::TerminationPending { .. } => f.write_str("termination-pending"),
             ComputeStatus::Terminated => f.write_str("terminated"),
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Configuration {
+    /// Only a TLS configuration was requested
+    Tls,
+    /// A full reconfiguration was requested
+    Full,
+}
+
+impl Display for Configuration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Configuration::Full => f.write_str("full"),
+            Configuration::Tls => f.write_str("tls"),
         }
     }
 }

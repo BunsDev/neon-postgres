@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::Response;
 use compute_api::requests::ConfigurationRequest;
-use compute_api::responses::{ComputeStatus, ComputeStatusResponse};
+use compute_api::responses::{ComputeStatus, ComputeStatusResponse, Configuration};
 use http::StatusCode;
 use tokio::task;
 use tracing::info;
@@ -45,7 +45,10 @@ pub(in crate::http) async fn configure(
         state.startup_span = Some(tracing::Span::current());
 
         state.pspec = Some(pspec);
-        state.set_status(ComputeStatus::ConfigurationPending, &compute.state_changed);
+        state.set_status(
+            ComputeStatus::ConfigurationPending(Configuration::Full),
+            &compute.state_changed,
+        );
         drop(state);
     }
 
