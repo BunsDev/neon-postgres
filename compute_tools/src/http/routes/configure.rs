@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::Response;
 use compute_api::requests::ConfigurationRequest;
-use compute_api::responses::{ComputeStatus, ComputeStatusResponse, Configuration};
+use compute_api::responses::{ComputeStatus, ComputeStatusResponse};
 use http::StatusCode;
 use tokio::task;
 use tracing::info;
@@ -39,10 +39,8 @@ pub(in crate::http) async fn configure(
             match state.status {
                 // ideal state.
                 ComputeStatus::Empty | ComputeStatus::Running => break,
-                // we can upgrade into a full configuration here, as those also apply reloads.
-                ComputeStatus::ConfigurationPending(Configuration::Reload) => break,
                 // we need to wait until reloaded
-                ComputeStatus::Configuration(Configuration::Reload) => {
+                ComputeStatus::Reload => {
                     state = c.state_changed.wait(state).unwrap();
                 }
                 // All other cases are unexpected.
@@ -56,10 +54,7 @@ pub(in crate::http) async fn configure(
         state.startup_span = Some(span);
 
         state.pspec = Some(pspec);
-        state.set_status(
-            ComputeStatus::ConfigurationPending(Configuration::Full),
-            &c.state_changed,
-        );
+        state.set_status(ComputeStatus::ConfigurationPending, &c.state_changed);
 
         while state.status != ComputeStatus::Running {
             state = c.state_changed.wait(state).unwrap();

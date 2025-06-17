@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use compute_api::privilege::Privilege;
 use compute_api::responses::{
-    ComputeConfig, ComputeCtlConfig, ComputeMetrics, ComputeStatus, Configuration, LfcOffloadState,
+    ComputeConfig, ComputeCtlConfig, ComputeMetrics, ComputeStatus, LfcOffloadState,
     LfcPrewarmState, TlsConfig,
 };
 use compute_api::spec::{
@@ -557,7 +557,7 @@ impl ComputeNode {
     pub fn wait_spec(&self) -> Result<ParsedSpec> {
         info!("no compute spec provided, waiting");
         let mut state = self.state.lock().unwrap();
-        while state.status != ComputeStatus::ConfigurationPending(Configuration::Full) {
+        while state.status != ComputeStatus::ConfigurationPending {
             state = self.state_changed.wait(state).unwrap();
         }
 
@@ -1745,9 +1745,7 @@ impl ComputeNode {
 
     /// Tell postgres/pgbouncer/local_proxy to reload their configurations.
     #[instrument(skip_all)]
-    pub fn reload(&self) -> Result<()> {
-        let spec = self.state.lock().unwrap().pspec.clone().unwrap().spec;
-
+    pub fn reload<'a>(&self, spec: ComputeSpec) -> Result<()> {
         let rt = tokio::runtime::Handle::current();
         if spec.pgbouncer_settings.is_some() {
             rt.block_on(reload_pgbouncer())?;
@@ -1838,8 +1836,7 @@ impl ComputeNode {
         loop {
             match state.status {
                 // A reconfiguration was already requested, there's no need to update it.
-                ComputeStatus::ConfigurationPending(Configuration::Full)
-                | ComputeStatus::ConfigurationPending(Configuration::Reload) => {
+                ComputeStatus::ConfigurationPending => {
                     info!("configuration already queued, skipping TLS reconfiguration");
                     return ControlFlow::Continue(());
                 }
@@ -1847,11 +1844,7 @@ impl ComputeNode {
                 // Reload TLS for the running compute
                 ComputeStatus::Running => {
                     info!("reloading compute due to TLS certificate renewal");
-                    state.set_status(
-                        ComputeStatus::ConfigurationPending(Configuration::Reload),
-                        &self.state_changed,
-                    );
-                    return ControlFlow::Continue(());
+                    break;
                 }
 
                 // exit loop
@@ -1861,12 +1854,31 @@ impl ComputeNode {
 
                 // wait
                 ComputeStatus::Init
-                | ComputeStatus::Configuration(Configuration::Full)
-                | ComputeStatus::Configuration(Configuration::Reload)
+                | ComputeStatus::Configuration
+                | ComputeStatus::Reload
                 | ComputeStatus::Empty => {
                     state = self.state_changed.wait(state).unwrap();
                 }
             }
+        }
+
+        // transition to the reloading state.
+        state.set_status(ComputeStatus::Reload, &self.state_changed);
+        let spec = state.pspec.as_ref().unwrap().spec.clone();
+        // unlock while reloading, so we don't block other tasks.
+        drop(state);
+
+        let res = self.reload(spec);
+        let mut state = self.state.lock().unwrap();
+
+        if let Err(e) = res {
+            error!("could not reload compute node: {}", e);
+            state.set_status(ComputeStatus::Failed, &self.state_changed);
+            ControlFlow::Break(())
+        } else {
+            info!("compute node reloaded");
+            state.set_status(ComputeStatus::Running, &self.state_changed);
+            ControlFlow::Continue(())
         }
     }
 

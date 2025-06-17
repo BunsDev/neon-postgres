@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use compute_api::responses::{ComputeStatus, Configuration};
+use compute_api::responses::ComputeStatus;
 use tracing::{error, info, instrument};
 
 use crate::compute::ComputeNode;
@@ -16,23 +16,18 @@ fn configurator_main_loop(compute: &Arc<ComputeNode>) {
         // the status has changed while we were waiting for the lock, and we might not need to
         // wait on the condition variable. Otherwise, we might end up in some soft-/deadlock, i.e.
         // we are waiting for a condition variable that will never be signaled.
-        if !matches!(state.status, ComputeStatus::ConfigurationPending(..)) {
+        if state.status != ComputeStatus::ConfigurationPending {
             state = compute.state_changed.wait(state).unwrap();
         }
 
         // Re-check the status after waking up
-        if let ComputeStatus::ConfigurationPending(c) = state.status {
-            info!("got configuration request {c}");
-            state.set_status(ComputeStatus::Configuration(c), &compute.state_changed);
+        if state.status == ComputeStatus::ConfigurationPending {
+            info!("got configuration request");
+            state.set_status(ComputeStatus::Configuration, &compute.state_changed);
             drop(state);
 
             let mut new_status = ComputeStatus::Failed;
-            let res = match c {
-                Configuration::Full => compute.reconfigure(),
-                Configuration::Reload => compute.reload(),
-            };
-
-            if let Err(e) = res {
+            if let Err(e) = compute.reconfigure() {
                 error!("could not configure compute node: {}", e);
             } else {
                 new_status = ComputeStatus::Running;

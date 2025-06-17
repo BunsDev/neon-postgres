@@ -923,7 +923,7 @@ impl Endpoint {
                             }
                             // keep retrying
                         }
-                        ComputeStatus::Running => {
+                        ComputeStatus::Reload | ComputeStatus::Running => {
                             // All good!
                             break;
                         }
@@ -937,8 +937,8 @@ impl Endpoint {
                             );
                         }
                         ComputeStatus::Empty
-                        | ComputeStatus::ConfigurationPending(_)
-                        | ComputeStatus::Configuration(_)
+                        | ComputeStatus::ConfigurationPending
+                        | ComputeStatus::Configuration
                         | ComputeStatus::TerminationPending { .. }
                         | ComputeStatus::Terminated => {
                             bail!("unexpected compute status: {:?}", state.status)
