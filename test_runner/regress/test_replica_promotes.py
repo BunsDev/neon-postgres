@@ -55,9 +55,8 @@ def test_replica_promotes(neon_simple_env: NeonEnv, query: PromoteMethod):
 
     with primary.connect() as primary_conn:
         primary_cur = primary_conn.cursor()
-
-        # TODO remove? default neon version should be 1.6
         if query is PromoteMethod.COMPUTE_CTL:
+            # TODO(myrrc): remove version
             primary_cur.execute("create extension neon version '1.6'")
 
         primary_cur.execute(
@@ -151,15 +150,16 @@ def test_replica_promotes(neon_simple_env: NeonEnv, query: PromoteMethod):
                    pg_current_wal_flush_lsn()
             """
         )
-        log.info(f"Secondary: LSN after workload is {new_primary_cur.fetchone()}")
+        lsn_triple = cast("tuple[str, str, str]", new_primary_cur.fetchone())
+        log.info(f"Secondary: LSN after workload is {lsn_triple}")
+        expected_promoted_lsn = Lsn(lsn_triple[2])
 
     with secondary.connect() as conn, conn.cursor() as new_primary_cur:
         new_primary_cur.execute("select payload from t")
         assert new_primary_cur.fetchall() == [(it,) for it in range(1, 201)]
 
     secondary.stop()
-    # secondaries don't sync safekeepers on finish so LSN will be None
-    stop_and_check_lsn(secondary, None)
+    stop_and_check_lsn(secondary, expected_promoted_lsn)
 
     primary = env.endpoints.create_start(branch_name="main", endpoint_id="primary2")
 
