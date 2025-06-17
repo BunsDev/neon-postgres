@@ -107,7 +107,7 @@ pub enum ComputeStatus {
     // Compute is configured and running.
     Running,
     // New spec is being applied.
-    Configuration,
+    Configuration(Configuration),
     // Either startup or configuration failed,
     // compute will exit soon or is waiting for
     // control-plane to terminate it.
@@ -130,12 +130,15 @@ impl Display for ComputeStatus {
             ComputeStatus::ConfigurationPending(Configuration::Full) => {
                 f.write_str("configuration-pending[full]")
             }
-            ComputeStatus::ConfigurationPending(Configuration::Tls) => {
-                f.write_str("configuration-pending[tls]")
+            ComputeStatus::ConfigurationPending(Configuration::Reload) => {
+                f.write_str("configuration-pending[reload]")
             }
             ComputeStatus::Init => f.write_str("init"),
             ComputeStatus::Running => f.write_str("running"),
-            ComputeStatus::Configuration => f.write_str("configuration"),
+            ComputeStatus::Configuration(Configuration::Full) => f.write_str("configuration[full]"),
+            ComputeStatus::Configuration(Configuration::Reload) => {
+                f.write_str("configuration[reload]")
+            }
             ComputeStatus::Failed => f.write_str("failed"),
             ComputeStatus::TerminationPending { .. } => f.write_str("termination-pending"),
             ComputeStatus::Terminated => f.write_str("terminated"),
@@ -146,8 +149,8 @@ impl Display for ComputeStatus {
 #[derive(Serialize, Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Configuration {
-    /// Only a TLS configuration was requested
-    Tls,
+    /// Only a reload was requested
+    Reload,
     /// A full reconfiguration was requested
     Full,
 }
@@ -156,7 +159,7 @@ impl Display for Configuration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Configuration::Full => f.write_str("full"),
-            Configuration::Tls => f.write_str("tls"),
+            Configuration::Reload => f.write_str("reload"),
         }
     }
 }

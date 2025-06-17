@@ -23,18 +23,16 @@ fn configurator_main_loop(compute: &Arc<ComputeNode>) {
         // Re-check the status after waking up
         if let ComputeStatus::ConfigurationPending(c) = state.status {
             info!("got configuration request {c}");
-            state.set_status(ComputeStatus::Configuration, &compute.state_changed);
+            state.set_status(ComputeStatus::Configuration(c), &compute.state_changed);
             drop(state);
 
             let mut new_status = ComputeStatus::Failed;
-            let skip_pg_catalog_updates = match c {
-                // In a full configuration, we shouldn't always skip the pg_catalogue_updates.
-                Configuration::Full => false,
-                // In a TLS reconfiguration, we should always skip the pg_catalogue_updates.
-                Configuration::Tls => true,
+            let res = match c {
+                Configuration::Full => compute.reconfigure(),
+                Configuration::Reload => compute.reload(),
             };
 
-            if let Err(e) = compute.reconfigure(skip_pg_catalog_updates) {
+            if let Err(e) = res {
                 error!("could not configure compute node: {}", e);
             } else {
                 new_status = ComputeStatus::Running;

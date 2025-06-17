@@ -8,24 +8,26 @@ use x509_cert::Certificate;
 #[derive(Clone, Copy)]
 pub struct CertDigest(digest::Digest);
 
-pub async fn watch_cert_for_changes(cert_path: String) -> tokio::sync::watch::Receiver<CertDigest> {
-    let mut digest = compute_digest(&cert_path).await;
-    let (tx, rx) = tokio::sync::watch::channel(digest);
-    tokio::spawn(async move {
-        while !tx.is_closed() {
-            let new_digest = compute_digest(&cert_path).await;
-            if digest.0.as_ref() != new_digest.0.as_ref() {
-                digest = new_digest;
-                _ = tx.send(digest);
-            }
-
-            tokio::time::sleep(Duration::from_secs(60)).await
-        }
-    });
-    rx
+impl PartialEq for CertDigest {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ref() == other.0.as_ref()
+    }
 }
 
-async fn compute_digest(cert_path: &str) -> CertDigest {
+pub async fn wait_until_cert_changed(digest: CertDigest, cert_path: &str) -> CertDigest {
+    loop {
+        let new_digest = compute_digest(cert_path).await;
+        if digest != new_digest {
+            break new_digest;
+        }
+
+        // Wait a while before checking the certificates.
+        // We renew on a daily basis, so there's no rush.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+pub async fn compute_digest(cert_path: &str) -> CertDigest {
     loop {
         match try_compute_digest(cert_path).await {
             Ok(d) => break d,
@@ -46,9 +48,9 @@ async fn try_compute_digest(cert_path: &str) -> Result<CertDigest> {
 pub const SERVER_CRT: &str = "server.crt";
 pub const SERVER_KEY: &str = "server.key";
 
-pub fn update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) {
+pub fn update_key_path_blocking(postgresql_conf_path: &Path, tls_config: &TlsConfig) {
     loop {
-        match try_update_key_path_blocking(pg_data, tls_config) {
+        match try_update_key_path_blocking(postgresql_conf_path, tls_config) {
             Ok(()) => break,
             Err(e) => {
                 tracing::error!(error = ?e, "could not create key file");
@@ -61,7 +63,7 @@ pub fn update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) {
 // Postgres requires the keypath be "secure". This means
 // 1. Owned by the postgres user.
 // 2. Have permission 600.
-fn try_update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) -> Result<()> {
+fn try_update_key_path_blocking(postgresql_conf_path: &Path, tls_config: &TlsConfig) -> Result<()> {
     let key = std::fs::read_to_string(&tls_config.key_path)?;
     let crt = std::fs::read_to_string(&tls_config.cert_path)?;
 
@@ -73,15 +75,18 @@ fn try_update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) -> Resul
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(pg_data.join(SERVER_KEY))?;
+        .open(postgresql_conf_path.join(SERVER_KEY))?;
 
     let mut crt_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(pg_data.join(SERVER_CRT))?;
+        .open(postgresql_conf_path.join(SERVER_CRT))?;
 
+    // There's a chance that postgres/pgbouncer/local_proxy reloads halfway between
+    // these writes and reads the wrong keys to the wrong certs.
+    // Not sure how to prevent that.
     key_file.write_all(key.as_bytes())?;
     crt_file.write_all(crt.as_bytes())?;
 

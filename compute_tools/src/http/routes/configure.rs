@@ -34,9 +34,19 @@ pub(in crate::http) async fn configure(
     // error: future cannot be sent between threads safely
     {
         let mut state = compute.state.lock().unwrap();
-        while !matches!(state.status, ComputeStatus::Empty | ComputeStatus::Running) {
-            // wait until we are not concurrently configuring
-            state = compute.state_changed.wait(state).unwrap();
+        loop {
+            match state.status {
+                // ideal state.
+                ComputeStatus::Empty | ComputeStatus::Running => break,
+                // we can upgrade into a full configuration here, as those also apply reloads.
+                ComputeStatus::ConfigurationPending(Configuration::Reload) => break,
+                // we need to wait until reloaded
+                ComputeStatus::Configuration(Configuration::Reload) => {
+                    state = compute.state_changed.wait(state).unwrap();
+                }
+                // All other cases are unexpected.
+                _ => return JsonResponse::invalid_status(state.status),
+            }
         }
 
         // Pass the tracing span to the main thread that performs the startup,
