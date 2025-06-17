@@ -1800,25 +1800,22 @@ impl ComputeNode {
 
     pub async fn watch_cert_for_changes(self: Arc<Self>, tls_config: TlsConfig) {
         // wait until the cert exists.
-        let mut digest = crate::tls::compute_digest(&tls_config.cert_path).await;
+        let path = tls_config.cert_path.clone();
+        let mut digest = tokio::task::spawn_blocking(move || crate::tls::compute_digest(&path))
+            .await
+            .unwrap();
         info!("TLS certificates found");
 
         let pgdata_path = Path::new(&self.params.pgdata);
         let postgresql_conf_path = pgdata_path.join("postgresql.conf");
 
         // spawn a thread for the permanent cert tracking task
-        let handle = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
-            let _rt = handle.enter();
-
             while let ControlFlow::Continue(()) =
                 self.reload_on_cert_changed(&postgresql_conf_path, &tls_config)
             {
                 // wait for new certificates
-                digest = handle.block_on(crate::tls::wait_until_cert_changed(
-                    digest,
-                    &tls_config.cert_path,
-                ));
+                digest = crate::tls::wait_until_cert_changed(digest, &tls_config.cert_path);
 
                 info!("TLS certificates renewed");
             }

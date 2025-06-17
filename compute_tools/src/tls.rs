@@ -14,33 +14,33 @@ impl PartialEq for CertDigest {
     }
 }
 
-pub async fn wait_until_cert_changed(digest: CertDigest, cert_path: &str) -> CertDigest {
+pub fn wait_until_cert_changed(digest: CertDigest, cert_path: &str) -> CertDigest {
     loop {
-        let new_digest = compute_digest(cert_path).await;
+        let new_digest = compute_digest(cert_path);
         if digest != new_digest {
             break new_digest;
         }
 
         // Wait a while before checking the certificates.
         // We renew on a daily basis, so there's no rush.
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        std::thread::sleep(Duration::from_secs(60));
     }
 }
 
-pub async fn compute_digest(cert_path: &str) -> CertDigest {
+pub fn compute_digest(cert_path: &str) -> CertDigest {
     loop {
-        match try_compute_digest(cert_path).await {
+        match try_compute_digest(cert_path) {
             Ok(d) => break d,
             Err(e) => {
                 tracing::error!("could not read cert file {e:?}");
-                tokio::time::sleep(Duration::from_secs(1)).await
+                std::thread::sleep(Duration::from_secs(1))
             }
         }
     }
 }
 
-async fn try_compute_digest(cert_path: &str) -> Result<CertDigest> {
-    let data = tokio::fs::read(cert_path).await?;
+fn try_compute_digest(cert_path: &str) -> Result<CertDigest> {
+    let data = std::fs::read(cert_path)?;
     // sha256 is extremely collision resistent. can safely assume the digest to be unique
     Ok(CertDigest(digest::digest(&digest::SHA256, &data)))
 }

@@ -27,13 +27,14 @@ pub(in crate::http) async fn configure(
         Err(e) => return JsonResponse::error(StatusCode::BAD_REQUEST, e),
     };
 
-    // XXX: wrap state update under lock in a code block. Otherwise, we will try
-    // to `Send` `mut state` into the spawned thread bellow, which will cause
-    // the following rustc error:
-    //
-    // error: future cannot be sent between threads safely
-    {
-        let mut state = compute.state.lock().unwrap();
+    // Spawn a blocking thread to wait for compute to become Running. This is
+    // needed to not block the main pool of workers and to be able to serve
+    // other requests while some particular request is waiting for compute to
+    // finish configuration.
+    let c = compute.clone();
+    let span = tracing::Span::current();
+    let completed = task::spawn_blocking(move || {
+        let mut state = c.state.lock().unwrap();
         loop {
             match state.status {
                 // ideal state.
@@ -42,33 +43,24 @@ pub(in crate::http) async fn configure(
                 ComputeStatus::ConfigurationPending(Configuration::Reload) => break,
                 // we need to wait until reloaded
                 ComputeStatus::Configuration(Configuration::Reload) => {
-                    state = compute.state_changed.wait(state).unwrap();
+                    state = c.state_changed.wait(state).unwrap();
                 }
                 // All other cases are unexpected.
-                _ => return JsonResponse::invalid_status(state.status),
+                _ => return Err(JsonResponse::invalid_status(state.status)),
             }
         }
 
         // Pass the tracing span to the main thread that performs the startup,
         // so that the start_compute operation is considered a child of this
         // configure request for tracing purposes.
-        state.startup_span = Some(tracing::Span::current());
+        state.startup_span = Some(span);
 
         state.pspec = Some(pspec);
         state.set_status(
             ComputeStatus::ConfigurationPending(Configuration::Full),
-            &compute.state_changed,
+            &c.state_changed,
         );
-        drop(state);
-    }
 
-    // Spawn a blocking thread to wait for compute to become Running. This is
-    // needed to not block the main pool of workers and to be able to serve
-    // other requests while some particular request is waiting for compute to
-    // finish configuration.
-    let c = compute.clone();
-    let completed = task::spawn_blocking(move || {
-        let mut state = c.state.lock().unwrap();
         while state.status != ComputeStatus::Running {
             state = c.state_changed.wait(state).unwrap();
             info!(
@@ -80,7 +72,7 @@ pub(in crate::http) async fn configure(
             if state.status == ComputeStatus::Failed {
                 let err = state.error.as_ref().map_or("unknown error", |x| x);
                 let msg = format!("compute configuration failed: {:?}", err);
-                return Err(msg);
+                return Err(JsonResponse::error(StatusCode::INTERNAL_SERVER_ERROR, msg));
             }
         }
 
@@ -90,7 +82,7 @@ pub(in crate::http) async fn configure(
     .unwrap();
 
     if let Err(e) = completed {
-        return JsonResponse::error(StatusCode::INTERNAL_SERVER_ERROR, e);
+        return e;
     }
 
     // Return current compute state if everything went well.
