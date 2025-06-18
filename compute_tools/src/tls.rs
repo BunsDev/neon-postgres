@@ -3,7 +3,6 @@ use std::{io::Write, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 use anyhow::{Context, Result, bail};
 use compute_api::responses::TlsConfig;
 use ring::digest;
-use x509_cert::Certificate;
 
 #[derive(Clone, Copy)]
 pub struct CertDigest(digest::Digest);
@@ -48,28 +47,32 @@ fn try_compute_digest(cert_path: &str) -> Result<CertDigest> {
 pub const SERVER_CRT: &str = "server.crt";
 pub const SERVER_KEY: &str = "server.key";
 
-pub fn update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) {
+pub fn load_certs_blocking(tls_config: &TlsConfig) -> (String, String) {
     loop {
-        match try_update_key_path_blocking(pg_data, tls_config) {
-            Ok(()) => break,
+        match try_load_certs_blocking(tls_config) {
+            Ok((key, crt)) => break (key, crt),
             Err(e) => {
-                tracing::error!(error = ?e, "could not create key file");
+                tracing::error!(error = ?e, "could not load certs");
                 std::thread::sleep(Duration::from_secs(1))
             }
         }
     }
 }
 
-// Postgres requires the keypath be "secure". This means
-// 1. Owned by the postgres user.
-// 2. Have permission 600.
-fn try_update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) -> Result<()> {
+fn try_load_certs_blocking(tls_config: &TlsConfig) -> Result<(String, String)> {
     let key = std::fs::read_to_string(&tls_config.key_path)?;
     let crt = std::fs::read_to_string(&tls_config.cert_path)?;
 
     // to mitigate a race condition during renewal.
     verify_key_cert(&key, &crt)?;
 
+    Ok((key, crt))
+}
+
+// Postgres requires the keypath be "secure". This means
+// 1. Owned by the postgres user.
+// 2. Have permission 600.
+pub fn update_key_path_blocking(pg_data: &Path, key: &str, crt: &str) -> Result<()> {
     let mut key_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -94,6 +97,7 @@ fn try_update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) -> Resul
 }
 
 fn verify_key_cert(key: &str, cert: &str) -> Result<()> {
+    use x509_cert::Certificate;
     use x509_cert::der::oid::db::rfc5912::ECDSA_WITH_SHA_256;
 
     let certs = Certificate::load_pem_chain(cert.as_bytes())
@@ -105,22 +109,20 @@ fn verify_key_cert(key: &str, cert: &str) -> Result<()> {
         bail!("no certificates found");
     };
 
+    let pubkey = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .raw_bytes();
+
     match cert.signature_algorithm.oid {
         ECDSA_WITH_SHA_256 => {
             let key = p256::SecretKey::from_sec1_pem(key).context("parse key")?;
-
-            let a = key.public_key().to_sec1_bytes();
-            let b = cert
-                .tbs_certificate
-                .subject_public_key_info
-                .subject_public_key
-                .raw_bytes();
-
-            if *a != *b {
+            if *key.public_key().to_sec1_bytes() != *pubkey {
                 bail!("private key file does not match certificate")
             }
         }
-        _ => bail!("unknown TLS key type"),
+        oid => bail!("unknown TLS key type: {oid}"),
     }
 
     Ok(())

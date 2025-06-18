@@ -1801,8 +1801,19 @@ impl ComputeNode {
         let mut digest = crate::tls::compute_digest(&tls_config.cert_path);
         info!("TLS certificates found");
 
+        // ensure the keys are saved before continuing.
+        let (key, crt) = crate::tls::load_certs_blocking(&tls_config);
+        while let Err(e) =
+            crate::tls::update_key_path_blocking(Path::new(&self.params.pgdata), &key, &crt)
+        {
+            error!("could not save TLS certificates: {e}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
         // spawn a thread for the permanent cert tracking task
+        let handle = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
+            let _rt = handle.enter();
             let pgdata_path = Path::new(&self.params.pgdata);
 
             while let ControlFlow::Continue(()) =
@@ -1822,6 +1833,8 @@ impl ComputeNode {
         pgdata_path: &Path,
         tls_config: &TlsConfig,
     ) -> ControlFlow<()> {
+        let (key, crt) = crate::tls::load_certs_blocking(tls_config);
+
         // we need to wait until it's running before we trigger a reload
         let mut state = self.state.lock().unwrap();
         loop {
@@ -1835,7 +1848,40 @@ impl ComputeNode {
                 // Reload TLS for the running compute
                 ComputeStatus::Running => {
                     info!("reloading compute due to TLS certificate renewal");
-                    break;
+
+                    // transition to the reloading state.
+                    state.set_status(ComputeStatus::Reloading, &self.state_changed);
+                    let spec = state.pspec.as_ref().unwrap().spec.clone();
+                    // unlock while reloading, so we don't block other tasks.
+                    // they shouldn't touch the status, but at least they can read it :)
+                    drop(state);
+
+                    // postgres requires the keyfile to be in a secure file,
+                    // currently too complicated to ensure that at the VM level,
+                    // so we just copy them to another file instead. :shrug:
+                    //
+                    // We do this while holding the `Reloading` state to ensure that no other concurrent reloads occur
+                    // until we finish this update.
+                    let res = crate::tls::update_key_path_blocking(pgdata_path, &key, &crt);
+                    let res = res.and_then(|()| self.reload(spec));
+
+                    state = self.state.lock().unwrap();
+                    assert_eq!(
+                        state.status,
+                        ComputeStatus::Reloading,
+                        "no other task should modify the status while reloading"
+                    );
+
+                    // set back to running.
+                    state.set_status(ComputeStatus::Running, &self.state_changed);
+
+                    if let Err(e) = res {
+                        error!("could not reload compute node: {}", e);
+                        continue;
+                    }
+
+                    info!("compute node reloaded");
+                    return ControlFlow::Continue(());
                 }
 
                 // exit loop
@@ -1851,33 +1897,6 @@ impl ComputeNode {
                     state = self.state_changed.wait(state).unwrap();
                 }
             }
-        }
-
-        // transition to the reloading state.
-        state.set_status(ComputeStatus::Reloading, &self.state_changed);
-        let spec = state.pspec.as_ref().unwrap().spec.clone();
-        // unlock while reloading, so we don't block other tasks.
-        drop(state);
-
-        // postgres requires the keyfile to be in a secure file,
-        // currently too complicated to ensure that at the VM level,
-        // so we just copy them to another file instead. :shrug:
-        //
-        // We do this while holding the `Reloading` state to ensure that no other concurrent reloads occur
-        // until we finish this update.
-        crate::tls::update_key_path_blocking(pgdata_path, tls_config);
-
-        let res = self.reload(spec);
-        let mut state = self.state.lock().unwrap();
-
-        if let Err(e) = res {
-            error!("could not reload compute node: {}", e);
-            state.set_status(ComputeStatus::Failed, &self.state_changed);
-            ControlFlow::Break(())
-        } else {
-            info!("compute node reloaded");
-            state.set_status(ComputeStatus::Running, &self.state_changed);
-            ControlFlow::Continue(())
         }
     }
 
