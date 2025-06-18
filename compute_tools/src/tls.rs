@@ -99,6 +99,8 @@ pub fn update_key_path_blocking(pg_data: &Path, key: &str, crt: &str) -> Result<
 fn verify_key_cert(key: &str, cert: &str) -> Result<()> {
     use x509_cert::Certificate;
     use x509_cert::der::oid::db::rfc5912::ECDSA_WITH_SHA_256;
+    use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
+    use x509_cert::der::pem;
 
     let certs = Certificate::load_pem_chain(cert.as_bytes())
         .context("decoding PEM encoded certificates")?;
@@ -119,6 +121,16 @@ fn verify_key_cert(key: &str, cert: &str) -> Result<()> {
         ECDSA_WITH_SHA_256 => {
             let key = p256::SecretKey::from_sec1_pem(key).context("parse key")?;
             if *key.public_key().to_sec1_bytes() != *pubkey {
+                bail!("private key file does not match certificate")
+            }
+        }
+        ID_ED_25519 => {
+            use ring::signature::{Ed25519KeyPair, KeyPair};
+
+            let (_, bytes) = pem::decode_vec(key.as_bytes())
+                .map_err(|_| anyhow::anyhow!("invalid key encoding"))?;
+            let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&bytes).context("parse key")?;
+            if *key.public_key().as_ref() != *pubkey {
                 bail!("private key file does not match certificate")
             }
         }
