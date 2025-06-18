@@ -653,8 +653,8 @@ impl ComputeNode {
         if let Some(tls) = &self.compute_ctl_config.tls {
             let this = self.clone();
             let tls = tls.clone();
-            pre_tasks.spawn(async move {
-                this.watch_cert_for_changes(tls).await;
+            pre_tasks.spawn_blocking(move || {
+                this.watch_cert_for_changes(tls);
 
                 Ok::<(), anyhow::Error>(())
             });
@@ -1745,7 +1745,7 @@ impl ComputeNode {
 
     /// Tell postgres/pgbouncer/local_proxy to reload their configurations.
     #[instrument(skip_all)]
-    pub fn reload<'a>(&self, spec: ComputeSpec) -> Result<()> {
+    pub fn reload(&self, spec: ComputeSpec) -> Result<()> {
         let rt = tokio::runtime::Handle::current();
         if spec.pgbouncer_settings.is_some() {
             rt.block_on(reload_pgbouncer())?;
@@ -1796,21 +1796,17 @@ impl ComputeNode {
         Ok(())
     }
 
-    pub async fn watch_cert_for_changes(self: Arc<Self>, tls_config: TlsConfig) {
+    pub fn watch_cert_for_changes(self: Arc<Self>, tls_config: TlsConfig) {
         // wait until the cert exists.
-        let path = tls_config.cert_path.clone();
-        let mut digest = tokio::task::spawn_blocking(move || crate::tls::compute_digest(&path))
-            .await
-            .unwrap();
+        let mut digest = crate::tls::compute_digest(&tls_config.cert_path);
         info!("TLS certificates found");
-
-        let pgdata_path = Path::new(&self.params.pgdata);
-        let postgresql_conf_path = pgdata_path.join("postgresql.conf");
 
         // spawn a thread for the permanent cert tracking task
         std::thread::spawn(move || {
+            let pgdata_path = Path::new(&self.params.pgdata);
+
             while let ControlFlow::Continue(()) =
-                self.reload_on_cert_changed(&postgresql_conf_path, &tls_config)
+                self.reload_on_cert_changed(pgdata_path, &tls_config)
             {
                 // wait for new certificates
                 digest = crate::tls::wait_until_cert_changed(digest, &tls_config.cert_path);
@@ -1823,14 +1819,9 @@ impl ComputeNode {
     /// Update certificate files and trigger a reload.
     pub fn reload_on_cert_changed(
         &self,
-        postgresql_conf_path: &Path,
+        pgdata_path: &Path,
         tls_config: &TlsConfig,
     ) -> ControlFlow<()> {
-        // postgres requires the keyfile to be in a secure file,
-        // currently too complicated to ensure that at the VM level,
-        // so we just copy them to another file instead. :shrug:
-        crate::tls::update_key_path_blocking(postgresql_conf_path, tls_config);
-
         // we need to wait until it's running before we trigger a reload
         let mut state = self.state.lock().unwrap();
         loop {
@@ -1855,7 +1846,7 @@ impl ComputeNode {
                 // wait
                 ComputeStatus::Init
                 | ComputeStatus::Configuration
-                | ComputeStatus::Reload
+                | ComputeStatus::Reloading
                 | ComputeStatus::Empty => {
                     state = self.state_changed.wait(state).unwrap();
                 }
@@ -1863,10 +1854,18 @@ impl ComputeNode {
         }
 
         // transition to the reloading state.
-        state.set_status(ComputeStatus::Reload, &self.state_changed);
+        state.set_status(ComputeStatus::Reloading, &self.state_changed);
         let spec = state.pspec.as_ref().unwrap().spec.clone();
         // unlock while reloading, so we don't block other tasks.
         drop(state);
+
+        // postgres requires the keyfile to be in a secure file,
+        // currently too complicated to ensure that at the VM level,
+        // so we just copy them to another file instead. :shrug:
+        //
+        // We do this while holding the `Reloading` state to ensure that no other concurrent reloads occur
+        // until we finish this update.
+        crate::tls::update_key_path_blocking(pgdata_path, tls_config);
 
         let res = self.reload(spec);
         let mut state = self.state.lock().unwrap();

@@ -40,7 +40,7 @@ pub(in crate::http) async fn configure(
                 // ideal state.
                 ComputeStatus::Empty | ComputeStatus::Running => break,
                 // we need to wait until reloaded
-                ComputeStatus::Reload => {
+                ComputeStatus::Reloading => {
                     state = c.state_changed.wait(state).unwrap();
                 }
                 // All other cases are unexpected.

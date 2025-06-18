@@ -48,9 +48,9 @@ fn try_compute_digest(cert_path: &str) -> Result<CertDigest> {
 pub const SERVER_CRT: &str = "server.crt";
 pub const SERVER_KEY: &str = "server.key";
 
-pub fn update_key_path_blocking(postgresql_conf_path: &Path, tls_config: &TlsConfig) {
+pub fn update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) {
     loop {
-        match try_update_key_path_blocking(postgresql_conf_path, tls_config) {
+        match try_update_key_path_blocking(pg_data, tls_config) {
             Ok(()) => break,
             Err(e) => {
                 tracing::error!(error = ?e, "could not create key file");
@@ -63,7 +63,7 @@ pub fn update_key_path_blocking(postgresql_conf_path: &Path, tls_config: &TlsCon
 // Postgres requires the keypath be "secure". This means
 // 1. Owned by the postgres user.
 // 2. Have permission 600.
-fn try_update_key_path_blocking(postgresql_conf_path: &Path, tls_config: &TlsConfig) -> Result<()> {
+fn try_update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) -> Result<()> {
     let key = std::fs::read_to_string(&tls_config.key_path)?;
     let crt = std::fs::read_to_string(&tls_config.cert_path)?;
 
@@ -75,14 +75,14 @@ fn try_update_key_path_blocking(postgresql_conf_path: &Path, tls_config: &TlsCon
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(postgresql_conf_path.join(SERVER_KEY))?;
+        .open(pg_data.join(SERVER_KEY))?;
 
     let mut crt_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(postgresql_conf_path.join(SERVER_CRT))?;
+        .open(pg_data.join(SERVER_CRT))?;
 
     // There's a chance that postgres/pgbouncer/local_proxy reloads halfway between
     // these writes and reads the wrong keys to the wrong certs.

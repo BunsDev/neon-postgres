@@ -102,7 +102,7 @@ pub enum ComputeStatus {
     // Compute configuration was requested.
     ConfigurationPending,
     // Postgres is currently being reloaded.
-    Reload,
+    Reloading,
     // Compute node has spec and initial startup and
     // configuration is in progress.
     Init,
@@ -130,7 +130,7 @@ impl Display for ComputeStatus {
         match self {
             ComputeStatus::Empty => f.write_str("empty"),
             ComputeStatus::ConfigurationPending => f.write_str("configuration-pending"),
-            ComputeStatus::Reload => f.write_str("reload"),
+            ComputeStatus::Reloading => f.write_str("reloading"),
             ComputeStatus::Init => f.write_str("init"),
             ComputeStatus::Running => f.write_str("running"),
             ComputeStatus::Configuration => f.write_str("configuration"),
