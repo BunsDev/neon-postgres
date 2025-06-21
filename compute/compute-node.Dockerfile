@@ -1628,11 +1628,11 @@ RUN make install USE_PGXS=1 -j $(getconf _NPROCESSORS_ONLN)
 FROM pg-build-with-cargo AS neon-ext-build
 ARG PG_VERSION
 
-USER nonroot
-WORKDIR /home/nonroot
-
+USER root
 COPY . .
-RUN make -j $(getconf _NPROCESSORS_ONLN) -C pgxn -s install-compute
+
+RUN make -j $(getconf _NPROCESSORS_ONLN) -C pgxn -s install-compute \
+      BUILD_TYPE=release CARGO_BUILD_FLAGS="--locked --release" NEON_CARGO_ARTIFACT_TARGET_DIR="$(pwd)/target/release"
 
 #########################################################################################
 #

@@ -60,7 +60,7 @@ WALPROP_OBJS = \
 neon.o: communicator/communicator_bindings.h
 
 $(NEON_CARGO_ARTIFACT_TARGET_DIR)/libcommunicator.a communicator/communicator_bindings.h &:
-	(cd $(srcdir)/communicator && cargo build)
+	(cd $(srcdir)/communicator && cargo build $(CARGO_BUILD_FLAGS))
 
 # Force `cargo build` every time. Some of the Rust sources might have
 # changed.
