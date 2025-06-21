@@ -1628,7 +1628,10 @@ RUN make install USE_PGXS=1 -j $(getconf _NPROCESSORS_ONLN)
 FROM pg-build-with-cargo AS neon-ext-build
 ARG PG_VERSION
 
-COPY pgxn/ pgxn/
+USER nonroot
+WORKDIR /home/nonroot
+
+COPY . .
 RUN make -j $(getconf _NPROCESSORS_ONLN) -C pgxn -s install-compute
 
 #########################################################################################
