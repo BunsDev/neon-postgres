@@ -20,7 +20,7 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
         if event is not None:
             event.set()
 
-        status, response = client.profile_cpu(100, 5, False)
+        status, response = client.start_profiling_cpu(100, 5)
         if status == 200:
             log.info("CPU profiling finished")
             profile = profile_pb2.Profile()
@@ -45,14 +45,14 @@ def _stop_profiling_cpu(client: EndpointHttpClient, event: threading.Event | Non
         if event is not None:
             event.set()
 
-        status, response = client.profile_cpu(100, 5, True)
+        status = client.stop_profiling_cpu()
         if status == 200:
             log.info("CPU profiling stopped successfully")
         elif status == 412:
             log.info("CPU profiling is not running, nothing to do")
         else:
-            log.error(f"Failed to stop CPU profiling: {status}: {response}")
-            raise HTTPError(f"Failed to stop CPU profiling: {status}: {response}")
+            log.error(f"Failed to stop CPU profiling: {status}")
+            raise HTTPError(f"Failed to stop CPU profiling: {status}")
     except Exception as e:
         log.error(f"Error stopping CPU profiling: {e}")
         raise
@@ -197,61 +197,6 @@ def test_compute_profiling_cpu_conflict(neon_simple_env: NeonEnv):
 
     endpoint.stop()
     endpoint.start()
-
-# def test_compute_profiling_cpu_start_and_stop_twice(neon_simple_env: NeonEnv):
-#     """
-#     Test that CPU profiling can be started and stopped correctly, and
-#     that the state changes correctly..
-#     """
-#     env = neon_simple_env
-#     endpoint = env.endpoints.create_start("main")
-#     pg_conn = endpoint.connect()
-#     pg_cur = pg_conn.cursor()
-#     pg_cur.execute("create database profiling_test")
-#     http_client = endpoint.http_client()
-#     event = threading.Event()
-
-#     def _wait_and_assert_cpu_profiling_local():
-#         # Should raise as the profiling will be stopped.
-#         with pytest.raises(HTTPError) as _:
-#             _wait_and_assert_cpu_profiling(http_client, event)
-
-#     thread = threading.Thread(target=_wait_and_assert_cpu_profiling_local)
-#     thread.start()
-
-#     def insert_rows():
-#         event.wait()  # Wait for profiling to be ready to start
-#         lfc_conn = endpoint.connect(dbname="profiling_test")
-#         lfc_cur = lfc_conn.cursor()
-#         n_records = 0
-#         duration = 1
-#         log.info(f"Inserting rows")
-#         lfc_cur.execute(
-#             "create table t(pk integer primary key, payload text default repeat('?', 128))"
-#         )
-#         end_time = time.time() + duration
-#         while time.time() < end_time:
-#             n_records += 1
-#             lfc_cur.execute(f"insert into t (pk) values ({n_records})")
-#         log.info(f"Inserted {n_records} rows")
-
-#     thread2 = threading.Thread(target=insert_rows)
-#     thread2.start()
-
-#     event.wait()  # Wait for profiling to be ready to start
-#     time.sleep(1)  # Give some time for the profiling to start
-#     _stop_profiling_cpu(http_client, None)
-#     # Should raise as the profiling is already stopped.
-#     with pytest.raises(HTTPError) as exc_info:
-#         _stop_profiling_cpu(http_client, None)
-#         assert exc_info.value.response.status_code == 412
-
-#     # The profiling should still be running and finish normally.
-#     thread.join(timeout=60)
-#     thread2.join(timeout=60)
-
-#     endpoint.stop()
-#     endpoint.start()
 
 def test_compute_profiling_cpu_stop_when_not_running(neon_simple_env: NeonEnv):
     """

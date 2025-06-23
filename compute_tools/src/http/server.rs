@@ -7,7 +7,7 @@ use anyhow::Result;
 use axum::Router;
 use axum::middleware::{self};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use compute_api::responses::ComputeCtlConfig;
 use http::StatusCode;
 use tokio::net::TcpListener;
@@ -96,7 +96,10 @@ impl From<&Server> for Router<Arc<ComputeNode>> {
                     .route("/metrics.json", get(metrics_json::get_metrics))
                     .route("/status", get(status::get_status))
                     .route("/terminate", post(terminate::terminate))
-                    .route("/profile/cpu", get(profile::profile))
+                    .route(
+                        "/profile/cpu",
+                        get(profile::profile_start).delete(profile::profile_stop),
+                    )
                     .layer(AsyncRequireAuthorizationLayer::new(Authorize::new(
                         compute_id.clone(),
                         config.jwks.clone(),

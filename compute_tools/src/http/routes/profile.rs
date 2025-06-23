@@ -18,6 +18,9 @@ use crate::http::JsonResponse;
 
 const PERF_BINARY_PATH: &str = "/usr/bin/perf";
 
+static CANCEL_CHANNEL: Lazy<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
+    Lazy::new(|| Mutex::new(None));
+
 fn default_sampling_frequency() -> u16 {
     100
 }
@@ -26,68 +29,88 @@ fn default_timeout_seconds() -> u8 {
     5
 }
 
+fn deserialize_sampling_frequency<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    const MIN_SAMPLING_FREQUENCY: u16 = 1;
+    const MAX_SAMPLING_FREQUENCY: u16 = 1000;
+
+    let value = u16::deserialize(deserializer)?;
+
+    if !(MIN_SAMPLING_FREQUENCY..=MAX_SAMPLING_FREQUENCY).contains(&value) {
+        return Err(serde::de::Error::custom(format!(
+            "sampling_frequency must be between {MIN_SAMPLING_FREQUENCY} and {MAX_SAMPLING_FREQUENCY}, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
+fn deserialize_profiling_timeout<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    const MIN_TIMEOUT_SECONDS: u8 = 1;
+    const MAX_TIMEOUT_SECONDS: u8 = 60;
+
+    let value = u8::deserialize(deserializer)?;
+
+    if !(MIN_TIMEOUT_SECONDS..=MAX_TIMEOUT_SECONDS).contains(&value) {
+        return Err(serde::de::Error::custom(format!(
+            "timeout_seconds must be between {MIN_TIMEOUT_SECONDS} and {MAX_TIMEOUT_SECONDS}, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
 /// Request parameters for profiling the compute.
 #[derive(Debug, Copy, Clone, serde::Deserialize)]
 pub(in crate::http) struct ProfileRequest {
     #[serde(default = "default_sampling_frequency")]
+    #[serde(deserialize_with = "deserialize_sampling_frequency")]
     sampling_frequency: u16,
     #[serde(default = "default_timeout_seconds")]
+    #[serde(deserialize_with = "deserialize_profiling_timeout")]
     timeout_seconds: u8,
-    #[serde(default)]
-    should_stop: bool,
 }
 
-impl ProfileRequest {
-    fn validate(&self) -> Result<(), String> {
-        if self.sampling_frequency < 1 || self.sampling_frequency > 1000 {
-            return Err("sampling_frequency must be between 1 and 1000".to_string());
+/// The HTTP request handler for stopping profiling the compute.
+pub(in crate::http) async fn profile_stop() -> impl IntoResponse {
+    tracing::info!("Profile stop request received.");
+
+    match CANCEL_CHANNEL.lock().await.take() {
+        Some(tx) => {
+            if tx.send(()).is_err() {
+                tracing::error!("Failed to send cancellation signal.");
+                return JsonResponse::create_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to send cancellation signal",
+                );
+            }
+            JsonResponse::create_response(StatusCode::OK, "Profiling stopped successfully.")
         }
-        if self.timeout_seconds < 1 || self.timeout_seconds > 60 {
-            return Err("timeout_seconds must be between 1 and 60".to_string());
-        }
-        Ok(())
+        None => JsonResponse::create_response(
+            StatusCode::PRECONDITION_FAILED,
+            "Profiling is not in progress, there is nothing to stop.",
+        ),
     }
 }
 
-/// The HTTP request handler for profiling the compute.
-pub(in crate::http) async fn profile(Query(request): Query<ProfileRequest>) -> impl IntoResponse {
-    static CANCEL_CHANNEL: Lazy<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
-        Lazy::new(|| Mutex::new(None));
-
-    tracing::info!("Profile request received: {request:?}");
-
-    if let Err(e) = request.validate() {
-        return JsonResponse::create_response(
-            StatusCode::BAD_REQUEST,
-            format!("Invalid request parameters: {e}"),
-        );
-    }
+/// The HTTP request handler for starting profiling the compute.
+pub(in crate::http) async fn profile_start(
+    Query(request): Query<ProfileRequest>,
+) -> impl IntoResponse {
+    tracing::info!("Profile start request received: {request:?}");
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
     match CANCEL_CHANNEL.try_lock() {
         Ok(mut cancel_channel) => {
-            if request.should_stop {
-                if let Some(old_tx) = cancel_channel.take() {
-                    if old_tx.send(()).is_err() {
-                        tracing::error!("Failed to send cancellation signal.");
-                        return JsonResponse::create_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Failed to send cancellation signal",
-                        );
-                    } else {
-                        return JsonResponse::create_response(
-                            StatusCode::OK,
-                            "Profiling stopped successfully.",
-                        );
-                    }
-                } else {
-                    return JsonResponse::create_response(
-                        StatusCode::PRECONDITION_FAILED,
-                        "Profiling is not in progress, there is nothing to stop.",
-                    );
-                }
-            } else if cancel_channel.is_some() {
+            if cancel_channel.is_some() {
                 return JsonResponse::create_response(
                     StatusCode::CONFLICT,
                     "Profiling is already in progress.",
