@@ -125,8 +125,10 @@ cargo-target-dir:
 neon-pg-ext-%: postgres-install-% cargo-target-dir
 	+@echo "Compiling neon-specific Postgres extensions for $*"
 	mkdir -p $(BUILD_DIR)/pgxn-$*
-	$(MAKE) PG_CONFIG=$(POSTGRES_INSTALL_DIR)/$*/bin/pg_config COPT='$(COPT)' \
-		NEON_CARGO_ARTIFACT_TARGET_DIR=$(NEON_CARGO_ARTIFACT_TARGET_DIR) \
+	$(MAKE) PG_CONFIG="$(POSTGRES_INSTALL_DIR)/$*/bin/pg_config" COPT='$(COPT)' \
+		NEON_CARGO_ARTIFACT_TARGET_DIR="$(NEON_CARGO_ARTIFACT_TARGET_DIR)" \
+		CARGO_BUILD_FLAGS="$(CARGO_BUILD_FLAGS)" \
+		CARGO_PROFILE="$(CARGO_PROFILE)" \
 		-C $(BUILD_DIR)/pgxn-$*\
 		-f $(ROOT_PROJECT_DIR)/pgxn/Makefile  install
 
