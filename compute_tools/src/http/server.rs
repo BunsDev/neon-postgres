@@ -7,7 +7,7 @@ use anyhow::Result;
 use axum::Router;
 use axum::middleware::{self};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use compute_api::responses::ComputeCtlConfig;
 use http::StatusCode;
 use tokio::net::TcpListener;
