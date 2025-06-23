@@ -7,9 +7,8 @@
 //! available at `/usr/bin/perf`.
 use std::sync::atomic::Ordering;
 
-use axum::body::Body;
 use axum::extract::Query;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use http::StatusCode;
 use nix::unistd::Pid;
 use once_cell::sync::Lazy;
@@ -59,7 +58,7 @@ pub(in crate::http) async fn profile(Query(request): Query<ProfileRequest>) -> i
 
     if let Err(e) = request.validate() {
         return JsonResponse::create_response(
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
             format!("Invalid request parameters: {e}"),
         );
     }

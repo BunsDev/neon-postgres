@@ -33,7 +33,7 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
             log.error("CPU profiling is already in progress, nothing to do")
             raise HTTPError(f"Failed to finish CPU profiling: profiling is already in progress.")
     except Exception as e:
-        log.error(f"Error starting CPU profiling: {e}")
+        log.error(f"Error finishing CPU profiling: {e}")
         raise
 
 def _stop_profiling_cpu(client: EndpointHttpClient, event: threading.Event | None):
@@ -57,6 +57,29 @@ def _stop_profiling_cpu(client: EndpointHttpClient, event: threading.Event | Non
         log.error(f"Error stopping CPU profiling: {e}")
         raise
 
+def _wait_and_assert_cpu_profiling(http_client: EndpointHttpClient, event: threading.Event | None):
+    profile = _start_profiling_cpu(http_client, event)
+
+    if profile is None:
+        log.error("The received profiling data is malformed or empty.")
+        return
+
+    assert len(profile.sample) > 0, "No samples found in CPU profiling data"
+    assert len(profile.mapping) > 0, "No mappings found in CPU profiling data"
+    assert len(profile.location) > 0, "No locations found in CPU profiling data"
+    assert len(profile.function) > 0, "No functions found in CPU profiling data"
+    assert len(profile.string_table) > 0, "No string tables found in CPU profiling data"
+    for string in [
+        "PostgresMain",
+        "ServerLoop",
+        "BackgroundWorkerMain",
+        "pq_recvbuf",
+        "pq_getbyte",
+    ]:
+        assert string in profile.string_table, (
+            f"Expected function '{string}' not found in string table"
+        )
+
 
 def test_compute_profiling_cpu_with_timeout(neon_simple_env: NeonEnv):
     """
@@ -70,30 +93,10 @@ def test_compute_profiling_cpu_with_timeout(neon_simple_env: NeonEnv):
     http_client = endpoint.http_client()
     event = threading.Event()
 
-    def _wait_and_assert_cpu_profiling():
-        profile = _start_profiling_cpu(http_client, event)
+    def _wait_and_assert_cpu_profiling_local():
+        _wait_and_assert_cpu_profiling(http_client, event)
 
-        if profile is None:
-            log.error("The received profiling data is malformed or empty.")
-            return
-
-        assert len(profile.sample) > 0, "No samples found in CPU profiling data"
-        assert len(profile.mapping) > 0, "No mappings found in CPU profiling data"
-        assert len(profile.location) > 0, "No locations found in CPU profiling data"
-        assert len(profile.function) > 0, "No functions found in CPU profiling data"
-        assert len(profile.string_table) > 0, "No string tables found in CPU profiling data"
-        for string in [
-            "PostgresMain",
-            "ServerLoop",
-            "BackgroundWorkerMain",
-            "pq_recvbuf",
-            "pq_getbyte",
-        ]:
-            assert string in profile.string_table, (
-                f"Expected function '{string}' not found in string table"
-            )
-
-    thread = threading.Thread(target=_wait_and_assert_cpu_profiling)
+    thread = threading.Thread(target=_wait_and_assert_cpu_profiling_local)
     thread.start()
 
     def insert_rows():
@@ -138,6 +141,11 @@ def test_compute_profiling_cpu_start_and_stop(neon_simple_env: NeonEnv):
     time.sleep(1)  # Give some time for the profiling to start
     _stop_profiling_cpu(http_client, None)
 
+    # Should raise as the profiling is already stopped.
+    with pytest.raises(HTTPError) as exc_info:
+        _stop_profiling_cpu(http_client, None)
+        assert exc_info.value.response.status_code == 412
+
     thread.join(timeout=60)
 
     endpoint.stop()
@@ -145,7 +153,116 @@ def test_compute_profiling_cpu_start_and_stop(neon_simple_env: NeonEnv):
 
 
 def test_compute_profiling_cpu_conflict(neon_simple_env: NeonEnv):
-    pass
+    """
+    Test that CPU profiling can be started and stopped correctly.
+    """
+    env = neon_simple_env
+    endpoint = env.endpoints.create_start("main")
+    pg_conn = endpoint.connect()
+    pg_cur = pg_conn.cursor()
+    pg_cur.execute("create database profiling_test")
+    http_client = endpoint.http_client()
+    event = threading.Event()
 
-def test_compute_profiling_cpu_stop_twice(neon_simple_env: NeonEnv):
-    pass
+    def _wait_and_assert_cpu_profiling_local():
+        _wait_and_assert_cpu_profiling(http_client, event)
+
+    thread = threading.Thread(target=_wait_and_assert_cpu_profiling_local)
+    thread.start()
+
+    def insert_rows():
+        event.wait()  # Wait for profiling to be ready to start
+        lfc_conn = endpoint.connect(dbname="profiling_test")
+        lfc_cur = lfc_conn.cursor()
+        n_records = 10000
+        log.info(f"Inserting {n_records} rows")
+        lfc_cur.execute(
+            "create table t(pk integer primary key, payload text default repeat('?', 128))"
+        )
+        lfc_cur.execute(f"insert into t (pk) values (generate_series(1,{n_records}))")
+        log.info(f"Inserted {n_records} rows")
+
+    thread2 = threading.Thread(target=insert_rows)
+    thread2.start()
+
+    event.wait()  # Wait for profiling to be ready to start
+    time.sleep(1)  # Give some time for the profiling to start
+    # Should raise as the profiling is already in progress.
+    with pytest.raises(HTTPError) as _:
+        _start_profiling_cpu(http_client, None)
+
+    # The profiling should still be running and finish normally.
+    thread.join(timeout=60)
+    thread2.join(timeout=60)
+
+    endpoint.stop()
+    endpoint.start()
+
+# def test_compute_profiling_cpu_start_and_stop_twice(neon_simple_env: NeonEnv):
+#     """
+#     Test that CPU profiling can be started and stopped correctly, and
+#     that the state changes correctly..
+#     """
+#     env = neon_simple_env
+#     endpoint = env.endpoints.create_start("main")
+#     pg_conn = endpoint.connect()
+#     pg_cur = pg_conn.cursor()
+#     pg_cur.execute("create database profiling_test")
+#     http_client = endpoint.http_client()
+#     event = threading.Event()
+
+#     def _wait_and_assert_cpu_profiling_local():
+#         # Should raise as the profiling will be stopped.
+#         with pytest.raises(HTTPError) as _:
+#             _wait_and_assert_cpu_profiling(http_client, event)
+
+#     thread = threading.Thread(target=_wait_and_assert_cpu_profiling_local)
+#     thread.start()
+
+#     def insert_rows():
+#         event.wait()  # Wait for profiling to be ready to start
+#         lfc_conn = endpoint.connect(dbname="profiling_test")
+#         lfc_cur = lfc_conn.cursor()
+#         n_records = 0
+#         duration = 1
+#         log.info(f"Inserting rows")
+#         lfc_cur.execute(
+#             "create table t(pk integer primary key, payload text default repeat('?', 128))"
+#         )
+#         end_time = time.time() + duration
+#         while time.time() < end_time:
+#             n_records += 1
+#             lfc_cur.execute(f"insert into t (pk) values ({n_records})")
+#         log.info(f"Inserted {n_records} rows")
+
+#     thread2 = threading.Thread(target=insert_rows)
+#     thread2.start()
+
+#     event.wait()  # Wait for profiling to be ready to start
+#     time.sleep(1)  # Give some time for the profiling to start
+#     _stop_profiling_cpu(http_client, None)
+#     # Should raise as the profiling is already stopped.
+#     with pytest.raises(HTTPError) as exc_info:
+#         _stop_profiling_cpu(http_client, None)
+#         assert exc_info.value.response.status_code == 412
+
+#     # The profiling should still be running and finish normally.
+#     thread.join(timeout=60)
+#     thread2.join(timeout=60)
+
+#     endpoint.stop()
+#     endpoint.start()
+
+def test_compute_profiling_cpu_stop_when_not_running(neon_simple_env: NeonEnv):
+    """
+    Test that CPU profiling throws the expected error when is attempted
+    to be stopped when it hasn't be running.
+    """
+    env = neon_simple_env
+    endpoint = env.endpoints.create_start("main")
+    http_client = endpoint.http_client()
+
+    for _ in range(3):
+        with pytest.raises(HTTPError) as exc_info:
+            _stop_profiling_cpu(http_client, None)
+            assert exc_info.value.response.status_code == 412
