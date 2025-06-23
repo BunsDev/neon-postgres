@@ -116,9 +116,9 @@ pub struct ProfileGenerationOptions<'a, S: AsRef<str>> {
     /// that are created by the main process after it has already
     /// started profiling.
     pub follow_forks: bool,
-    /// The sampling frequency in Hz. If `None`, it defaults to 99 Hz.
+    /// The sampling frequency in Hz.
     /// This is the frequency at which stack traces will be sampled.
-    pub sampling_frequency: Option<u32>,
+    pub sampling_frequency: u32,
     /// A list of symbols to block from the profiling output.
     /// This is useful for filtering out noise from the profiling data,
     /// such as system libraries or other irrelevant symbols.
@@ -173,13 +173,11 @@ pub fn generate_pprof_using_perf<S: AsRef<str>>(
 
     // Step 1: Run perf to collect stack traces
     let mut perf_record_command = if options.run_with_sudo {
-        std::process::Command::new(SUDO_PATH)
+        let mut cmd = std::process::Command::new(SUDO_PATH);
+        cmd.arg(&perf_binary_path);
+        cmd
     } else {
         std::process::Command::new(&perf_binary_path)
-    };
-
-    if options.run_with_sudo {
-        perf_record_command.arg(&perf_binary_path);
     };
 
     let mut perf_record_command = perf_record_command
@@ -189,7 +187,7 @@ pub fn generate_pprof_using_perf<S: AsRef<str>>(
         .arg(pids)
         // Specify the sampling frequency or default to 99 Hz.
         .arg("-F")
-        .arg(options.sampling_frequency.unwrap_or(99).to_string())
+        .arg(options.sampling_frequency.to_string())
         // Enable call-graph (stack chain/backtrace) recording for both
         // kernel space and user space.
         .arg("-g");
@@ -205,25 +203,23 @@ pub fn generate_pprof_using_perf<S: AsRef<str>>(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    let perf_record_pid = perf_record_command.id();
+
+    let perf_record_stdout = perf_record_command
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture perf record output"))?;
 
     let perf_script_command = std::process::Command::new(&perf_binary_path)
         .arg("script")
         .arg("-i")
         .arg("-")
-        .stdin(
-            perf_record_command
-                .stdout
-                .take()
-                .expect("Failed to capture perf output"),
-        )
+        .stdin(perf_record_stdout)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
     std::thread::spawn(move || {
         use crossbeam_channel::{after, select};
-        use nix::sys::signal::Signal;
 
         if let Some(rx) = options.should_stop {
             select! {
@@ -238,12 +234,7 @@ pub fn generate_pprof_using_perf<S: AsRef<str>>(
             std::thread::sleep(options.timeout);
         }
 
-        // SAFETY:
-        // unsafe because of the use of `kill` to send a signal to the
-        // process.
-        unsafe {
-            let _ = kill(perf_record_pid as i32, Signal::SIGINT as i32);
-        }
+        let _ = perf_record_command.kill();
     });
 
     let perf_script_output = perf_script_command.wait_with_output()?;

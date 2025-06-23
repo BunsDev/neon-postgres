@@ -113,7 +113,7 @@ pub(in crate::http) async fn profile(Query(request): Query<ProfileRequest>) -> R
         perf_binary_path: Some(PERF_BINARY_PATH.as_ref()),
         process_pid: pg_pid,
         follow_forks: true,
-        sampling_frequency: Some(request.sampling_frequency as u32),
+        sampling_frequency: request.sampling_frequency as u32,
         blocklist_symbols: &["libc", "libgcc", "pthread", "vdso"],
         timeout: std::time::Duration::from_secs(request.timeout_seconds as u64),
         should_stop: Some(rx),
