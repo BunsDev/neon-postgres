@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Tuple
 
 import urllib.parse
 from enum import StrEnum
@@ -96,7 +97,7 @@ class EndpointHttpClient(requests.Session):
 
     def profile_cpu(
         self, sampling_frequency: int, timeout_seconds: int, should_stop: bool
-    ) -> bytes:
+    ) -> Tuple[int, bytes]:
         should_stop_str = "false"
         if should_stop:
             should_stop_str = "true"
@@ -113,11 +114,9 @@ class EndpointHttpClient(requests.Session):
             auth=self.auth,
         )
 
-        if res.status_code != 200:
-            log.error(f"Failed to profile CPU: {res.status_code} {res.text}")
-            res.raise_for_status()
+        res.raise_for_status()
 
-        return res.content
+        return res.status_code, res.content
 
     def database_schema(self, database: str):
         res = self.get(

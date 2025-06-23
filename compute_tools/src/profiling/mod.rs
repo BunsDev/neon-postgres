@@ -8,10 +8,7 @@ use std::{
 use anyhow::anyhow;
 use flate2::{Compression, write::GzEncoder};
 use inferno::collapse::Collapse;
-use nix::{
-    libc::{kill, pid_t},
-    unistd::Pid,
-};
+use nix::{libc::pid_t, unistd::Pid};
 
 const SUDO_PATH: &str = "/usr/bin/sudo";
 
@@ -132,7 +129,7 @@ pub struct ProfileGenerationOptions<'a, S: AsRef<str>> {
     /// profiling to stop early. If provided, the profiling will stop
     /// when a message is received on this channel or when the timeout
     /// is reached, whichever comes first.
-    pub should_stop: Option<crossbeam_channel::Receiver<()>>,
+    pub should_stop: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 /// Run perf against a process with the given name and generate a pprof
@@ -149,8 +146,8 @@ pub struct ProfileGenerationOptions<'a, S: AsRef<str>> {
 /// If the perf binary path is not provided, it defaults to "perf" in
 /// the system's `PATH`.
 #[allow(unsafe_code)]
-pub fn generate_pprof_using_perf<S: AsRef<str>>(
-    options: ProfileGenerationOptions<S>,
+pub async fn generate_pprof_using_perf<S: AsRef<str>>(
+    options: ProfileGenerationOptions<'_, S>,
 ) -> anyhow::Result<PprofData> {
     let perf_binary_path = options
         .perf_binary_path
@@ -218,24 +215,39 @@ pub fn generate_pprof_using_perf<S: AsRef<str>>(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    std::thread::spawn(move || {
-        use crossbeam_channel::{after, select};
+    // std::thread::spawn(async move || {
+    //     if let Some(mut rx) = options.should_stop {
+    //         tokio::select! {
+    //             _ = &mut rx => {
+    //                 tracing::debug!("Received shutdown signal, stopping perf...");
+    //             }
+    //             _ = tokio::time::sleep(options.timeout) => {
+    //                 tracing::debug!("Timeout reached, stopping perf...");
+    //             }
+    //         }
+    //     } else {
+    //         std::thread::sleep(options.timeout);
+    //         tracing::debug!("Timeout reached, stopping perf...");
+    //     }
 
-        if let Some(rx) = options.should_stop {
-            select! {
-                recv(rx) -> _ => {
-                    println!("Received shutdown signal, stopping perf...");
-                }
-                recv(after(options.timeout)) -> _ => {
-                    println!("Timeout reached, stopping perf...");
-                }
+    //     let _ = perf_record_command.kill();
+    // });
+
+    if let Some(mut rx) = options.should_stop {
+        tokio::select! {
+            _ = &mut rx => {
+                println!("Received shutdown signal, stopping perf...");
             }
-        } else {
-            std::thread::sleep(options.timeout);
+            _ = tokio::time::sleep(options.timeout) => {
+                println!("Timeout reached, stopping perf...");
+            }
         }
+    } else {
+        tokio::time::sleep(options.timeout).await;
+        println!("Timeout reached, stopping perf...");
+    }
 
-        let _ = perf_record_command.kill();
-    });
+    let _ = perf_record_command.kill();
 
     let perf_script_output = perf_script_command.wait_with_output()?;
     if !perf_script_output.status.success() {

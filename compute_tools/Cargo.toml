@@ -80,4 +80,3 @@ inferno = { version = "0.12", default-features = false, features = ["multithread
 pprof = { version = "0.15", features = ["protobuf-codec", "flamegraph"] }
 prost = "0.12"
 procfs = "0.17"
-crossbeam-channel = "0.5"

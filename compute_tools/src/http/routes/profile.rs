@@ -51,8 +51,8 @@ impl ProfileRequest {
 }
 
 /// The HTTP request handler for profiling the compute.
-pub(in crate::http) async fn profile(Query(request): Query<ProfileRequest>) -> Response {
-    static CANCEL_CHANNEL: Lazy<Mutex<Option<crossbeam_channel::Sender<()>>>> =
+pub(in crate::http) async fn profile(Query(request): Query<ProfileRequest>) -> impl IntoResponse {
+    static CANCEL_CHANNEL: Lazy<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
         Lazy::new(|| Mutex::new(None));
 
     tracing::info!("Profile request received: {request:?}");
@@ -64,14 +64,14 @@ pub(in crate::http) async fn profile(Query(request): Query<ProfileRequest>) -> R
         );
     }
 
-    let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
     match CANCEL_CHANNEL.try_lock() {
         Ok(mut cancel_channel) => {
             if request.should_stop {
                 if let Some(old_tx) = cancel_channel.take() {
-                    if let Err(e) = old_tx.send(()) {
-                        tracing::error!("Failed to send cancellation signal: {e}");
+                    if old_tx.send(()).is_err() {
+                        tracing::error!("Failed to send cancellation signal.");
                         return JsonResponse::create_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Failed to send cancellation signal",
@@ -84,7 +84,7 @@ pub(in crate::http) async fn profile(Query(request): Query<ProfileRequest>) -> R
                     }
                 } else {
                     return JsonResponse::create_response(
-                        StatusCode::NO_CONTENT,
+                        StatusCode::PRECONDITION_FAILED,
                         "Profiling is not in progress, there is nothing to stop.",
                     );
                 }
@@ -118,7 +118,19 @@ pub(in crate::http) async fn profile(Query(request): Query<ProfileRequest>) -> R
         timeout: std::time::Duration::from_secs(request.timeout_seconds as u64),
         should_stop: Some(rx),
     };
-    let pprof_data = match crate::profiling::generate_pprof_using_perf(options) {
+
+    let pprof_data = crate::profiling::generate_pprof_using_perf(options).await;
+
+    if CANCEL_CHANNEL.lock().await.take().is_none() {
+        tracing::error!("Profiling was cancelled from another request.");
+
+        return JsonResponse::create_response(
+            StatusCode::NO_CONTENT,
+            "Profiling was cancelled from another request.",
+        );
+    }
+
+    let pprof_data = match pprof_data {
         Ok(data) => data,
         Err(e) => {
             tracing::error!("Failed to generate pprof data: {e}");

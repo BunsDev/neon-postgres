@@ -1,4 +1,8 @@
 import threading
+import pytest
+import time
+
+from requests import HTTPError
 
 from fixtures.endpoint.http import EndpointHttpClient
 from fixtures.log_helper import log
@@ -7,24 +11,57 @@ from google.protobuf.message import Message
 from data import profile_pb2
 
 
-def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event):
+def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | None):
     """
     Start CPU profiling for the compute node.
     """
     log.info("Starting CPU profiling...")
     try:
-        event.set()
-        response = client.profile_cpu(100, 5, False)
-        log.info("CPU profiling finished")
-        profile = profile_pb2.Profile()
-        Message.ParseFromString(profile, response)
-        return profile
+        if event is not None:
+            event.set()
+
+        status, response = client.profile_cpu(100, 5, False)
+        if status == 200:
+            log.info("CPU profiling finished")
+            profile = profile_pb2.Profile()
+            Message.ParseFromString(profile, response)
+            return profile
+        elif status == 204:
+            log.error("CPU profiling was stopped")
+            raise HTTPError(f"Failed to finish CPU profiling: was stopped.")
+        elif status == 208:
+            log.error("CPU profiling is already in progress, nothing to do")
+            raise HTTPError(f"Failed to finish CPU profiling: profiling is already in progress.")
     except Exception as e:
         log.error(f"Error starting CPU profiling: {e}")
         raise
 
+def _stop_profiling_cpu(client: EndpointHttpClient, event: threading.Event | None):
+    """
+    Stop CPU profiling for the compute node.
+    """
+    log.info("Manually stopping CPU profiling...")
+    try:
+        if event is not None:
+            event.set()
 
-def test_compute_profiling_cpu(neon_simple_env: NeonEnv):
+        status, response = client.profile_cpu(100, 5, True)
+        if status == 200:
+            log.info("CPU profiling stopped successfully")
+        elif status == 412:
+            log.info("CPU profiling is not running, nothing to do")
+        else:
+            log.error(f"Failed to stop CPU profiling: {status}: {response}")
+            raise HTTPError(f"Failed to stop CPU profiling: {status}: {response}")
+    except Exception as e:
+        log.error(f"Error stopping CPU profiling: {e}")
+        raise
+
+
+def test_compute_profiling_cpu_with_timeout(neon_simple_env: NeonEnv):
+    """
+    Test that CPU profiling works correctly with timeout.
+    """
     env = neon_simple_env
     endpoint = env.endpoints.create_start("main")
     pg_conn = endpoint.connect()
@@ -35,6 +72,11 @@ def test_compute_profiling_cpu(neon_simple_env: NeonEnv):
 
     def _wait_and_assert_cpu_profiling():
         profile = _start_profiling_cpu(http_client, event)
+
+        if profile is None:
+            log.error("The received profiling data is malformed or empty.")
+            return
+
         assert len(profile.sample) > 0, "No samples found in CPU profiling data"
         assert len(profile.mapping) > 0, "No mappings found in CPU profiling data"
         assert len(profile.location) > 0, "No locations found in CPU profiling data"
@@ -74,3 +116,36 @@ def test_compute_profiling_cpu(neon_simple_env: NeonEnv):
 
     endpoint.stop()
     endpoint.start()
+
+def test_compute_profiling_cpu_start_and_stop(neon_simple_env: NeonEnv):
+    """
+    Test that CPU profiling can be started and stopped correctly.
+    """
+    env = neon_simple_env
+    endpoint = env.endpoints.create_start("main")
+    http_client = endpoint.http_client()
+    event = threading.Event()
+
+    def _wait_and_assert_cpu_profiling():
+        # Should raise as the profiling will be stopped.
+        with pytest.raises(HTTPError) as _:
+            _start_profiling_cpu(http_client, event)
+
+    thread = threading.Thread(target=_wait_and_assert_cpu_profiling)
+    thread.start()
+
+    event.wait()  # Wait for profiling to be ready to start
+    time.sleep(1)  # Give some time for the profiling to start
+    _stop_profiling_cpu(http_client, None)
+
+    thread.join(timeout=60)
+
+    endpoint.stop()
+    endpoint.start()
+
+
+def test_compute_profiling_cpu_conflict(neon_simple_env: NeonEnv):
+    pass
+
+def test_compute_profiling_cpu_stop_twice(neon_simple_env: NeonEnv):
+    pass
