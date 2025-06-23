@@ -20,7 +20,7 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
         if event is not None:
             event.set()
 
-        status, response = client.start_profiling_cpu(100, 5)
+        status, response = client.start_profiling_cpu(100, 3)
         if status == 200:
             log.info("CPU profiling finished")
             profile = profile_pb2.Profile()
@@ -144,7 +144,7 @@ def test_compute_profiling_cpu_start_and_stop(neon_simple_env: NeonEnv):
     # Should raise as the profiling is already stopped.
     with pytest.raises(HTTPError) as exc_info:
         _stop_profiling_cpu(http_client, None)
-        assert exc_info.value.response.status_code == 412
+    assert exc_info.value.response.status_code == 412
 
     thread.join(timeout=60)
 
@@ -210,4 +210,22 @@ def test_compute_profiling_cpu_stop_when_not_running(neon_simple_env: NeonEnv):
     for _ in range(3):
         with pytest.raises(HTTPError) as exc_info:
             _stop_profiling_cpu(http_client, None)
-            assert exc_info.value.response.status_code == 412
+        assert exc_info.value.response.status_code == 412
+
+def test_compute_profiling_cpu_start_arguments_validation_works(neon_simple_env: NeonEnv):
+    """
+    Test that CPU profiling start request properly validated the
+    arguments and throws the expected error (bad request).
+    """
+    env = neon_simple_env
+    endpoint = env.endpoints.create_start("main")
+    http_client = endpoint.http_client()
+
+    for sampling_frequency in [-1, 0, 1000000]:
+        with pytest.raises(HTTPError) as exc_info:
+            http_client.start_profiling_cpu(sampling_frequency, 5)
+        assert exc_info.value.response.status_code == 400
+    for timeout_seconds in [-1, 0, 1000000]:
+        with pytest.raises(HTTPError) as exc_info:
+            http_client.start_profiling_cpu(5, timeout_seconds)
+        assert exc_info.value.response.status_code == 400
