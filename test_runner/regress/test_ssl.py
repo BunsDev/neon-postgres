@@ -242,9 +242,9 @@ def test_compute_tls(
     neon_env_builder.use_compute_tls = True
     env = neon_env_builder.init_start()
 
-    env.create_branch("test_startup")
+    env.create_branch("test_compute_tls")
 
-    with env.endpoints.create_start("test_startup") as endpoint:
+    with env.endpoints.create_start("test_compute_tls") as endpoint:
         res = endpoint.safe_psql(
             "select ssl from pg_stat_ssl where pid = pg_backend_pid();",
             sslmode="verify-full",

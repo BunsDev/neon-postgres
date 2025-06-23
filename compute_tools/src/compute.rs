@@ -1799,12 +1799,16 @@ impl ComputeNode {
     pub fn watch_cert_for_changes(self: Arc<Self>, tls_config: TlsConfig) {
         // wait until the cert exists.
         let mut digest = crate::tls::compute_digest(&tls_config.cert_path);
-        info!("TLS certificates found");
+        info!(
+            cert_path = tls_config.cert_path,
+            key_path = tls_config.key_path,
+            "TLS certificates found"
+        );
 
         // ensure the keys are saved before continuing.
-        let (key, crt) = crate::tls::load_certs_blocking(&tls_config);
+        let key_pair = crate::tls::load_certs_blocking(&tls_config);
         while let Err(e) =
-            crate::tls::update_key_path_blocking(Path::new(&self.params.pgdata), &key, &crt)
+            crate::tls::update_key_path_blocking(Path::new(&self.params.pgdata), &key_pair)
         {
             error!("could not save TLS certificates: {e}");
             std::thread::sleep(Duration::from_millis(20));
@@ -1822,7 +1826,11 @@ impl ComputeNode {
                 // wait for new certificates
                 digest = crate::tls::wait_until_cert_changed(digest, &tls_config.cert_path);
 
-                info!("TLS certificates renewed");
+                info!(
+                    cert_path = tls_config.cert_path,
+                    key_path = tls_config.key_path,
+                    "TLS certificates renewed",
+                );
             }
         });
     }
@@ -1833,7 +1841,7 @@ impl ComputeNode {
         pgdata_path: &Path,
         tls_config: &TlsConfig,
     ) -> ControlFlow<()> {
-        let (key, crt) = crate::tls::load_certs_blocking(tls_config);
+        let key_pair = crate::tls::load_certs_blocking(tls_config);
 
         // we need to wait until it's running before we trigger a reload
         let mut state = self.state.lock().unwrap();
@@ -1862,7 +1870,7 @@ impl ComputeNode {
                     //
                     // We do this while holding the `Reloading` state to ensure that no other concurrent reloads occur
                     // until we finish this update.
-                    let res = crate::tls::update_key_path_blocking(pgdata_path, &key, &crt);
+                    let res = crate::tls::update_key_path_blocking(pgdata_path, &key_pair);
                     let res = res.and_then(|()| self.reload(spec));
 
                     state = self.state.lock().unwrap();

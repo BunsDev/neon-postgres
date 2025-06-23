@@ -889,7 +889,7 @@ impl LocalEnv {
         Ok(pem)
     }
 
-    /// Get the TLS Config if set.
+    /// Get the TLS config if set.
     pub fn get_tls_config(&self) -> anyhow::Result<Option<TlsConfig>> {
         match self.compute_ssl_paths() {
             Some((cert_path, key_path)) => {

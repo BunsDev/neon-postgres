@@ -47,10 +47,15 @@ fn try_compute_digest(cert_path: &str) -> Result<CertDigest> {
 pub const SERVER_CRT: &str = "server.crt";
 pub const SERVER_KEY: &str = "server.key";
 
-pub fn load_certs_blocking(tls_config: &TlsConfig) -> (String, String) {
+pub struct KeyPair {
+    crt: String,
+    key: String,
+}
+
+pub fn load_certs_blocking(tls_config: &TlsConfig) -> KeyPair {
     loop {
         match try_load_certs_blocking(tls_config) {
-            Ok((key, crt)) => break (key, crt),
+            Ok(key_pair) => break key_pair,
             Err(e) => {
                 tracing::error!(error = ?e, "could not load certs");
                 std::thread::sleep(Duration::from_secs(1))
@@ -59,20 +64,20 @@ pub fn load_certs_blocking(tls_config: &TlsConfig) -> (String, String) {
     }
 }
 
-fn try_load_certs_blocking(tls_config: &TlsConfig) -> Result<(String, String)> {
+fn try_load_certs_blocking(tls_config: &TlsConfig) -> Result<KeyPair> {
     let key = std::fs::read_to_string(&tls_config.key_path)?;
     let crt = std::fs::read_to_string(&tls_config.cert_path)?;
 
     // to mitigate a race condition during renewal.
     verify_key_cert(&key, &crt)?;
 
-    Ok((key, crt))
+    Ok(KeyPair { key, crt })
 }
 
 // Postgres requires the keypath be "secure". This means
 // 1. Owned by the postgres user.
 // 2. Have permission 600.
-pub fn update_key_path_blocking(pg_data: &Path, key: &str, crt: &str) -> Result<()> {
+pub fn update_key_path_blocking(pg_data: &Path, key_pair: &KeyPair) -> Result<()> {
     let mut key_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -87,11 +92,13 @@ pub fn update_key_path_blocking(pg_data: &Path, key: &str, crt: &str) -> Result<
         .mode(0o600)
         .open(pg_data.join(SERVER_CRT))?;
 
-    // There's a chance that postgres/pgbouncer/local_proxy reloads halfway between
-    // these writes and reads the wrong keys to the wrong certs.
-    // Not sure how to prevent that.
-    key_file.write_all(key.as_bytes())?;
-    crt_file.write_all(crt.as_bytes())?;
+    // NOTE: We currently ensure that an explicit reload does not happen during TLS renewal, but
+    // there's a chance that postgres/pgbouncer/local_proxy reloads implicitly halfway between
+    // these writes. This could allow them to reads the wrong keys to the wrong certs. 
+    // There doesn't seem to be any way to prevent that. However, we will issue a reload shortly
+    // after which should at least correct it.
+    key_file.write_all(key_pair.key.as_bytes())?;
+    crt_file.write_all(key_pair.crt.as_bytes())?;
 
     Ok(())
 }
