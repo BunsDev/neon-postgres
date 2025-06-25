@@ -1,12 +1,14 @@
+use std::io;
+
 use thiserror::Error;
 
 use crate::control_plane::client::ApiLockError;
 use crate::control_plane::messages::{self, ControlPlaneErrorMessage, Reason};
-use crate::error::{ErrorKind, ReportableError, UserFacingError, io_error};
+use crate::error::{ErrorKind, ReportableError, UserFacingError};
 use crate::proxy::retry::CouldRetry;
 
 /// A go-to error message which doesn't leak any detail.
-pub(crate) const REQUEST_FAILED: &str = "Console request failed";
+pub(crate) const REQUEST_FAILED: &str = "Control plane request failed";
 
 /// Common console API error.
 #[derive(Debug, Error)]
@@ -79,13 +81,13 @@ impl CouldRetry for ControlPlaneError {
 
 impl From<reqwest::Error> for ControlPlaneError {
     fn from(e: reqwest::Error) -> Self {
-        io_error(e).into()
+        io::Error::other(e).into()
     }
 }
 
 impl From<reqwest_middleware::Error> for ControlPlaneError {
     fn from(e: reqwest_middleware::Error) -> Self {
-        io_error(e).into()
+        io::Error::other(e).into()
     }
 }
 
@@ -97,6 +99,10 @@ pub(crate) enum GetAuthInfoError {
 
     #[error(transparent)]
     ApiError(ControlPlaneError),
+
+    /// Proxy does not know about the endpoint in advanced
+    #[error("endpoint not found in endpoint cache")]
+    UnknownEndpoint,
 }
 
 // This allows more useful interactions than `#[from]`.
@@ -113,6 +119,8 @@ impl UserFacingError for GetAuthInfoError {
             Self::BadSecret => REQUEST_FAILED.to_owned(),
             // However, API might return a meaningful error.
             Self::ApiError(e) => e.to_string_client(),
+            // pretend like control plane returned an error.
+            Self::UnknownEndpoint => REQUEST_FAILED.to_owned(),
         }
     }
 }
@@ -122,6 +130,8 @@ impl ReportableError for GetAuthInfoError {
         match self {
             Self::BadSecret => crate::error::ErrorKind::ControlPlane,
             Self::ApiError(_) => crate::error::ErrorKind::ControlPlane,
+            // we only apply endpoint filtering if control plane is under high load.
+            Self::UnknownEndpoint => crate::error::ErrorKind::ServiceRateLimit,
         }
     }
 }

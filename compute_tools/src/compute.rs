@@ -1,4 +1,26 @@
-use std::collections::HashMap;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use compute_api::privilege::Privilege;
+use compute_api::responses::{
+    ComputeConfig, ComputeCtlConfig, ComputeMetrics, ComputeStatus, LfcOffloadState,
+    LfcPrewarmState, TlsConfig,
+};
+use compute_api::spec::{
+    ComputeAudit, ComputeFeature, ComputeMode, ComputeSpec, ExtVersion, PgIdent,
+};
+use futures::StreamExt;
+use futures::future::join_all;
+use futures::stream::FuturesUnordered;
+use itertools::Itertools;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+use once_cell::sync::Lazy;
+use postgres;
+use postgres::NoTls;
+use postgres::error::SqlState;
+use remote_storage::{DownloadError, RemotePath};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -7,36 +29,23 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use std::{env, fs};
-
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use compute_api::privilege::Privilege;
-use compute_api::responses::{ComputeCtlConfig, ComputeMetrics, ComputeStatus};
-use compute_api::spec::{
-    ComputeAudit, ComputeFeature, ComputeMode, ComputeSpec, ExtVersion, PgIdent,
-};
-use futures::StreamExt;
-use futures::future::join_all;
-use futures::stream::FuturesUnordered;
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
-use postgres;
-use postgres::NoTls;
-use postgres::error::SqlState;
-use remote_storage::{DownloadError, RemotePath};
 use tokio::spawn;
 use tracing::{Instrument, debug, error, info, instrument, warn};
+use url::Url;
 use utils::id::{TenantId, TimelineId};
 use utils::lsn::Lsn;
 use utils::measured_stream::MeasuredReader;
+use utils::pid_file;
 
 use crate::configurator::launch_configurator;
 use crate::disk_quota::set_disk_quota;
 use crate::installed_extensions::get_installed_extensions;
 use crate::logger::startup_context_from_env;
 use crate::lsn_lease::launch_lsn_lease_bg_task_for_static;
+use crate::metrics::COMPUTE_CTL_UP;
 use crate::monitor::launch_monitor;
 use crate::pg_helpers::*;
+use crate::pgbouncer::*;
 use crate::rsyslog::{
     PostgresLogsRsyslogConfig, configure_audit_rsyslog, configure_postgres_logs_export,
     launch_pgaudit_gc,
@@ -49,6 +58,17 @@ use crate::{config, extension_server, local_proxy};
 
 pub static SYNC_SAFEKEEPERS_PID: AtomicU32 = AtomicU32::new(0);
 pub static PG_PID: AtomicU32 = AtomicU32::new(0);
+// This is an arbitrary build tag. Fine as a default / for testing purposes
+// in-case of not-set environment var
+const BUILD_TAG_DEFAULT: &str = "latest";
+/// Build tag/version of the compute node binaries/image. It's tricky and ugly
+/// to pass it everywhere as a part of `ComputeNodeParams`, so we use a
+/// global static variable.
+pub static BUILD_TAG: Lazy<String> = Lazy::new(|| {
+    option_env!("BUILD_TAG")
+        .unwrap_or(BUILD_TAG_DEFAULT)
+        .to_string()
+});
 
 /// Static configuration params that don't change after startup. These mostly
 /// come from the CLI args, or are derived from them.
@@ -72,7 +92,6 @@ pub struct ComputeNodeParams {
     pub pgdata: String,
     pub pgbin: String,
     pub pgversion: String,
-    pub build_tag: String,
 
     /// The port that the compute's external HTTP server listens on
     pub external_http_port: u16,
@@ -80,21 +99,10 @@ pub struct ComputeNodeParams {
     pub internal_http_port: u16,
 
     /// the address of extension storage proxy gateway
-    pub ext_remote_storage: Option<String>,
+    pub remote_ext_base_url: Option<Url>,
 
-    /// We should only allow live re- / configuration of the compute node if
-    /// it uses 'pull model', i.e. it can go to control-plane and fetch
-    /// the latest configuration. Otherwise, there could be a case:
-    /// - we start compute with some spec provided as argument
-    /// - we push new spec and it does reconfiguration
-    /// - but then something happens and compute pod / VM is destroyed,
-    ///   so k8s controller starts it again with the **old** spec
-    ///
-    /// and the same for empty computes:
-    /// - we started compute without any spec
-    /// - we push spec and it does configuration
-    /// - but then it is restarted without any spec again
-    pub live_config_allowed: bool,
+    /// Interval for installed extensions collection
+    pub installed_extensions_collection_interval: u64,
 }
 
 /// Compute node info shared across several `compute_ctl` threads.
@@ -152,6 +160,13 @@ pub struct ComputeState {
     /// set up the span relationship ourselves.
     pub startup_span: Option<tracing::span::Span>,
 
+    pub lfc_prewarm_state: LfcPrewarmState,
+    pub lfc_offload_state: LfcOffloadState,
+
+    /// WAL flush LSN that is set after terminating Postgres and syncing safekeepers if
+    /// mode == ComputeMode::Primary. None otherwise
+    pub terminate_flush_lsn: Option<Lsn>,
+
     pub metrics: ComputeMetrics,
 }
 
@@ -165,6 +180,9 @@ impl ComputeState {
             pspec: None,
             startup_span: None,
             metrics: ComputeMetrics::default(),
+            lfc_prewarm_state: LfcPrewarmState::default(),
+            lfc_offload_state: LfcOffloadState::default(),
+            terminate_flush_lsn: None,
         }
     }
 
@@ -173,6 +191,11 @@ impl ComputeState {
         info!("Changing compute status from {} to {}", prev, status);
         self.status = status;
         state_changed.notify_all();
+
+        COMPUTE_CTL_UP.reset();
+        COMPUTE_CTL_UP
+            .with_label_values(&[&BUILD_TAG, status.to_string().as_str()])
+            .set(1);
     }
 
     pub fn set_failed_status(&mut self, err: anyhow::Error, state_changed: &Condvar) {
@@ -195,6 +218,47 @@ pub struct ParsedSpec {
     pub pageserver_connstr: String,
     pub safekeeper_connstrings: Vec<String>,
     pub storage_auth_token: Option<String>,
+    pub endpoint_storage_addr: Option<SocketAddr>,
+    pub endpoint_storage_token: Option<String>,
+}
+
+impl ParsedSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        // Only Primary nodes are using safekeeper_connstrings, and at the moment
+        // this method only validates that part of the specs.
+        if self.spec.mode != ComputeMode::Primary {
+            return Ok(());
+        }
+
+        // While it seems like a good idea to check for an odd number of entries in
+        // the safekeepers connection string, changes to the list of safekeepers might
+        // incur appending a new server to a list of 3, in which case a list of 4
+        // entries is okay in production.
+        //
+        // Still we want unique entries, and at least one entry in the vector
+        if self.safekeeper_connstrings.is_empty() {
+            return Err(String::from("safekeeper_connstrings is empty"));
+        }
+
+        // check for uniqueness of the connection strings in the set
+        let mut connstrings = self.safekeeper_connstrings.clone();
+
+        connstrings.sort();
+        let mut previous = &connstrings[0];
+
+        for current in connstrings.iter().skip(1) {
+            // duplicate entry?
+            if current == previous {
+                return Err(format!(
+                    "duplicate entry in safekeeper_connstrings: {current}!",
+                ));
+            }
+
+            previous = current;
+        }
+
+        Ok(())
+    }
 }
 
 impl TryFrom<ComputeSpec> for ParsedSpec {
@@ -226,6 +290,7 @@ impl TryFrom<ComputeSpec> for ParsedSpec {
         } else {
             spec.safekeeper_connstrings.clone()
         };
+
         let storage_auth_token = spec.storage_auth_token.clone();
         let tenant_id: TenantId = if let Some(tenant_id) = spec.tenant_id {
             tenant_id
@@ -248,14 +313,32 @@ impl TryFrom<ComputeSpec> for ParsedSpec {
                 .or(Err("invalid timeline id"))?
         };
 
-        Ok(ParsedSpec {
+        let endpoint_storage_addr: Option<SocketAddr> = spec
+            .endpoint_storage_addr
+            .clone()
+            .or_else(|| spec.cluster.settings.find("neon.endpoint_storage_addr"))
+            .unwrap_or_default()
+            .parse()
+            .ok();
+        let endpoint_storage_token = spec
+            .endpoint_storage_token
+            .clone()
+            .or_else(|| spec.cluster.settings.find("neon.endpoint_storage_token"));
+
+        let res = ParsedSpec {
             spec,
             pageserver_connstr,
             safekeeper_connstrings,
             storage_auth_token,
             tenant_id,
             timeline_id,
-        })
+            endpoint_storage_addr,
+            endpoint_storage_token,
+        };
+
+        // Now check validity of the parsed specification
+        res.validate()?;
+        Ok(res)
     }
 }
 
@@ -300,20 +383,41 @@ struct StartVmMonitorResult {
 }
 
 impl ComputeNode {
-    pub fn new(
-        params: ComputeNodeParams,
-        cli_spec: Option<ComputeSpec>,
-        compute_ctl_config: ComputeCtlConfig,
-    ) -> Result<Self> {
+    pub fn new(params: ComputeNodeParams, config: ComputeConfig) -> Result<Self> {
         let connstr = params.connstr.as_str();
-        let conn_conf = postgres::config::Config::from_str(connstr)
+        let mut conn_conf = postgres::config::Config::from_str(connstr)
             .context("cannot build postgres config from connstr")?;
-        let tokio_conn_conf = tokio_postgres::config::Config::from_str(connstr)
+        let mut tokio_conn_conf = tokio_postgres::config::Config::from_str(connstr)
             .context("cannot build tokio postgres config from connstr")?;
 
+        // Users can set some configuration parameters per database with
+        //   ALTER DATABASE ... SET ...
+        //
+        // There are at least these parameters:
+        //
+        //   - role=some_other_role
+        //   - default_transaction_read_only=on
+        //   - statement_timeout=1, i.e., 1ms, which will cause most of the queries to fail
+        //   - search_path=non_public_schema, this should be actually safe because
+        //     we don't call any functions in user databases, but better to always reset
+        //     it to public.
+        //
+        // that can affect `compute_ctl` and prevent it from properly configuring the database schema.
+        // Unset them via connection string options before connecting to the database.
+        // N.B. keep it in sync with `ZENITH_OPTIONS` in `get_maintenance_client()`.
+        const EXTRA_OPTIONS: &str = "-c role=cloud_admin -c default_transaction_read_only=off -c search_path=public -c statement_timeout=0 -c pgaudit.log=none";
+        let options = match conn_conf.get_options() {
+            // Allow the control plane to override any options set by the
+            // compute
+            Some(options) => format!("{EXTRA_OPTIONS} {options}"),
+            None => EXTRA_OPTIONS.to_string(),
+        };
+        conn_conf.options(&options);
+        tokio_conn_conf.options(&options);
+
         let mut new_state = ComputeState::new();
-        if let Some(cli_spec) = cli_spec {
-            let pspec = ParsedSpec::try_from(cli_spec).map_err(|msg| anyhow::anyhow!(msg))?;
+        if let Some(spec) = config.spec {
+            let pspec = ParsedSpec::try_from(spec).map_err(|msg| anyhow::anyhow!(msg))?;
             new_state.pspec = Some(pspec);
         }
 
@@ -324,7 +428,7 @@ impl ComputeNode {
             state: Mutex::new(new_state),
             state_changed: Condvar::new(),
             ext_download_progress: RwLock::new(HashMap::new()),
-            compute_ctl_config,
+            compute_ctl_config: config.compute_ctl_config,
         })
     }
 
@@ -340,8 +444,16 @@ impl ComputeNode {
         // because QEMU will already have its memory allocated from the host, and
         // the necessary binaries will already be cached.
         if cli_spec.is_none() {
-            this.prewarm_postgres()?;
+            this.prewarm_postgres_vm_memory()?;
         }
+
+        // Set the up metric with Empty status before starting the HTTP server.
+        // That way on the first metric scrape, an external observer will see us
+        // as 'up' and 'empty' (unless the compute was started with a spec or
+        // already configured by control plane).
+        COMPUTE_CTL_UP
+            .with_label_values(&[&BUILD_TAG, ComputeStatus::Empty.to_string().as_str()])
+            .set(1);
 
         // Launch the external HTTP server first, so that we can serve control plane
         // requests while configuration is still in progress.
@@ -425,12 +537,21 @@ impl ComputeNode {
         // Reap the postgres process
         delay_exit |= this.cleanup_after_postgres_exit()?;
 
+        // /terminate returns LSN. If we don't sleep at all, connection will break and we
+        // won't get result. If we sleep too much, tests will take significantly longer
+        // and Github Action run will error out
+        let sleep_duration = if delay_exit {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_millis(300)
+        };
+
         // If launch failed, keep serving HTTP requests for a while, so the cloud
         // control plane can get the actual error.
         if delay_exit {
             info!("giving control plane 30s to collect the error before shutdown");
-            std::thread::sleep(Duration::from_secs(30));
         }
+        std::thread::sleep(sleep_duration);
         Ok(exit_code)
     }
 
@@ -512,11 +633,14 @@ impl ComputeNode {
 
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
         info!(
-            "starting compute for project {}, operation {}, tenant {}, timeline {}, features {:?}, spec.remote_extensions {:?}",
+            "starting compute for project {}, operation {}, tenant {}, timeline {}, project {}, branch {}, endpoint {}, features {:?}, spec.remote_extensions {:?}",
             pspec.spec.cluster.cluster_id.as_deref().unwrap_or("None"),
             pspec.spec.operation_uuid.as_deref().unwrap_or("None"),
             pspec.tenant_id,
             pspec.timeline_id,
+            pspec.spec.project_id.as_deref().unwrap_or("None"),
+            pspec.spec.branch_id.as_deref().unwrap_or("None"),
+            pspec.spec.endpoint_id.as_deref().unwrap_or("None"),
             pspec.spec.features,
             pspec.spec.remote_extensions,
         );
@@ -535,6 +659,8 @@ impl ComputeNode {
                 Ok::<(), anyhow::Error>(())
             });
         }
+
+        let tls_config = self.tls_config(&pspec.spec);
 
         // If there are any remote extensions in shared_preload_libraries, start downloading them
         if pspec.spec.remote_extensions.is_some() {
@@ -592,7 +718,7 @@ impl ComputeNode {
             info!("tuning pgbouncer");
 
             let pgbouncer_settings = pgbouncer_settings.clone();
-            let tls_config = self.compute_ctl_config.tls.clone();
+            let tls_config = tls_config.clone();
 
             // Spawn a background task to do the tuning,
             // so that we don't block the main thread that starts Postgres.
@@ -611,7 +737,10 @@ impl ComputeNode {
 
             // Spawn a background task to do the configuration,
             // so that we don't block the main thread that starts Postgres.
-            let local_proxy = local_proxy.clone();
+
+            let mut local_proxy = local_proxy.clone();
+            local_proxy.tls = tls_config.clone();
+
             let _handle = tokio::spawn(async move {
                 if let Err(err) = local_proxy::configure(&local_proxy) {
                     error!("error while configuring local_proxy: {err:?}");
@@ -620,31 +749,40 @@ impl ComputeNode {
             });
         }
 
-        // Configure and start rsyslog for HIPAA if necessary
-        if let ComputeAudit::Hipaa = pspec.spec.audit_log_level {
-            let remote_endpoint = std::env::var("AUDIT_LOGGING_ENDPOINT").unwrap_or("".to_string());
-            if remote_endpoint.is_empty() {
-                anyhow::bail!("AUDIT_LOGGING_ENDPOINT is empty");
+        // Configure and start rsyslog for compliance audit logging
+        match pspec.spec.audit_log_level {
+            ComputeAudit::Hipaa | ComputeAudit::Extended | ComputeAudit::Full => {
+                let remote_endpoint =
+                    std::env::var("AUDIT_LOGGING_ENDPOINT").unwrap_or("".to_string());
+                if remote_endpoint.is_empty() {
+                    anyhow::bail!("AUDIT_LOGGING_ENDPOINT is empty");
+                }
+
+                let log_directory_path = Path::new(&self.params.pgdata).join("log");
+                let log_directory_path = log_directory_path.to_string_lossy().to_string();
+
+                // Add project_id,endpoint_id to identify the logs.
+                //
+                // These ids are passed from cplane,
+                let endpoint_id = pspec.spec.endpoint_id.as_deref().unwrap_or("");
+                let project_id = pspec.spec.project_id.as_deref().unwrap_or("");
+
+                configure_audit_rsyslog(
+                    log_directory_path.clone(),
+                    endpoint_id,
+                    project_id,
+                    &remote_endpoint,
+                )?;
+
+                // Launch a background task to clean up the audit logs
+                launch_pgaudit_gc(log_directory_path);
             }
-
-            let log_directory_path = Path::new(&self.params.pgdata).join("log");
-            let log_directory_path = log_directory_path.to_string_lossy().to_string();
-            configure_audit_rsyslog(log_directory_path.clone(), "hipaa", &remote_endpoint)?;
-
-            // Launch a background task to clean up the audit logs
-            launch_pgaudit_gc(log_directory_path);
+            _ => {}
         }
 
         // Configure and start rsyslog for Postgres logs export
-        if self.has_feature(ComputeFeature::PostgresLogsExport) {
-            if let Some(ref project_id) = pspec.spec.cluster.cluster_id {
-                let host = PostgresLogsRsyslogConfig::default_host(project_id);
-                let conf = PostgresLogsRsyslogConfig::new(Some(&host));
-                configure_postgres_logs_export(conf)?;
-            } else {
-                warn!("not configuring rsyslog for Postgres logs export: project ID is missing")
-            }
-        }
+        let conf = PostgresLogsRsyslogConfig::new(pspec.spec.logs_export_host.as_deref());
+        configure_postgres_logs_export(conf)?;
 
         // Launch remaining service threads
         let _monitor_handle = launch_monitor(self);
@@ -670,17 +808,7 @@ impl ComputeNode {
 
             let conf = self.get_tokio_conn_conf(None);
             tokio::task::spawn(async {
-                let res = get_installed_extensions(conf).await;
-                match res {
-                    Ok(extensions) => {
-                        info!(
-                            "[NEON_EXT_STAT] {}",
-                            serde_json::to_string(&extensions)
-                                .expect("failed to serialize extensions list")
-                        );
-                    }
-                    Err(err) => error!("could not get installed extensions: {err:?}"),
-                }
+                let _ = installed_extensions(conf).await;
             });
         }
 
@@ -710,6 +838,12 @@ impl ComputeNode {
         // Log metrics so that we can search for slow operations in logs
         info!(?metrics, postmaster_pid = %postmaster_pid, "compute start finished");
 
+        // Spawn the extension stats background task
+        self.spawn_extension_stats_task();
+
+        if pspec.spec.autoprewarm {
+            self.prewarm_lfc(None);
+        }
         Ok(())
     }
 
@@ -789,20 +923,25 @@ impl ComputeNode {
         // Maybe sync safekeepers again, to speed up next startup
         let compute_state = self.state.lock().unwrap().clone();
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
-        if matches!(pspec.spec.mode, compute_api::spec::ComputeMode::Primary) {
+        let lsn = if matches!(pspec.spec.mode, compute_api::spec::ComputeMode::Primary) {
             info!("syncing safekeepers on shutdown");
             let storage_auth_token = pspec.storage_auth_token.clone();
             let lsn = self.sync_safekeepers(storage_auth_token)?;
-            info!("synced safekeepers at lsn {lsn}");
-        }
+            info!(%lsn, "synced safekeepers");
+            Some(lsn)
+        } else {
+            info!("not primary, not syncing safekeepers");
+            None
+        };
 
         let mut delay_exit = false;
         let mut state = self.state.lock().unwrap();
-        if state.status == ComputeStatus::TerminationPending {
+        state.terminate_flush_lsn = lsn;
+        if let ComputeStatus::TerminationPending { mode } = state.status {
             state.status = ComputeStatus::Terminated;
             self.state_changed.notify_all();
             // we were asked to terminate gracefully, don't exit to avoid restart
-            delay_exit = true
+            delay_exit = mode == compute_api::responses::TerminateMode::Fast
         }
         drop(state);
 
@@ -876,6 +1015,14 @@ impl ComputeNode {
             config.password(storage_auth_token);
         } else {
             info!("Storage auth token not set");
+        }
+
+        config.application_name("compute_ctl");
+        if let Some(spec) = &compute_state.pspec {
+            config.options(&format!(
+                "-c neon.compute_mode={}",
+                spec.spec.mode.to_type_str()
+            ));
         }
 
         // Connect to pageserver
@@ -979,7 +1126,7 @@ impl ComputeNode {
         let sk_configs = sk_connstrs.into_iter().map(|connstr| {
             // Format connstr
             let id = connstr.clone();
-            let connstr = format!("postgresql://no_user@{}", connstr);
+            let connstr = format!("postgresql://no_user@{connstr}");
             let options = format!(
                 "-c timeline_id={} tenant_id={}",
                 pspec.timeline_id, pspec.tenant_id
@@ -1125,13 +1272,15 @@ impl ComputeNode {
         let spec = &pspec.spec;
         let pgdata_path = Path::new(&self.params.pgdata);
 
+        let tls_config = self.tls_config(&pspec.spec);
+
         // Remove/create an empty pgdata directory and put configuration there.
         self.create_pgdata()?;
         config::write_postgres_conf(
             pgdata_path,
             &pspec.spec,
             self.params.internal_http_port,
-            &self.compute_ctl_config.tls,
+            tls_config,
         )?;
 
         // Syncing safekeepers is only safe with primary nodes: if a primary
@@ -1227,8 +1376,8 @@ impl ComputeNode {
     }
 
     /// Start and stop a postgres process to warm up the VM for startup.
-    pub fn prewarm_postgres(&self) -> Result<()> {
-        info!("prewarming");
+    pub fn prewarm_postgres_vm_memory(&self) -> Result<()> {
+        info!("prewarming VM memory");
 
         // Create pgdata
         let pgdata = &format!("{}.warmup", self.params.pgdata);
@@ -1270,7 +1419,7 @@ impl ComputeNode {
         kill(pm_pid, Signal::SIGQUIT)?;
         info!("sent SIGQUIT signal");
         pg.wait()?;
-        info!("done prewarming");
+        info!("done prewarming vm memory");
 
         // clean up
         let _ok = fs::remove_dir_all(pgdata);
@@ -1340,7 +1489,7 @@ impl ComputeNode {
                 let (mut client, connection) = conf.connect(NoTls).await?;
                 tokio::spawn(async move {
                     if let Err(e) = connection.await {
-                        eprintln!("connection error: {}", e);
+                        eprintln!("connection error: {e}");
                     }
                 });
 
@@ -1388,14 +1537,19 @@ impl ComputeNode {
             Err(e) => match e.code() {
                 Some(&SqlState::INVALID_PASSWORD)
                 | Some(&SqlState::INVALID_AUTHORIZATION_SPECIFICATION) => {
-                    // Connect with zenith_admin if cloud_admin could not authenticate
+                    // Connect with `zenith_admin` if `cloud_admin` could not authenticate
                     info!(
-                        "cannot connect to postgres: {}, retrying with `zenith_admin` username",
+                        "cannot connect to Postgres: {}, retrying with 'zenith_admin' username",
                         e
                     );
                     let mut zenith_admin_conf = postgres::config::Config::from(conf.clone());
                     zenith_admin_conf.application_name("compute_ctl:apply_config");
                     zenith_admin_conf.user("zenith_admin");
+
+                    // It doesn't matter what were the options before, here we just want
+                    // to connect and create a new superuser role.
+                    const ZENITH_OPTIONS: &str = "-c role=zenith_admin -c default_transaction_read_only=off -c search_path=public -c statement_timeout=0";
+                    zenith_admin_conf.options(ZENITH_OPTIONS);
 
                     let mut client =
                         zenith_admin_conf.connect(NoTls)
@@ -1451,14 +1605,22 @@ impl ComputeNode {
                 .clone(),
         );
 
+        let mut tls_config = None::<TlsConfig>;
+        if spec.features.contains(&ComputeFeature::TlsExperimental) {
+            tls_config = self.compute_ctl_config.tls.clone();
+        }
+
         let max_concurrent_connections = self.max_service_connections(compute_state, &spec);
 
         // Merge-apply spec & changes to PostgreSQL state.
         self.apply_spec_sql(spec.clone(), conf.clone(), max_concurrent_connections)?;
 
         if let Some(local_proxy) = &spec.clone().local_proxy_config {
+            let mut local_proxy = local_proxy.clone();
+            local_proxy.tls = tls_config.clone();
+
             info!("configuring local_proxy");
-            local_proxy::configure(local_proxy).context("apply_config local_proxy")?;
+            local_proxy::configure(&local_proxy).context("apply_config local_proxy")?;
         }
 
         // Run migrations separately to not hold up cold starts
@@ -1470,7 +1632,7 @@ impl ComputeNode {
                 Ok((mut client, connection)) => {
                     tokio::spawn(async move {
                         if let Err(e) = connection.await {
-                            eprintln!("connection error: {}", e);
+                            eprintln!("connection error: {e}");
                         }
                     });
                     if let Err(e) = handle_migrations(&mut client).await {
@@ -1510,11 +1672,13 @@ impl ComputeNode {
     pub fn reconfigure(&self) -> Result<()> {
         let spec = self.state.lock().unwrap().pspec.clone().unwrap().spec;
 
+        let tls_config = self.tls_config(&spec);
+
         if let Some(ref pgbouncer_settings) = spec.pgbouncer_settings {
             info!("tuning pgbouncer");
 
             let pgbouncer_settings = pgbouncer_settings.clone();
-            let tls_config = self.compute_ctl_config.tls.clone();
+            let tls_config = tls_config.clone();
 
             // Spawn a background task to do the tuning,
             // so that we don't block the main thread that starts Postgres.
@@ -1532,7 +1696,7 @@ impl ComputeNode {
             // Spawn a background task to do the configuration,
             // so that we don't block the main thread that starts Postgres.
             let mut local_proxy = local_proxy.clone();
-            local_proxy.tls = self.compute_ctl_config.tls.clone();
+            local_proxy.tls = tls_config.clone();
             tokio::spawn(async move {
                 if let Err(err) = local_proxy::configure(&local_proxy) {
                     error!("error while configuring local_proxy: {err:?}");
@@ -1540,13 +1704,17 @@ impl ComputeNode {
             });
         }
 
+        // Reconfigure rsyslog for Postgres logs export
+        let conf = PostgresLogsRsyslogConfig::new(spec.logs_export_host.as_deref());
+        configure_postgres_logs_export(conf)?;
+
         // Write new config
         let pgdata_path = Path::new(&self.params.pgdata);
         config::write_postgres_conf(
             pgdata_path,
             &spec,
             self.params.internal_http_port,
-            &self.compute_ctl_config.tls,
+            tls_config,
         )?;
 
         if !spec.skip_pg_catalog_updates {
@@ -1558,9 +1726,7 @@ impl ComputeNode {
                 self.pg_reload_conf()?;
 
                 if spec.mode == ComputeMode::Primary {
-                    let mut conf =
-                        tokio_postgres::Config::from_str(self.params.connstr.as_str()).unwrap();
-                    conf.application_name("apply_config");
+                    let conf = self.get_tokio_conn_conf(Some("compute_ctl:reconfigure"));
                     let conf = Arc::new(conf);
 
                     let spec = Arc::new(spec.clone());
@@ -1646,7 +1812,7 @@ impl ComputeNode {
 
                             // exit loop
                             ComputeStatus::Failed
-                            | ComputeStatus::TerminationPending
+                            | ComputeStatus::TerminationPending { .. }
                             | ComputeStatus::Terminated => break 'cert_update,
 
                             // wait
@@ -1665,6 +1831,14 @@ impl ComputeNode {
                     }
                 }
             });
+        }
+    }
+
+    pub fn tls_config(&self, spec: &ComputeSpec) -> &Option<TlsConfig> {
+        if spec.features.contains(&ComputeFeature::TlsExperimental) {
+            &self.compute_ctl_config.tls
+        } else {
+            &None::<TlsConfig>
         }
     }
 
@@ -1762,7 +1936,7 @@ impl ComputeNode {
         let (client, connection) = connect_result.unwrap();
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                eprintln!("connection error: {}", e);
+                eprintln!("connection error: {e}");
             }
         });
         let result = client
@@ -1800,9 +1974,9 @@ LIMIT 100",
         real_ext_name: String,
         ext_path: RemotePath,
     ) -> Result<u64, DownloadError> {
-        let ext_remote_storage =
+        let remote_ext_base_url =
             self.params
-                .ext_remote_storage
+                .remote_ext_base_url
                 .as_ref()
                 .ok_or(DownloadError::BadInput(anyhow::anyhow!(
                     "Remote extensions storage is not configured",
@@ -1864,7 +2038,7 @@ LIMIT 100",
         let download_size = extension_server::download_extension(
             &real_ext_name,
             &ext_path,
-            ext_remote_storage,
+            remote_ext_base_url,
             &self.params.pgbin,
         )
         .await
@@ -1899,23 +2073,40 @@ LIMIT 100",
         tokio::spawn(conn);
 
         // TODO: support other types of grants apart from schemas?
-        let query = format!(
-            "GRANT {} ON SCHEMA {} TO {}",
-            privileges
-                .iter()
-                // should not be quoted as it's part of the command.
-                // is already sanitized so it's ok
-                .map(|p| p.as_str())
-                .collect::<Vec<&'static str>>()
-                .join(", "),
-            // quote the schema and role name as identifiers to sanitize them.
-            schema_name.pg_quote(),
-            role_name.pg_quote(),
-        );
-        db_client
-            .simple_query(&query)
+
+        // check the role grants first - to gracefully handle read-replicas.
+        let select = "SELECT privilege_type
+            FROM pg_namespace
+                JOIN LATERAL (SELECT * FROM aclexplode(nspacl) AS x) acl ON true
+                JOIN pg_user users ON acl.grantee = users.usesysid
+            WHERE users.usename = $1
+                AND nspname = $2";
+        let rows = db_client
+            .query(select, &[role_name, schema_name])
             .await
-            .with_context(|| format!("Failed to execute query: {}", query))?;
+            .with_context(|| format!("Failed to execute query: {select}"))?;
+
+        let already_granted: HashSet<String> = rows.into_iter().map(|row| row.get(0)).collect();
+
+        let grants = privileges
+            .iter()
+            .filter(|p| !already_granted.contains(p.as_str()))
+            // should not be quoted as it's part of the command.
+            // is already sanitized so it's ok
+            .map(|p| p.as_str())
+            .join(", ");
+
+        if !grants.is_empty() {
+            // quote the schema and role name as identifiers to sanitize them.
+            let schema_name = schema_name.pg_quote();
+            let role_name = role_name.pg_quote();
+
+            let query = format!("GRANT {grants} ON SCHEMA {schema_name} TO {role_name}",);
+            db_client
+                .simple_query(&query)
+                .await
+                .with_context(|| format!("Failed to execute query: {query}"))?;
+        }
 
         Ok(())
     }
@@ -1941,7 +2132,7 @@ LIMIT 100",
         let version: Option<ExtVersion> = db_client
             .query_opt(version_query, &[&ext_name])
             .await
-            .with_context(|| format!("Failed to execute query: {}", version_query))?
+            .with_context(|| format!("Failed to execute query: {version_query}"))?
             .map(|row| row.get(0));
 
         // sanitize the inputs as postgres idents.
@@ -1956,14 +2147,14 @@ LIMIT 100",
             db_client
                 .simple_query(&query)
                 .await
-                .with_context(|| format!("Failed to execute query: {}", query))?;
+                .with_context(|| format!("Failed to execute query: {query}"))?;
         } else {
             let query =
                 format!("CREATE EXTENSION IF NOT EXISTS {ext_name} WITH VERSION {quoted_version}");
             db_client
                 .simple_query(&query)
                 .await
-                .with_context(|| format!("Failed to execute query: {}", query))?;
+                .with_context(|| format!("Failed to execute query: {query}"))?;
         }
 
         Ok(ext_version)
@@ -1973,7 +2164,7 @@ LIMIT 100",
         &self,
         spec: &ComputeSpec,
     ) -> Result<RemoteExtensionMetrics> {
-        if self.params.ext_remote_storage.is_none() {
+        if self.params.remote_ext_base_url.is_none() {
             return Ok(RemoteExtensionMetrics {
                 num_ext_downloaded: 0,
                 largest_ext_size: 0,
@@ -2024,12 +2215,8 @@ LIMIT 100",
 
         let mut download_tasks = Vec::new();
         for library in &libs_vec {
-            let (ext_name, ext_path) = remote_extensions.get_ext(
-                library,
-                true,
-                &self.params.build_tag,
-                &self.params.pgversion,
-            )?;
+            let (ext_name, ext_path) =
+                remote_extensions.get_ext(library, true, &BUILD_TAG, &self.params.pgversion)?;
             download_tasks.push(self.download_extension(ext_name, ext_path));
         }
         let results = join_all(download_tasks).await;
@@ -2089,14 +2276,105 @@ LIMIT 100",
             info!("Pageserver config changed");
         }
     }
+
+    pub fn spawn_extension_stats_task(&self) {
+        let conf = self.tokio_conn_conf.clone();
+        let installed_extensions_collection_interval =
+            self.params.installed_extensions_collection_interval;
+        tokio::spawn(async move {
+            // An initial sleep is added to ensure that two collections don't happen at the same time.
+            // The first collection happens during compute startup.
+            tokio::time::sleep(tokio::time::Duration::from_secs(
+                installed_extensions_collection_interval,
+            ))
+            .await;
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+                installed_extensions_collection_interval,
+            ));
+            loop {
+                interval.tick().await;
+                let _ = installed_extensions(conf.clone()).await;
+            }
+        });
+    }
 }
 
-pub fn forward_termination_signal() {
+pub async fn installed_extensions(conf: tokio_postgres::Config) -> Result<()> {
+    let res = get_installed_extensions(conf).await;
+    match res {
+        Ok(extensions) => {
+            info!(
+                "[NEON_EXT_STAT] {}",
+                serde_json::to_string(&extensions).expect("failed to serialize extensions list")
+            );
+        }
+        Err(err) => error!("could not get installed extensions: {err:?}"),
+    }
+    Ok(())
+}
+
+pub fn forward_termination_signal(dev_mode: bool) {
     let ss_pid = SYNC_SAFEKEEPERS_PID.load(Ordering::SeqCst);
     if ss_pid != 0 {
         let ss_pid = nix::unistd::Pid::from_raw(ss_pid as i32);
         kill(ss_pid, Signal::SIGTERM).ok();
     }
+
+    if !dev_mode {
+        //  Terminate pgbouncer with SIGKILL
+        match pid_file::read(PGBOUNCER_PIDFILE.into()) {
+            Ok(pid_file::PidFileRead::LockedByOtherProcess(pid)) => {
+                info!("sending SIGKILL to pgbouncer process pid: {}", pid);
+                if let Err(e) = kill(pid, Signal::SIGKILL) {
+                    error!("failed to terminate pgbouncer: {}", e);
+                }
+            }
+            // pgbouncer does not lock the pid file, so we read and kill the process directly
+            Ok(pid_file::PidFileRead::NotHeldByAnyProcess(_)) => {
+                if let Ok(pid_str) = std::fs::read_to_string(PGBOUNCER_PIDFILE) {
+                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                        info!(
+                            "sending SIGKILL to pgbouncer process pid: {} (from unlocked pid file)",
+                            pid
+                        );
+                        if let Err(e) = kill(Pid::from_raw(pid), Signal::SIGKILL) {
+                            error!("failed to terminate pgbouncer: {}", e);
+                        }
+                    }
+                } else {
+                    info!("pgbouncer pid file exists but process not running");
+                }
+            }
+            Ok(pid_file::PidFileRead::NotExist) => {
+                info!("pgbouncer pid file not found, process may not be running");
+            }
+            Err(e) => {
+                error!("error reading pgbouncer pid file: {}", e);
+            }
+        }
+
+        // Terminate local_proxy
+        match pid_file::read("/etc/local_proxy/pid".into()) {
+            Ok(pid_file::PidFileRead::LockedByOtherProcess(pid)) => {
+                info!("sending SIGTERM to local_proxy process pid: {}", pid);
+                if let Err(e) = kill(pid, Signal::SIGTERM) {
+                    error!("failed to terminate local_proxy: {}", e);
+                }
+            }
+            Ok(pid_file::PidFileRead::NotHeldByAnyProcess(_)) => {
+                info!("local_proxy PID file exists but process not running");
+            }
+            Ok(pid_file::PidFileRead::NotExist) => {
+                info!("local_proxy PID file not found, process may not be running");
+            }
+            Err(e) => {
+                error!("error reading local_proxy PID file: {}", e);
+            }
+        }
+    } else {
+        info!("Skipping pgbouncer and local_proxy termination because in dev mode");
+    }
+
     let pg_pid = PG_PID.load(Ordering::SeqCst);
     if pg_pid != 0 {
         let pg_pid = nix::unistd::Pid::from_raw(pg_pid as i32);
@@ -2127,5 +2405,23 @@ impl<T: 'static> JoinSetExt<T> for tokio::task::JoinSet<T> {
             let _e = sp.enter();
             f()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use super::*;
+
+    #[test]
+    fn duplicate_safekeeper_connstring() {
+        let file = File::open("tests/cluster_spec.json").unwrap();
+        let spec: ComputeSpec = serde_json::from_reader(file).unwrap();
+
+        match ParsedSpec::try_from(spec.clone()) {
+            Ok(_p) => panic!("Failed to detect duplicate entry"),
+            Err(e) => assert!(e.starts_with("duplicate entry in safekeeper_connstrings:")),
+        };
     }
 }

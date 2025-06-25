@@ -35,7 +35,8 @@ use crate::state::{EvictionState, TimelineMemState, TimelinePersistentState, Tim
 use crate::timeline_guard::ResidenceGuard;
 use crate::timeline_manager::{AtomicStatus, ManagerCtl};
 use crate::timelines_set::TimelinesSet;
-use crate::wal_backup::{self, remote_timeline_path};
+use crate::wal_backup;
+use crate::wal_backup::{WalBackup, remote_timeline_path};
 use crate::wal_backup_partial::PartialRemoteSegment;
 use crate::wal_storage::{Storage as wal_storage_iface, WalReader};
 use crate::{SafeKeeperConf, control_file, debug_dump, timeline_manager, wal_storage};
@@ -50,6 +51,7 @@ fn peer_info_from_sk_info(sk_info: &SafekeeperTimelineInfo, ts: Instant) -> Peer
         local_start_lsn: Lsn(sk_info.local_start_lsn),
         pg_connstr: sk_info.safekeeper_connstr.clone(),
         http_connstr: sk_info.http_connstr.clone(),
+        https_connstr: sk_info.https_connstr.clone(),
         ts,
     }
 }
@@ -137,6 +139,7 @@ impl Drop for WriteGuardSharedState<'_> {
 /// Usually it holds SafeKeeper, but it also supports offloaded timeline state. In this
 /// case, SafeKeeper is not available (because WAL is not present on disk) and all
 /// operations can be done only with control file.
+#[allow(clippy::large_enum_variant, reason = "TODO")]
 pub enum StateSK {
     Loaded(SafeKeeper<control_file::FileStorage, wal_storage::PhysicalStorage>),
     Offloaded(Box<TimelineState<control_file::FileStorage>>),
@@ -363,6 +366,7 @@ impl SharedState {
                 .to_owned()
                 .unwrap_or(conf.listen_pg_addr.clone()),
             http_connstr: conf.listen_http_addr.to_owned(),
+            https_connstr: conf.listen_https_addr.to_owned(),
             backup_lsn: self.sk.state().inmem.backup_lsn.0,
             local_start_lsn: self.sk.state().local_start_lsn.0,
             availability_zone: conf.availability_zone.clone(),
@@ -391,6 +395,8 @@ pub enum TimelineError {
     Cancelled(TenantTimelineId),
     #[error("Timeline {0} was not found in global map")]
     NotFound(TenantTimelineId),
+    #[error("Timeline {0} has been deleted")]
+    Deleted(TenantTimelineId),
     #[error("Timeline {0} creation is in progress")]
     CreationInProgress(TenantTimelineId),
     #[error("Timeline {0} exists on disk, but wasn't loaded on startup")]
@@ -449,6 +455,8 @@ pub struct Timeline {
     manager_ctl: ManagerCtl,
     conf: Arc<SafeKeeperConf>,
 
+    pub(crate) wal_backup: Arc<WalBackup>,
+
     remote_deletion: std::sync::Mutex<Option<RemoteDeletionReceiver>>,
 
     /// Hold this gate from code that depends on the Timeline's non-shut-down state.  While holding
@@ -473,6 +481,7 @@ impl Timeline {
         remote_path: &RemotePath,
         shared_state: SharedState,
         conf: Arc<SafeKeeperConf>,
+        wal_backup: Arc<WalBackup>,
     ) -> Arc<Self> {
         let (commit_lsn_watch_tx, commit_lsn_watch_rx) =
             watch::channel(shared_state.sk.state().commit_lsn);
@@ -506,6 +515,7 @@ impl Timeline {
             wal_backup_active: AtomicBool::new(false),
             last_removed_segno: AtomicU64::new(0),
             mgr_status: AtomicStatus::new(),
+            wal_backup,
         })
     }
 
@@ -513,6 +523,7 @@ impl Timeline {
     pub fn load_timeline(
         conf: Arc<SafeKeeperConf>,
         ttid: TenantTimelineId,
+        wal_backup: Arc<WalBackup>,
     ) -> Result<Arc<Timeline>> {
         let _enter = info_span!("load_timeline", timeline = %ttid.timeline_id).entered();
 
@@ -526,6 +537,7 @@ impl Timeline {
             &remote_path,
             shared_state,
             conf,
+            wal_backup,
         ))
     }
 
@@ -536,6 +548,7 @@ impl Timeline {
         conf: &SafeKeeperConf,
         broker_active_set: Arc<TimelinesSet>,
         partial_backup_rate_limiter: RateLimiter,
+        wal_backup: Arc<WalBackup>,
     ) {
         let (tx, rx) = self.manager_ctl.bootstrap_manager();
 
@@ -558,6 +571,7 @@ impl Timeline {
                     tx,
                     rx,
                     partial_backup_rate_limiter,
+                    wal_backup,
                 )
                 .await
             }
@@ -603,9 +617,10 @@ impl Timeline {
         // it is cancelled, so WAL storage won't be opened again.
         shared_state.sk.close_wal_store();
 
-        if !only_local && self.conf.is_wal_backup_enabled() {
+        if !only_local {
             self.remote_delete().await?;
         }
+
         let dir_existed = delete_dir(&self.timeline_dir).await?;
         Ok(dir_existed)
     }
@@ -672,11 +687,20 @@ impl Timeline {
         guard: &mut std::sync::MutexGuard<Option<RemoteDeletionReceiver>>,
     ) -> RemoteDeletionReceiver {
         tracing::info!("starting remote deletion");
+        let storage = self.wal_backup.get_storage().clone();
         let (result_tx, result_rx) = tokio::sync::watch::channel(None);
         let ttid = self.ttid;
         tokio::task::spawn(
             async move {
-                let r = wal_backup::delete_timeline(&ttid).await;
+                let r = if let Some(storage) = storage {
+                    wal_backup::delete_timeline(&storage, &ttid).await
+                } else {
+                    tracing::info!(
+                        "skipping remote deletion because no remote storage is configured; this effectively leaks the objects in remote storage"
+                    );
+                    Ok(())
+                };
+
                 if let Err(e) = &r {
                     // Log error here in case nobody ever listens for our result (e.g. dropped API request)
                     tracing::error!("remote deletion failed: {e}");
@@ -699,7 +723,7 @@ impl Timeline {
     }
 
     /// Take a writing mutual exclusive lock on timeline shared_state.
-    pub async fn write_shared_state<'a>(self: &'a Arc<Self>) -> WriteGuardSharedState<'a> {
+    pub async fn write_shared_state(self: &Arc<Self>) -> WriteGuardSharedState<'_> {
         WriteGuardSharedState::new(self.clone(), self.mutex.write().await)
     }
 
@@ -1043,14 +1067,13 @@ impl WalResidentTimeline {
 
     pub async fn get_walreader(&self, start_lsn: Lsn) -> Result<WalReader> {
         let (_, persisted_state) = self.get_state().await;
-        let enable_remote_read = self.conf.is_wal_backup_enabled();
 
         WalReader::new(
             &self.ttid,
             self.timeline_dir.clone(),
             &persisted_state,
             start_lsn,
-            enable_remote_read,
+            self.wal_backup.clone(),
         )
     }
 

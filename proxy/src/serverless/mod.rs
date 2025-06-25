@@ -49,13 +49,14 @@ use crate::config::{ProxyConfig, ProxyProtocolV2};
 use crate::context::RequestContext;
 use crate::ext::TaskExt;
 use crate::metrics::Metrics;
-use crate::protocol2::{ChainRW, ConnectHeader, ConnectionInfo, read_proxy_protocol};
-use crate::proxy::run_until_cancelled;
+use crate::protocol2::{ConnectHeader, ConnectionInfo, read_proxy_protocol};
 use crate::rate_limiter::EndpointRateLimiter;
 use crate::serverless::backend::PoolingBackend;
 use crate::serverless::http_util::{api_error_into_response, json_response};
+use crate::util::run_until_cancelled;
 
 pub(crate) const SERVERLESS_DRIVER_SNI: &str = "api";
+pub(crate) const AUTH_BROKER_SNI: &str = "apiauth";
 
 pub async fn task_main(
     config: &'static ProxyConfig,
@@ -206,12 +207,12 @@ pub(crate) type AsyncRW = Pin<Box<dyn AsyncReadWrite>>;
 
 #[async_trait]
 trait MaybeTlsAcceptor: Send + Sync + 'static {
-    async fn accept(&self, conn: ChainRW<TcpStream>) -> std::io::Result<AsyncRW>;
+    async fn accept(&self, conn: TcpStream) -> std::io::Result<AsyncRW>;
 }
 
 #[async_trait]
 impl MaybeTlsAcceptor for &'static ArcSwapOption<crate::config::TlsConfig> {
-    async fn accept(&self, conn: ChainRW<TcpStream>) -> std::io::Result<AsyncRW> {
+    async fn accept(&self, conn: TcpStream) -> std::io::Result<AsyncRW> {
         match &*self.load() {
             Some(config) => Ok(Box::pin(
                 TlsAcceptor::from(config.http_config.clone())
@@ -234,33 +235,30 @@ async fn connection_startup(
     peer_addr: SocketAddr,
 ) -> Option<(AsyncRW, ConnectionInfo)> {
     // handle PROXY protocol
-    let (conn, peer) = match read_proxy_protocol(conn).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(?session_id, %peer_addr, "failed to accept TCP connection: invalid PROXY protocol V2 header: {e:#}");
-            return None;
+    let (conn, conn_info) = match config.proxy_protocol_v2 {
+        ProxyProtocolV2::Required => {
+            match read_proxy_protocol(conn).await {
+                Err(e) => {
+                    warn!("per-client task finished with an error: {e:#}");
+                    return None;
+                }
+                // our load balancers will not send any more data. let's just exit immediately
+                Ok((_conn, ConnectHeader::Local)) => {
+                    tracing::debug!("healthcheck received");
+                    return None;
+                }
+                Ok((conn, ConnectHeader::Proxy(info))) => (conn, info),
+            }
         }
-    };
-
-    let conn_info = match peer {
-        // our load balancers will not send any more data. let's just exit immediately
-        ConnectHeader::Local => {
-            tracing::debug!("healthcheck received");
-            return None;
-        }
-        ConnectHeader::Missing if config.proxy_protocol_v2 == ProxyProtocolV2::Required => {
-            tracing::warn!("missing required proxy protocol header");
-            return None;
-        }
-        ConnectHeader::Proxy(_) if config.proxy_protocol_v2 == ProxyProtocolV2::Rejected => {
-            tracing::warn!("proxy protocol header not supported");
-            return None;
-        }
-        ConnectHeader::Proxy(info) => info,
-        ConnectHeader::Missing => ConnectionInfo {
-            addr: peer_addr,
-            extra: None,
-        },
+        // ignore the header - it cannot be confused for a postgres or http connection so will
+        // error later.
+        ProxyProtocolV2::Rejected => (
+            conn,
+            ConnectionInfo {
+                addr: peer_addr,
+                extra: None,
+            },
+        ),
     };
 
     let has_private_peer_addr = match conn_info.addr.ip() {
@@ -434,15 +432,6 @@ async fn request_handler(
                 .map(Into::into),
         );
 
-        let testodrome_id = request
-            .headers()
-            .get("X-Neon-Query-ID")
-            .map(|value| value.to_str().unwrap_or_default().to_string());
-
-        if let Some(query_id) = testodrome_id {
-            ctx.set_testodrome_id(query_id);
-        }
-
         let span = ctx.span();
         info!(parent: &span, "performing websocket upgrade");
 
@@ -480,6 +469,17 @@ async fn request_handler(
             &config.region,
         );
         let span = ctx.span();
+
+        let testodrome_id = request
+            .headers()
+            .get("X-Neon-Query-ID")
+            .and_then(|value| value.to_str().ok())
+            .map(|s| s.to_string());
+
+        if let Some(query_id) = testodrome_id {
+            info!(parent: &ctx.span(), "testodrome query ID: {query_id}");
+            ctx.set_testodrome_id(query_id.into());
+        }
 
         sql_over_http::handle(config, ctx, request, backend, http_cancellation_token)
             .instrument(span)

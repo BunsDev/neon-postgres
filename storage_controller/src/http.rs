@@ -22,14 +22,17 @@ use pageserver_api::controller_api::{
     MetadataHealthListUnhealthyResponse, MetadataHealthUpdateRequest, MetadataHealthUpdateResponse,
     NodeAvailability, NodeConfigureRequest, NodeRegisterRequest, SafekeeperSchedulingPolicyRequest,
     ShardsPreferredAzsRequest, TenantCreateRequest, TenantPolicyRequest, TenantShardMigrateRequest,
+    TimelineImportRequest,
 };
 use pageserver_api::models::{
-    DetachBehavior, TenantConfigPatchRequest, TenantConfigRequest, TenantLocationConfigRequest,
-    TenantShardSplitRequest, TenantTimeTravelRequest, TimelineArchivalConfigRequest,
-    TimelineCreateRequest,
+    DetachBehavior, LsnLeaseRequest, TenantConfigPatchRequest, TenantConfigRequest,
+    TenantLocationConfigRequest, TenantShardSplitRequest, TenantTimeTravelRequest,
+    TimelineArchivalConfigRequest, TimelineCreateRequest,
 };
 use pageserver_api::shard::TenantShardId;
-use pageserver_api::upcall_api::{ReAttachRequest, ValidateRequest};
+use pageserver_api::upcall_api::{
+    PutTimelineImportStatusRequest, ReAttachRequest, TimelineImportStatusRequest, ValidateRequest,
+};
 use pageserver_client::{BlockUnblock, mgmt_api};
 use routerify::Middleware;
 use tokio_util::sync::CancellationToken;
@@ -69,6 +72,7 @@ impl HttpState {
             neon_metrics: NeonMetrics::new(build_info),
             allowlist_routes: &[
                 "/status",
+                "/live",
                 "/ready",
                 "/metrics",
                 "/profile/cpu",
@@ -151,6 +155,51 @@ async fn handle_validate(req: Request<Body>) -> Result<Response<Body>, ApiError>
     let validate_req = json_request::<ValidateRequest>(&mut req).await?;
     let state = get_state(&req);
     json_response(StatusCode::OK, state.service.validate(validate_req).await?)
+}
+
+async fn handle_get_timeline_import_status(req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    check_permissions(&req, Scope::GenerationsApi)?;
+
+    let mut req = match maybe_forward(req).await {
+        ForwardOutcome::Forwarded(res) => {
+            return res;
+        }
+        ForwardOutcome::NotForwarded(req) => req,
+    };
+
+    let get_req = json_request::<TimelineImportStatusRequest>(&mut req).await?;
+
+    let state = get_state(&req);
+
+    json_response(
+        StatusCode::OK,
+        state
+            .service
+            .handle_timeline_shard_import_progress(get_req)
+            .await?,
+    )
+}
+
+async fn handle_put_timeline_import_status(req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    check_permissions(&req, Scope::GenerationsApi)?;
+
+    let mut req = match maybe_forward(req).await {
+        ForwardOutcome::Forwarded(res) => {
+            return res;
+        }
+        ForwardOutcome::NotForwarded(req) => req,
+    };
+
+    let put_req = json_request::<PutTimelineImportStatusRequest>(&mut req).await?;
+
+    let state = get_state(&req);
+    json_response(
+        StatusCode::OK,
+        state
+            .service
+            .handle_timeline_shard_import_progress_upcall(put_req)
+            .await?,
+    )
 }
 
 /// Call into this before attaching a tenant to a pageserver, to acquire a generation number
@@ -433,6 +482,10 @@ async fn handle_tenant_timeline_delete(
         ForwardOutcome::NotForwarded(_req) => {}
     };
 
+    service
+        .maybe_delete_timeline_import(tenant_id, timeline_id)
+        .await?;
+
     // For timeline deletions, which both implement an "initially return 202, then 404 once
     // we're done" semantic, we wrap with a retry loop to expose a simpler API upstream.
     async fn deletion_wrapper<R, F>(service: Arc<Service>, f: F) -> Result<Response<Body>, ApiError>
@@ -582,6 +635,32 @@ async fn handle_tenant_timeline_download_heatmap_layers(
     json_response(StatusCode::OK, ())
 }
 
+async fn handle_tenant_timeline_lsn_lease(
+    service: Arc<Service>,
+    req: Request<Body>,
+) -> Result<Response<Body>, ApiError> {
+    let tenant_id: TenantId = parse_request_param(&req, "tenant_id")?;
+    let timeline_id: TimelineId = parse_request_param(&req, "timeline_id")?;
+
+    check_permissions(&req, Scope::PageServerApi)?;
+    maybe_rate_limit(&req, tenant_id).await;
+
+    let mut req = match maybe_forward(req).await {
+        ForwardOutcome::Forwarded(res) => {
+            return res;
+        }
+        ForwardOutcome::NotForwarded(req) => req,
+    };
+
+    let lsn_lease_request = json_request::<LsnLeaseRequest>(&mut req).await?;
+
+    service
+        .tenant_timeline_lsn_lease(tenant_id, timeline_id, lsn_lease_request.lsn)
+        .await?;
+
+    json_response(StatusCode::OK, ())
+}
+
 // For metric labels where we would like to include the approximate path, but exclude high-cardinality fields like query parameters
 // and tenant/timeline IDs.  Since we are proxying to arbitrary paths, we don't have routing templates to
 // compare to, so we can just filter out our well known ID format with regexes.
@@ -613,6 +692,15 @@ async fn handle_tenant_timeline_passthrough(
         return Err(ApiError::BadRequest(anyhow::anyhow!("Missing path")));
     };
 
+    let method = match *req.method() {
+        hyper::Method::GET => reqwest::Method::GET,
+        hyper::Method::POST => reqwest::Method::POST,
+        hyper::Method::PUT => reqwest::Method::PUT,
+        hyper::Method::DELETE => reqwest::Method::DELETE,
+        hyper::Method::PATCH => reqwest::Method::PATCH,
+        _ => return Err(ApiError::BadRequest(anyhow::anyhow!("Unsupported method"))),
+    };
+
     tracing::info!(
         "Proxying request for tenant {} ({})",
         tenant_or_shard_id.tenant_id,
@@ -633,9 +721,9 @@ async fn handle_tenant_timeline_passthrough(
 
     // Callers will always pass an unsharded tenant ID.  Before proxying, we must
     // rewrite this to a shard-aware shard zero ID.
-    let path = format!("{}", path);
+    let path = format!("{path}");
     let tenant_str = tenant_or_shard_id.tenant_id.to_string();
-    let tenant_shard_str = format!("{}", tenant_shard_id);
+    let tenant_shard_str = format!("{tenant_shard_id}");
     let path = path.replace(&tenant_str, &tenant_shard_str);
 
     let latency = &METRICS_REGISTRY
@@ -656,12 +744,11 @@ async fn handle_tenant_timeline_passthrough(
     let _timer = latency.start_timer(labels.clone());
 
     let client = mgmt_api::Client::new(
+        service.get_http_client().clone(),
         node.base_url(),
         service.get_config().pageserver_jwt_token.as_deref(),
-        service.get_config().ssl_ca_cert.clone(),
-    )
-    .map_err(|e| ApiError::InternalServerError(anyhow::anyhow!(e)))?;
-    let resp = client.get_raw(path).await.map_err(|e|
+    );
+    let resp = client.op_raw(method, path).await.map_err(|e|
         // We return 503 here because if we can't successfully send a request to the pageserver,
         // either we aren't available or the pageserver is unavailable.
         ApiError::ResourceUnavailable(format!("Error sending pageserver API request to {node}: {e}").into()))?;
@@ -820,6 +907,42 @@ async fn handle_node_delete(req: Request<Body>) -> Result<Response<Body>, ApiErr
     json_response(StatusCode::OK, state.service.node_delete(node_id).await?)
 }
 
+async fn handle_tombstone_list(req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    check_permissions(&req, Scope::Admin)?;
+
+    let req = match maybe_forward(req).await {
+        ForwardOutcome::Forwarded(res) => {
+            return res;
+        }
+        ForwardOutcome::NotForwarded(req) => req,
+    };
+
+    let state = get_state(&req);
+    let mut nodes = state.service.tombstone_list().await?;
+    nodes.sort_by_key(|n| n.get_id());
+    let api_nodes = nodes.into_iter().map(|n| n.describe()).collect::<Vec<_>>();
+
+    json_response(StatusCode::OK, api_nodes)
+}
+
+async fn handle_tombstone_delete(req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    check_permissions(&req, Scope::Admin)?;
+
+    let req = match maybe_forward(req).await {
+        ForwardOutcome::Forwarded(res) => {
+            return res;
+        }
+        ForwardOutcome::NotForwarded(req) => req,
+    };
+
+    let state = get_state(&req);
+    let node_id: NodeId = parse_request_param(&req, "node_id")?;
+    json_response(
+        StatusCode::OK,
+        state.service.tombstone_delete(node_id).await?,
+    )
+}
+
 async fn handle_node_configure(req: Request<Body>) -> Result<Response<Body>, ApiError> {
     check_permissions(&req, Scope::Admin)?;
 
@@ -865,7 +988,7 @@ async fn handle_node_status(req: Request<Body>) -> Result<Response<Body>, ApiErr
     let state = get_state(&req);
     let node_id: NodeId = parse_request_param(&req, "node_id")?;
 
-    let node_status = state.service.get_node(node_id).await?;
+    let node_status = state.service.get_node(node_id).await?.describe();
 
     json_response(StatusCode::OK, node_status)
 }
@@ -1202,7 +1325,9 @@ async fn handle_step_down(req: Request<Body>) -> Result<Response<Body>, ApiError
     };
 
     let state = get_state(&req);
-    json_response(StatusCode::OK, state.service.step_down().await)
+    let result = state.service.step_down().await;
+
+    json_response(StatusCode::OK, result)
 }
 
 async fn handle_tenant_drop(req: Request<Body>) -> Result<Response<Body>, ApiError> {
@@ -1239,6 +1364,62 @@ async fn handle_tenant_import(req: Request<Body>) -> Result<Response<Body>, ApiE
     json_response(
         StatusCode::OK,
         state.service.tenant_import(tenant_id).await?,
+    )
+}
+
+async fn handle_timeline_import(req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    let tenant_id: TenantId = parse_request_param(&req, "tenant_id")?;
+    let timeline_id: TimelineId = parse_request_param(&req, "timeline_id")?;
+    check_permissions(&req, Scope::PageServerApi)?;
+    maybe_rate_limit(&req, tenant_id).await;
+
+    let mut req = match maybe_forward(req).await {
+        ForwardOutcome::Forwarded(res) => {
+            return res;
+        }
+        ForwardOutcome::NotForwarded(req) => req,
+    };
+
+    let import_req = json_request::<TimelineImportRequest>(&mut req).await?;
+
+    let state = get_state(&req);
+
+    if import_req.tenant_id != tenant_id || import_req.timeline_id != timeline_id {
+        return Err(ApiError::BadRequest(anyhow::anyhow!(
+            "tenant id or timeline id mismatch: url={tenant_id}/{timeline_id}, body={}/{}",
+            import_req.tenant_id,
+            import_req.timeline_id
+        )));
+    }
+
+    json_response(
+        StatusCode::OK,
+        state.service.timeline_import(import_req).await?,
+    )
+}
+
+async fn handle_tenant_timeline_locate(
+    service: Arc<Service>,
+    req: Request<Body>,
+) -> Result<Response<Body>, ApiError> {
+    let tenant_id: TenantId = parse_request_param(&req, "tenant_id")?;
+    let timeline_id: TimelineId = parse_request_param(&req, "timeline_id")?;
+
+    check_permissions(&req, Scope::Admin)?;
+    maybe_rate_limit(&req, tenant_id).await;
+
+    match maybe_forward(req).await {
+        ForwardOutcome::Forwarded(res) => {
+            return res;
+        }
+        ForwardOutcome::NotForwarded(_req) => {}
+    };
+
+    json_response(
+        StatusCode::OK,
+        service
+            .tenant_timeline_locate(tenant_id, timeline_id)
+            .await?,
     )
 }
 
@@ -1301,6 +1482,8 @@ async fn handle_reconcile_all(req: Request<Body>) -> Result<Response<Body>, ApiE
 }
 
 /// Status endpoint is just used for checking that our HTTP listener is up
+///
+/// This serves as our k8s startup probe.
 async fn handle_status(req: Request<Body>) -> Result<Response<Body>, ApiError> {
     match maybe_forward(req).await {
         ForwardOutcome::Forwarded(res) => {
@@ -1310,6 +1493,30 @@ async fn handle_status(req: Request<Body>) -> Result<Response<Body>, ApiError> {
     };
 
     json_response(StatusCode::OK, ())
+}
+
+/// Liveness endpoint indicates that this storage controller is in a state
+/// where it can fulfill it's responsibilties. Namely, startup has finished
+/// and it is the current leader.
+///
+/// This serves as our k8s liveness probe.
+async fn handle_live(req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    let req = match maybe_forward(req).await {
+        ForwardOutcome::Forwarded(res) => {
+            return res;
+        }
+        ForwardOutcome::NotForwarded(req) => req,
+    };
+
+    let state = get_state(&req);
+    let live = state.service.startup_complete.is_ready()
+        && state.service.get_leadership_status() == LeadershipStatus::Leader;
+
+    if live {
+        json_response(StatusCode::OK, ())
+    } else {
+        json_response(StatusCode::SERVICE_UNAVAILABLE, ())
+    }
 }
 
 /// Readiness endpoint indicates when we're done doing startup I/O (e.g. reconciling
@@ -1332,7 +1539,7 @@ async fn handle_ready(req: Request<Body>) -> Result<Response<Body>, ApiError> {
 
 impl From<ReconcileError> for ApiError {
     fn from(value: ReconcileError) -> Self {
-        ApiError::Conflict(format!("Reconciliation error: {}", value))
+        ApiError::Conflict(format!("Reconciliation error: {value}"))
     }
 }
 
@@ -1379,6 +1586,12 @@ async fn handle_upsert_safekeeper(mut req: Request<Body>) -> Result<Response<Bod
         return Err(ApiError::BadRequest(anyhow::anyhow!(
             "id mismatch: url={id:?}, body={:?}",
             body.id
+        )));
+    }
+
+    if id <= 0 {
+        return Err(ApiError::BadRequest(anyhow::anyhow!(
+            "id not allowed to be zero or negative: {id}"
         )));
     }
 
@@ -1639,6 +1852,7 @@ async fn maybe_forward(req: Request<Body>) -> ForwardOutcome {
     const NOT_FOR_FORWARD: &[&str] = &[
         "/control/v1/step_down",
         "/status",
+        "/live",
         "/ready",
         "/metrics",
         "/profile/cpu",
@@ -1693,9 +1907,9 @@ async fn maybe_forward(req: Request<Body>) -> ForwardOutcome {
         };
 
         if *self_addr == leader_addr {
-            return ForwardOutcome::Forwarded(Err(ApiError::InternalServerError(anyhow::anyhow!(
-                "Leader is stepped down instance"
-            ))));
+            return ForwardOutcome::Forwarded(Err(ApiError::ResourceUnavailable(
+                "Leader is stepped down instance".into(),
+            )));
         }
     }
 
@@ -1704,19 +1918,17 @@ async fn maybe_forward(req: Request<Body>) -> ForwardOutcome {
     // Use [`RECONCILE_TIMEOUT`] as the max amount of time a request should block for and
     // include some leeway to get the timeout for proxied requests.
     const PROXIED_REQUEST_TIMEOUT: Duration = Duration::from_secs(RECONCILE_TIMEOUT.as_secs() + 10);
-    let client = reqwest::ClientBuilder::new()
-        .timeout(PROXIED_REQUEST_TIMEOUT)
-        .build();
-    let client = match client {
-        Ok(client) => client,
-        Err(err) => {
-            return ForwardOutcome::Forwarded(Err(ApiError::InternalServerError(anyhow::anyhow!(
-                "Failed to build leader client for forwarding while in stepped down state: {err}"
-            ))));
-        }
-    };
 
-    let request: reqwest::Request = match convert_request(req, &client, leader.address).await {
+    let client = state.service.get_http_client().clone();
+
+    let request: reqwest::Request = match convert_request(
+        req,
+        &client,
+        leader.address,
+        PROXIED_REQUEST_TIMEOUT,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(err) => {
             return ForwardOutcome::Forwarded(Err(ApiError::InternalServerError(anyhow::anyhow!(
@@ -1774,6 +1986,7 @@ async fn convert_request(
     req: hyper::Request<Body>,
     client: &reqwest::Client,
     to_address: String,
+    timeout: Duration,
 ) -> Result<reqwest::Request, ApiError> {
     use std::str::FromStr;
 
@@ -1828,6 +2041,7 @@ async fn convert_request(
         .request(method, uri)
         .headers(headers)
         .body(body)
+        .timeout(timeout)
         .build()
         .map_err(|err| {
             ApiError::InternalServerError(anyhow::anyhow!("Request conversion failed: {err}"))
@@ -1856,12 +2070,15 @@ pub fn make_router(
 
     router
         .data(Arc::new(HttpState::new(service, auth, build_info)))
+        // Non-prefixed generic endpoints (status, metrics, profiling)
         .get("/metrics", |r| {
             named_request_span(r, measured_metrics_handler, RequestName("metrics"))
         })
-        // Non-prefixed generic endpoints (status, metrics, profiling)
         .get("/status", |r| {
             named_request_span(r, handle_status, RequestName("status"))
+        })
+        .get("/live", |r| {
+            named_request_span(r, handle_live, RequestName("live"))
         })
         .get("/ready", |r| {
             named_request_span(r, handle_ready, RequestName("ready"))
@@ -1879,6 +2096,20 @@ pub fn make_router(
         .post("/upcall/v1/validate", |r| {
             named_request_span(r, handle_validate, RequestName("upcall_v1_validate"))
         })
+        .get("/upcall/v1/timeline_import_status", |r| {
+            named_request_span(
+                r,
+                handle_get_timeline_import_status,
+                RequestName("upcall_v1_timeline_import_status"),
+            )
+        })
+        .post("/upcall/v1/timeline_import_status", |r| {
+            named_request_span(
+                r,
+                handle_put_timeline_import_status,
+                RequestName("upcall_v1_timeline_import_status"),
+            )
+        })
         // Test/dev/debug endpoints
         .post("/debug/v1/attach-hook", |r| {
             named_request_span(r, handle_attach_hook, RequestName("debug_v1_attach_hook"))
@@ -1891,6 +2122,20 @@ pub fn make_router(
         })
         .post("/debug/v1/node/:node_id/drop", |r| {
             named_request_span(r, handle_node_drop, RequestName("debug_v1_node_drop"))
+        })
+        .delete("/debug/v1/tombstone/:node_id", |r| {
+            named_request_span(
+                r,
+                handle_tombstone_delete,
+                RequestName("debug_v1_tombstone_delete"),
+            )
+        })
+        .get("/debug/v1/tombstone", |r| {
+            named_request_span(
+                r,
+                handle_tombstone_list,
+                RequestName("debug_v1_tombstone_list"),
+            )
         })
         .post("/debug/v1/tenant/:tenant_id/import", |r| {
             named_request_span(
@@ -1909,6 +2154,26 @@ pub fn make_router(
                 RequestName("debug_v1_tenant_locate"),
             )
         })
+        .post(
+            "/debug/v1/tenant/:tenant_id/timeline/:timeline_id/import",
+            |r| {
+                named_request_span(
+                    r,
+                    handle_timeline_import,
+                    RequestName("debug_v1_timeline_import"),
+                )
+            },
+        )
+        .get(
+            "/debug/v1/tenant/:tenant_id/timeline/:timeline_id/locate",
+            |r| {
+                tenant_service_handler(
+                    r,
+                    handle_tenant_timeline_locate,
+                    RequestName("v1_tenant_timeline_locate"),
+                )
+            },
+        )
         .get("/debug/v1/scheduler", |r| {
             named_request_span(r, handle_scheduler_dump, RequestName("debug_v1_scheduler"))
         })
@@ -2193,6 +2458,17 @@ pub fn make_router(
                 )
             },
         )
+        // LSN lease passthrough to all shards
+        .post(
+            "/v1/tenant/:tenant_id/timeline/:timeline_id/lsn_lease",
+            |r| {
+                tenant_service_handler(
+                    r,
+                    handle_tenant_timeline_lsn_lease,
+                    RequestName("v1_tenant_timeline_lsn_lease"),
+                )
+            },
+        )
         // Tenant detail GET passthrough to shard zero:
         .get("/v1/tenant/:tenant_id", |r| {
             tenant_service_handler(
@@ -2211,6 +2487,17 @@ pub fn make_router(
                 RequestName("v1_tenant_passthrough"),
             )
         })
+        // Tenant timeline mark_invisible passthrough to shard zero
+        .put(
+            "/v1/tenant/:tenant_id/timeline/:timeline_id/mark_invisible",
+            |r| {
+                tenant_service_handler(
+                    r,
+                    handle_tenant_timeline_passthrough,
+                    RequestName("v1_tenant_timeline_mark_invisible_passthrough"),
+                )
+            },
+        )
 }
 
 #[cfg(test)]

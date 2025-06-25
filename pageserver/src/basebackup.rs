@@ -18,13 +18,13 @@ use bytes::{BufMut, Bytes, BytesMut};
 use fail::fail_point;
 use pageserver_api::key::{Key, rel_block_to_key};
 use pageserver_api::reltag::{RelTag, SlruKind};
-use postgres_ffi::pg_constants::{
-    DEFAULTTABLESPACE_OID, GLOBALTABLESPACE_OID, PG_HBA, PGDATA_SPECIAL_FILES,
-};
-use postgres_ffi::relfile_utils::{INIT_FORKNUM, MAIN_FORKNUM};
+use postgres_ffi::pg_constants::{PG_HBA, PGDATA_SPECIAL_FILES};
 use postgres_ffi::{
-    BLCKSZ, PG_TLI, RELSEG_SIZE, WAL_SEGMENT_SIZE, XLogFileName, dispatch_pgversion, pg_constants,
+    BLCKSZ, PG_TLI, PgMajorVersion, RELSEG_SIZE, WAL_SEGMENT_SIZE, XLogFileName,
+    dispatch_pgversion, pg_constants,
 };
+use postgres_ffi_types::constants::{DEFAULTTABLESPACE_OID, GLOBALTABLESPACE_OID};
+use postgres_ffi_types::forknum::{INIT_FORKNUM, MAIN_FORKNUM};
 use tokio::io;
 use tokio::io::AsyncWrite;
 use tokio_tar::{Builder, EntryType, Header};
@@ -34,7 +34,7 @@ use utils::lsn::Lsn;
 use crate::context::RequestContext;
 use crate::pgdatadir_mapping::Version;
 use crate::tenant::storage_layer::IoConcurrency;
-use crate::tenant::timeline::GetVectoredError;
+use crate::tenant::timeline::{GetVectoredError, VersionedKeySpaceQuery};
 use crate::tenant::{PageReconstructError, Timeline};
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +62,30 @@ impl From<GetVectoredError> for BasebackupError {
             GetVectoredError::Cancelled => BasebackupError::Shutdown,
             err => BasebackupError::Server(err.into()),
         }
+    }
+}
+
+impl From<BasebackupError> for postgres_backend::QueryError {
+    fn from(err: BasebackupError) -> Self {
+        use postgres_backend::QueryError;
+        use pq_proto::framed::ConnectionError;
+        match err {
+            BasebackupError::Client(err, _) => QueryError::Disconnected(ConnectionError::Io(err)),
+            BasebackupError::Server(err) => QueryError::Other(err),
+            BasebackupError::Shutdown => QueryError::Shutdown,
+        }
+    }
+}
+
+impl From<BasebackupError> for tonic::Status {
+    fn from(err: BasebackupError) -> Self {
+        use tonic::Code;
+        let code = match &err {
+            BasebackupError::Client(_, _) => Code::Cancelled,
+            BasebackupError::Server(_) => Code::Internal,
+            BasebackupError::Shutdown => Code::Unavailable,
+        };
+        tonic::Status::new(code, err.to_string())
     }
 }
 
@@ -144,7 +168,7 @@ where
         replica,
         ctx,
         io_concurrency: IoConcurrency::spawn_from_conf(
-            timeline.conf,
+            timeline.conf.get_vectored_concurrent_io,
             timeline
                 .gate
                 .enter()
@@ -248,7 +272,7 @@ where
     async fn flush(&mut self) -> Result<(), BasebackupError> {
         let nblocks = self.buf.len() / BLCKSZ as usize;
         let (kind, segno) = self.current_segment.take().unwrap();
-        let segname = format!("{}/{:>04X}", kind.to_str(), segno);
+        let segname = format!("{kind}/{segno:>04X}");
         let header = new_tar_header(&segname, self.buf.len() as u64)?;
         self.ar
             .append(&header, self.buf.as_slice())
@@ -343,19 +367,21 @@ where
             // Gather non-relational files from object storage pages.
             let slru_partitions = self
                 .timeline
-                .get_slru_keyspace(Version::Lsn(self.lsn), self.ctx)
+                .get_slru_keyspace(Version::at(self.lsn), self.ctx)
                 .await?
                 .partition(
                     self.timeline.get_shard_identity(),
-                    Timeline::MAX_GET_VECTORED_KEYS * BLCKSZ as u64,
+                    self.timeline.conf.max_get_vectored_keys.get() as u64 * BLCKSZ as u64,
+                    BLCKSZ as u64,
                 );
 
             let mut slru_builder = SlruSegmentsBuilder::new(&mut self.ar);
 
             for part in slru_partitions.parts {
+                let query = VersionedKeySpaceQuery::uniform(part, self.lsn);
                 let blocks = self
                     .timeline
-                    .get_vectored(part, self.lsn, self.io_concurrency.clone(), self.ctx)
+                    .get_vectored(query, self.io_concurrency.clone(), self.ctx)
                     .await?;
 
                 for (key, block) in blocks {
@@ -377,7 +403,7 @@ where
             // Otherwise only include init forks of unlogged relations.
             let rels = self
                 .timeline
-                .list_rels(spcnode, dbnode, Version::Lsn(self.lsn), self.ctx)
+                .list_rels(spcnode, dbnode, Version::at(self.lsn), self.ctx)
                 .await?;
             for &rel in rels.iter() {
                 // Send init fork as main fork to provide well formed empty
@@ -516,7 +542,7 @@ where
     async fn add_rel(&mut self, src: RelTag, dst: RelTag) -> Result<(), BasebackupError> {
         let nblocks = self
             .timeline
-            .get_rel_size(src, Version::Lsn(self.lsn), self.ctx)
+            .get_rel_size(src, Version::at(self.lsn), self.ctx)
             .await?;
 
         // If the relation is empty, create an empty file
@@ -576,7 +602,7 @@ where
         let relmap_img = if has_relmap_file {
             let img = self
                 .timeline
-                .get_relmap_file(spcnode, dbnode, Version::Lsn(self.lsn), self.ctx)
+                .get_relmap_file(spcnode, dbnode, Version::at(self.lsn), self.ctx)
                 .await?;
 
             if img.len()
@@ -594,10 +620,7 @@ where
         };
 
         if spcnode == GLOBALTABLESPACE_OID {
-            let pg_version_str = match self.timeline.pg_version {
-                14 | 15 => self.timeline.pg_version.to_string(),
-                ver => format!("{ver}\x0A"),
-            };
+            let pg_version_str = self.timeline.pg_version.versionfile_string();
             let header = new_tar_header("PG_VERSION", pg_version_str.len() as u64)?;
             self.ar
                 .append(&header, pg_version_str.as_bytes())
@@ -630,7 +653,7 @@ where
             if !has_relmap_file
                 && self
                     .timeline
-                    .list_rels(spcnode, dbnode, Version::Lsn(self.lsn), self.ctx)
+                    .list_rels(spcnode, dbnode, Version::at(self.lsn), self.ctx)
                     .await?
                     .is_empty()
             {
@@ -644,7 +667,7 @@ where
             }
 
             // Append dir path for each database
-            let path = format!("base/{}", dbnode);
+            let path = format!("base/{dbnode}");
             let header = new_tar_header_dir(&path)?;
             self.ar
                 .append(&header, io::empty())
@@ -652,19 +675,16 @@ where
                 .map_err(|e| BasebackupError::Client(e, "add_dbdir,base"))?;
 
             if let Some(img) = relmap_img {
-                let dst_path = format!("base/{}/PG_VERSION", dbnode);
+                let dst_path = format!("base/{dbnode}/PG_VERSION");
 
-                let pg_version_str = match self.timeline.pg_version {
-                    14 | 15 => self.timeline.pg_version.to_string(),
-                    ver => format!("{ver}\x0A"),
-                };
+                let pg_version_str = self.timeline.pg_version.versionfile_string();
                 let header = new_tar_header(&dst_path, pg_version_str.len() as u64)?;
                 self.ar
                     .append(&header, pg_version_str.as_bytes())
                     .await
                     .map_err(|e| BasebackupError::Client(e, "add_dbdir,base/PG_VERSION"))?;
 
-                let relmap_path = format!("base/{}/pg_filenode.map", dbnode);
+                let relmap_path = format!("base/{dbnode}/pg_filenode.map");
                 let header = new_tar_header(&relmap_path, img.len() as u64)?;
                 self.ar
                     .append(&header, &img[..])
@@ -688,10 +708,10 @@ where
         buf.extend_from_slice(&img[..]);
         let crc = crc32c::crc32c(&img[..]);
         buf.put_u32_le(crc);
-        let path = if self.timeline.pg_version < 17 {
-            format!("pg_twophase/{:>08X}", xid)
+        let path = if self.timeline.pg_version < PgMajorVersion::PG17 {
+            format!("pg_twophase/{xid:>08X}")
         } else {
-            format!("pg_twophase/{:>016X}", xid)
+            format!("pg_twophase/{xid:>016X}")
         };
         let header = new_tar_header(&path, buf.len() as u64)?;
         self.ar
@@ -743,7 +763,7 @@ where
         //send wal segment
         let segno = self.lsn.segment_number(WAL_SEGMENT_SIZE);
         let wal_file_name = XLogFileName(PG_TLI, segno, WAL_SEGMENT_SIZE);
-        let wal_file_path = format!("pg_wal/{}", wal_file_name);
+        let wal_file_path = format!("pg_wal/{wal_file_name}");
         let header = new_tar_header(&wal_file_path, WAL_SEGMENT_SIZE as u64)?;
 
         let wal_seg = postgres_ffi::generate_wal_segment(

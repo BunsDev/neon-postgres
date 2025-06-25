@@ -145,6 +145,7 @@ typedef uint64 NNodeId;
  * This and following structs pair ones in membership.rs.
  */
 typedef uint32 Generation;
+#define INVALID_GENERATION 0
 
 typedef struct SafekeeperId
 {
@@ -390,6 +391,7 @@ typedef struct WalproposerShmemState
 	/* last feedback from each shard */
 	PageserverFeedback shard_ps_feedback[MAX_SHARDS];
 	int			num_shards;
+	bool		replica_promote;
 
 	/* aggregated feedback with min LSNs across shards */
 	PageserverFeedback min_ps_feedback;
@@ -677,8 +679,7 @@ typedef struct walproposer_api
 	 * Finish sync safekeepers with the given LSN. This function should not
 	 * return and should exit the program.
 	 */
-	void		(*finish_sync_safekeepers) (WalProposer *wp, XLogRecPtr lsn);
-
+	void		(*finish_sync_safekeepers) (WalProposer *wp, XLogRecPtr lsn) __attribute__((noreturn)) ;
 	/*
 	 * Called after every AppendResponse from the safekeeper. Used to
 	 * propagate backpressure feedback and to confirm WAL persistence (has
@@ -712,6 +713,9 @@ typedef struct WalProposerConfig
 	 * This cstr should be editable.
 	 */
 	char	   *safekeepers_list;
+
+	/* libpq connection info options. */
+	char	   *safekeeper_conninfo_options;
 
 	/*
 	 * WalProposer reconnects to offline safekeepers once in this interval.
@@ -771,7 +775,17 @@ typedef struct WalProposer
 	/* Current walproposer membership configuration */
 	MembershipConfiguration mconf;
 
-	/* (n_safekeepers / 2) + 1 */
+	/*
+	 * Parallels mconf.members with pointers to the member's slot in
+	 * safekeepers array of connections, or NULL if such member is not
+	 * connected. Helps to avoid looking slot per id through all
+	 * .safekeepers[] when doing quorum checks.
+	 */
+	Safekeeper *members_safekeepers[MAX_SAFEKEEPERS];
+	/* As above, but for new_members. */
+	Safekeeper *new_members_safekeepers[MAX_SAFEKEEPERS];
+
+	/* (n_safekeepers / 2) + 1. Used for static pre-generations quorum checks. */
 	int			quorum;
 
 	/*
@@ -791,6 +805,9 @@ typedef struct WalProposer
 	int			n_safekeepers;
 	/* Safekeepers walproposer is connecting to. */
 	Safekeeper	safekeeper[MAX_SAFEKEEPERS];
+
+	/* Current local TimeLineId in use */
+	TimeLineID	localTimeLineID;
 
 	/* WAL has been generated up to this point */
 	XLogRecPtr	availableLsn;
@@ -829,13 +846,10 @@ typedef struct WalProposer
 	term_t		donorLastLogTerm;
 
 	/* Most advanced acceptor */
-	int			donor;
+	Safekeeper *donor;
 
 	/* timeline globally starts at this LSN */
 	XLogRecPtr	timelineStartLsn;
-
-	/* number of votes collected from safekeepers */
-	int			n_votes;
 
 	/* number of successful connections over the lifetime of walproposer */
 	int			n_connected;

@@ -1,6 +1,7 @@
 //! Helper functions to upload files to remote storage with a RemoteStorage
 
 use std::io::{ErrorKind, SeekFrom};
+use std::num::NonZeroU32;
 use std::time::SystemTime;
 
 use anyhow::{Context, bail};
@@ -61,6 +62,7 @@ pub(crate) async fn upload_index_part(
         .await
         .with_context(|| format!("upload index part for '{tenant_shard_id} / {timeline_id}'"))
 }
+
 /// Serializes and uploads the given tenant manifest data to the remote storage.
 pub(crate) async fn upload_tenant_manifest(
     storage: &GenericRemoteStorage,
@@ -76,16 +78,14 @@ pub(crate) async fn upload_tenant_manifest(
     });
     pausable_failpoint!("before-upload-manifest-pausable");
 
-    let serialized = tenant_manifest.to_json_bytes()?;
-    let serialized = Bytes::from(serialized);
-
-    let tenant_manifest_site = serialized.len();
-
+    let serialized = Bytes::from(tenant_manifest.to_json_bytes()?);
+    let tenant_manifest_size = serialized.len();
     let remote_path = remote_tenant_manifest_path(tenant_shard_id, generation);
+
     storage
         .upload_storage_object(
             futures::stream::once(futures::future::ready(Ok(serialized))),
-            tenant_manifest_site,
+            tenant_manifest_size,
             &remote_path,
             cancel,
         )
@@ -229,11 +229,25 @@ pub(crate) async fn time_travel_recover_tenant(
         let timelines_path = super::remote_timelines_path(tenant_shard_id);
         prefixes.push(timelines_path);
     }
+
+    // Limit the number of versions deletions, mostly so that we don't
+    // keep requesting forever if the list is too long, as we'd put the
+    // list in RAM.
+    // Building a list of 100k entries that reaches the limit roughly takes
+    // 40 seconds, and roughly corresponds to tenants of 2 TiB physical size.
+    const COMPLEXITY_LIMIT: Option<NonZeroU32> = NonZeroU32::new(100_000);
+
     for prefix in &prefixes {
         backoff::retry(
             || async {
                 storage
-                    .time_travel_recover(Some(prefix), timestamp, done_if_after, cancel)
+                    .time_travel_recover(
+                        Some(prefix),
+                        timestamp,
+                        done_if_after,
+                        cancel,
+                        COMPLEXITY_LIMIT,
+                    )
                     .await
             },
             |e| !matches!(e, TimeTravelError::Other(_)),

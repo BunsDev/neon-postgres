@@ -26,7 +26,7 @@ use self::deleter::Deleter;
 use self::list_writer::{DeletionOp, ListWriter, RecoverOp};
 use self::validator::Validator;
 use crate::config::PageServerConf;
-use crate::controller_upcall_client::ControlPlaneGenerationsApi;
+use crate::controller_upcall_client::StorageControllerUpcallApi;
 use crate::metrics;
 use crate::tenant::remote_timeline_client::{LayerFileMetadata, remote_timeline_path};
 use crate::tenant::storage_layer::LayerName;
@@ -76,7 +76,7 @@ pub struct DeletionQueue {
 /// worker objects themselves public
 pub struct DeletionQueueWorkers<C>
 where
-    C: ControlPlaneGenerationsApi + Send + Sync,
+    C: StorageControllerUpcallApi + Send + Sync,
 {
     frontend: ListWriter,
     backend: Validator<C>,
@@ -85,7 +85,7 @@ where
 
 impl<C> DeletionQueueWorkers<C>
 where
-    C: ControlPlaneGenerationsApi + Send + Sync + 'static,
+    C: StorageControllerUpcallApi + Send + Sync + 'static,
 {
     pub fn spawn_with(mut self, runtime: &tokio::runtime::Handle) -> tokio::task::JoinHandle<()> {
         let jh_frontend = runtime.spawn(async move {
@@ -585,11 +585,11 @@ impl DeletionQueue {
     /// we don't spawn those inside new() so that the caller can use their runtime/spans of choice.
     pub fn new<C>(
         remote_storage: GenericRemoteStorage,
-        controller_upcall_client: Option<C>,
+        controller_upcall_client: C,
         conf: &'static PageServerConf,
     ) -> (Self, DeletionQueueWorkers<C>)
     where
-        C: ControlPlaneGenerationsApi + Send + Sync,
+        C: StorageControllerUpcallApi + Send + Sync,
     {
         // Unbounded channel: enables non-async functions to submit deletions.  The actual length is
         // constrained by how promptly the ListWriter wakes up and drains it, which should be frequent
@@ -663,6 +663,7 @@ mod test {
     use camino::Utf8Path;
     use hex_literal::hex;
     use pageserver_api::key::Key;
+    use pageserver_api::models::ShardImportStatus;
     use pageserver_api::shard::ShardIndex;
     use pageserver_api::upcall_api::ReAttachResponseTenant;
     use remote_storage::{RemoteStorageConfig, RemoteStorageKind};
@@ -691,7 +692,7 @@ mod test {
         harness: TenantHarness,
         remote_fs_dir: Utf8PathBuf,
         storage: GenericRemoteStorage,
-        mock_control_plane: MockControlPlane,
+        mock_control_plane: MockStorageController,
         deletion_queue: DeletionQueue,
         worker_join: JoinHandle<()>,
     }
@@ -701,7 +702,7 @@ mod test {
         async fn restart(&mut self) {
             let (deletion_queue, workers) = DeletionQueue::new(
                 self.storage.clone(),
-                Some(self.mock_control_plane.clone()),
+                self.mock_control_plane.clone(),
                 self.harness.conf,
             );
 
@@ -751,11 +752,11 @@ mod test {
     }
 
     #[derive(Debug, Clone)]
-    struct MockControlPlane {
+    struct MockStorageController {
         pub latest_generation: std::sync::Arc<std::sync::Mutex<HashMap<TenantShardId, Generation>>>,
     }
 
-    impl MockControlPlane {
+    impl MockStorageController {
         fn new() -> Self {
             Self {
                 latest_generation: Arc::default(),
@@ -763,7 +764,7 @@ mod test {
         }
     }
 
-    impl ControlPlaneGenerationsApi for MockControlPlane {
+    impl StorageControllerUpcallApi for MockStorageController {
         async fn re_attach(
             &self,
             _conf: &PageServerConf,
@@ -786,6 +787,25 @@ mod test {
             }
 
             Ok(result)
+        }
+
+        async fn put_timeline_import_status(
+            &self,
+            _tenant_shard_id: TenantShardId,
+            _timeline_id: TimelineId,
+            _generation: Generation,
+            _status: pageserver_api::models::ShardImportStatus,
+        ) -> Result<(), RetryForeverError> {
+            unimplemented!()
+        }
+
+        async fn get_timeline_import_status(
+            &self,
+            _tenant_shard_id: TenantShardId,
+            _timeline_id: TimelineId,
+            _generation: Generation,
+        ) -> Result<ShardImportStatus, RetryForeverError> {
+            unimplemented!()
         }
     }
 
@@ -810,13 +830,10 @@ mod test {
             .await
             .unwrap();
 
-        let mock_control_plane = MockControlPlane::new();
+        let mock_control_plane = MockStorageController::new();
 
-        let (deletion_queue, worker) = DeletionQueue::new(
-            storage.clone(),
-            Some(mock_control_plane.clone()),
-            harness.conf,
-        );
+        let (deletion_queue, worker) =
+            DeletionQueue::new(storage.clone(), mock_control_plane.clone(), harness.conf);
 
         let worker_join = worker.spawn_with(&tokio::runtime::Handle::current());
 

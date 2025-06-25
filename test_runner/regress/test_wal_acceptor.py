@@ -39,14 +39,13 @@ from fixtures.pageserver.utils import (
     timeline_delete_wait_completed,
 )
 from fixtures.pg_version import PgVersion
-from fixtures.port_distributor import PortDistributor
 from fixtures.remote_storage import (
     RemoteStorageKind,
     default_remote_storage,
     s3_storage,
 )
 from fixtures.safekeeper.http import (
-    Configuration,
+    MembershipConfiguration,
     SafekeeperHttpClient,
     SafekeeperId,
     TimelineCreateRequest,
@@ -71,6 +70,8 @@ from fixtures.utils import (
 
 if TYPE_CHECKING:
     from typing import Any, Self
+
+    from fixtures.port_distributor import PortDistributor
 
 
 @dataclass
@@ -138,20 +139,24 @@ def test_many_timelines(neon_env_builder: NeonEnvBuilder):
 
             for flush_lsn, commit_lsn in zip(m.flush_lsns, m.commit_lsns, strict=False):
                 # Invariant. May be < when transaction is in progress.
-                assert (
-                    commit_lsn <= flush_lsn
-                ), f"timeline_id={timeline_id}, timeline_detail={timeline_detail}, sk_metrics={sk_metrics}"
+                assert commit_lsn <= flush_lsn, (
+                    f"timeline_id={timeline_id}, timeline_detail={timeline_detail}, sk_metrics={sk_metrics}"
+                )
             # We only call collect_metrics() after a transaction is confirmed by
             # the compute node, which only happens after a consensus of safekeepers
             # has confirmed the transaction. We assume majority consensus here.
             assert (
                 2 * sum(m.last_record_lsn <= lsn for lsn in m.flush_lsns)
                 > neon_env_builder.num_safekeepers
-            ), f"timeline_id={timeline_id}, timeline_detail={timeline_detail}, sk_metrics={sk_metrics}"
+            ), (
+                f"timeline_id={timeline_id}, timeline_detail={timeline_detail}, sk_metrics={sk_metrics}"
+            )
             assert (
                 2 * sum(m.last_record_lsn <= lsn for lsn in m.commit_lsns)
                 > neon_env_builder.num_safekeepers
-            ), f"timeline_id={timeline_id}, timeline_detail={timeline_detail}, sk_metrics={sk_metrics}"
+            ), (
+                f"timeline_id={timeline_id}, timeline_detail={timeline_detail}, sk_metrics={sk_metrics}"
+            )
             timeline_metrics.append(m)
         log.info(f"{message}: {timeline_metrics}")
         return timeline_metrics
@@ -224,7 +229,7 @@ def test_many_timelines(neon_env_builder: NeonEnvBuilder):
 
     # Test timeline_list endpoint.
     http_cli = env.safekeepers[0].http_client()
-    assert len(http_cli.timeline_list()) == 3
+    assert len(http_cli.timeline_list()) == 4
 
 
 # Check that dead minority doesn't prevent the commits: execute insert n_inserts
@@ -428,6 +433,7 @@ def test_wal_backup(neon_env_builder: NeonEnvBuilder):
     env.pageserver.allowed_errors.extend(
         [
             ".*Timeline .* was not found in global map.*",
+            ".*Timeline .* has been deleted.*",
             ".*Timeline .* was cancelled and cannot be used anymore.*",
         ]
     )
@@ -584,7 +590,7 @@ def test_s3_wal_replay(neon_env_builder: NeonEnvBuilder, remote_storage_kind: Re
     for sk in env.safekeepers:
         sk.start()
         cli = sk.http_client()
-        mconf = Configuration(generation=0, members=[], new_members=None)
+        mconf = MembershipConfiguration(generation=0, members=[], new_members=None)
         # set start_lsn to the beginning of the first segment to allow reading
         # WAL from there (could you intidb LSN as well).
         r = TimelineCreateRequest(
@@ -734,8 +740,8 @@ def test_timeline_status(neon_env_builder: NeonEnvBuilder, auth_enabled: bool):
     env = neon_env_builder.init_start()
 
     tenant_id = env.initial_tenant
-    timeline_id = env.create_branch("test_timeline_status")
-    endpoint = env.endpoints.create_start("test_timeline_status")
+    timeline_id = env.initial_timeline
+    endpoint = env.endpoints.create_start("main")
 
     wa = env.safekeepers[0]
 
@@ -1112,16 +1118,16 @@ def cmp_sk_wal(sks: list[Safekeeper], tenant_id: TenantId, timeline_id: Timeline
     statuses = [sk_http_cli.timeline_status(tenant_id, timeline_id) for sk_http_cli in sk_http_clis]
     term_flush_lsns = [(s.last_log_term, s.flush_lsn) for s in statuses]
     for tfl, sk in zip(term_flush_lsns[1:], sks[1:], strict=False):
-        assert (
-            term_flush_lsns[0] == tfl
-        ), f"(last_log_term, flush_lsn) are not equal on sks {sks[0].id} and {sk.id}: {term_flush_lsns[0]} != {tfl}"
+        assert term_flush_lsns[0] == tfl, (
+            f"(last_log_term, flush_lsn) are not equal on sks {sks[0].id} and {sk.id}: {term_flush_lsns[0]} != {tfl}"
+        )
 
     # check that WALs are identic.
     segs = [sk.list_segments(tenant_id, timeline_id) for sk in sks]
     for cmp_segs, sk in zip(segs[1:], sks[1:], strict=False):
-        assert (
-            segs[0] == cmp_segs
-        ), f"lists of segments on sks {sks[0].id} and {sk.id} are not identic: {segs[0]} and {cmp_segs}"
+        assert segs[0] == cmp_segs, (
+            f"lists of segments on sks {sks[0].id} and {sk.id} are not identic: {segs[0]} and {cmp_segs}"
+        )
     log.info(f"comparing segs {segs[0]}")
 
     sk0 = sks[0]
@@ -1286,6 +1292,12 @@ def test_lagging_sk(neon_env_builder: NeonEnvBuilder):
 # it works without compute at all.
 def test_peer_recovery(neon_env_builder: NeonEnvBuilder):
     neon_env_builder.num_safekeepers = 3
+
+    # timelines should be created the old way
+    neon_env_builder.storage_controller_config = {
+        "timelines_onto_safekeepers": False,
+    }
+
     env = neon_env_builder.init_start()
 
     tenant_id = env.initial_tenant
@@ -1526,6 +1538,11 @@ def test_safekeeper_without_pageserver(
 
 
 def test_replace_safekeeper(neon_env_builder: NeonEnvBuilder):
+    # timelines should be created the old way manually until we have migration support
+    neon_env_builder.storage_controller_config = {
+        "timelines_onto_safekeepers": False,
+    }
+
     def execute_payload(endpoint: Endpoint):
         with closing(endpoint.connect()) as conn:
             with conn.cursor() as cur:
@@ -1655,6 +1672,15 @@ def test_pull_timeline(neon_env_builder: NeonEnvBuilder, live_sk_change: bool):
     res = env.safekeepers[3].pull_timeline(
         [env.safekeepers[0], env.safekeepers[2]], tenant_id, timeline_id
     )
+    sk_id_1 = env.safekeepers[0].safekeeper_id()
+    sk_id_3 = env.safekeepers[2].safekeeper_id()
+    sk_id_4 = env.safekeepers[3].safekeeper_id()
+    new_conf = MembershipConfiguration(
+        generation=2, members=[sk_id_1, sk_id_3, sk_id_4], new_members=None
+    )
+    for i in [0, 2, 3]:
+        env.safekeepers[i].http_client().membership_switch(tenant_id, timeline_id, new_conf)
+
     log.info("Finished pulling timeline")
     log.info(res)
 
@@ -1699,13 +1725,15 @@ def test_pull_timeline_gc(neon_env_builder: NeonEnvBuilder):
     neon_env_builder.num_safekeepers = 3
     neon_env_builder.enable_safekeeper_remote_storage(default_remote_storage())
     env = neon_env_builder.init_start()
-    tenant_id = env.initial_tenant
-    timeline_id = env.initial_timeline
 
     (src_sk, dst_sk) = (env.safekeepers[0], env.safekeepers[2])
 
+    dst_sk.stop()
+
+    [tenant_id, timeline_id] = env.create_tenant()
+
     log.info("use only first 2 safekeepers, 3rd will be seeded")
-    endpoint = env.endpoints.create("main")
+    endpoint = env.endpoints.create("main", tenant_id=tenant_id)
     endpoint.active_safekeepers = [1, 2]
     endpoint.start()
     endpoint.safe_psql("create table t(key int, value text)")
@@ -1717,6 +1745,7 @@ def test_pull_timeline_gc(neon_env_builder: NeonEnvBuilder):
     src_http = src_sk.http_client()
     # run pull_timeline which will halt before downloading files
     src_http.configure_failpoints(("sk-snapshot-after-list-pausable", "pause"))
+    dst_sk.start()
     pt_handle = PropagatingThread(
         target=dst_sk.pull_timeline, args=([src_sk], tenant_id, timeline_id)
     )
@@ -1776,23 +1805,27 @@ def test_pull_timeline_term_change(neon_env_builder: NeonEnvBuilder):
     neon_env_builder.enable_safekeeper_remote_storage(default_remote_storage())
     env = neon_env_builder.init_start()
     tenant_id = env.initial_tenant
-    timeline_id = env.initial_timeline
 
     (src_sk, dst_sk) = (env.safekeepers[0], env.safekeepers[2])
+    dst_sk.stop()
 
+    src_http = src_sk.http_client()
+    src_http.configure_failpoints(("sk-snapshot-after-list-pausable", "pause"))
+
+    timeline_id = env.create_branch("pull_timeline_term_changes")
+
+    # run pull_timeline which will halt before downloading files
     log.info("use only first 2 safekeepers, 3rd will be seeded")
-    ep = env.endpoints.create("main")
+    ep = env.endpoints.create("pull_timeline_term_changes")
     ep.active_safekeepers = [1, 2]
     ep.start()
     ep.safe_psql("create table t(key int, value text)")
     ep.safe_psql("insert into t select generate_series(1, 1000), 'pear'")
 
-    src_http = src_sk.http_client()
-    # run pull_timeline which will halt before downloading files
-    src_http.configure_failpoints(("sk-snapshot-after-list-pausable", "pause"))
     pt_handle = PropagatingThread(
         target=dst_sk.pull_timeline, args=([src_sk], tenant_id, timeline_id)
     )
+    dst_sk.start()
     pt_handle.start()
     src_sk.wait_until_paused("sk-snapshot-after-list-pausable")
 
@@ -1801,7 +1834,7 @@ def test_pull_timeline_term_change(neon_env_builder: NeonEnvBuilder):
 
     # restart compute to bump term
     ep.stop()
-    ep = env.endpoints.create("main")
+    ep = env.endpoints.create("pull_timeline_term_changes")
     ep.active_safekeepers = [1, 2]
     ep.start()
     ep.safe_psql("insert into t select generate_series(1, 100), 'pear'")
@@ -1923,12 +1956,18 @@ def test_pull_timeline_while_evicted(neon_env_builder: NeonEnvBuilder):
 @run_only_on_default_postgres("tests only safekeeper API")
 def test_membership_api(neon_env_builder: NeonEnvBuilder):
     neon_env_builder.num_safekeepers = 1
+    # timelines should be created the old way
+    neon_env_builder.storage_controller_config = {
+        "timelines_onto_safekeepers": False,
+    }
+
     env = neon_env_builder.init_start()
 
     # These are expected after timeline deletion on safekeepers.
     env.pageserver.allowed_errors.extend(
         [
             ".*Timeline .* was not found in global map.*",
+            ".*Timeline .* has been deleted.*",
             ".*Timeline .* was cancelled and cannot be used anymore.*",
         ]
     )
@@ -1943,7 +1982,7 @@ def test_membership_api(neon_env_builder: NeonEnvBuilder):
     sk_id_2 = SafekeeperId(11, "localhost", 5434)  # just a mock
 
     # Request to switch before timeline creation should fail.
-    init_conf = Configuration(generation=1, members=[sk_id_1], new_members=None)
+    init_conf = MembershipConfiguration(generation=1, members=[sk_id_1], new_members=None)
     with pytest.raises(requests.exceptions.HTTPError):
         http_cli.membership_switch(tenant_id, timeline_id, init_conf)
 
@@ -1955,7 +1994,7 @@ def test_membership_api(neon_env_builder: NeonEnvBuilder):
     http_cli.timeline_create(create_r)
 
     # Switch into some conf.
-    joint_conf = Configuration(generation=4, members=[sk_id_1], new_members=[sk_id_2])
+    joint_conf = MembershipConfiguration(generation=4, members=[sk_id_1], new_members=[sk_id_2])
     resp = http_cli.membership_switch(tenant_id, timeline_id, joint_conf)
     log.info(f"joint switch resp: {resp}")
     assert resp.previous_conf.generation == 1
@@ -1968,24 +2007,26 @@ def test_membership_api(neon_env_builder: NeonEnvBuilder):
     assert after_restart.generation == 4
 
     # Switch into non joint conf of which sk is not a member, must fail.
-    non_joint_not_member = Configuration(generation=5, members=[sk_id_2], new_members=None)
+    non_joint_not_member = MembershipConfiguration(
+        generation=5, members=[sk_id_2], new_members=None
+    )
     with pytest.raises(requests.exceptions.HTTPError):
         resp = http_cli.membership_switch(tenant_id, timeline_id, non_joint_not_member)
 
     # Switch into good non joint conf.
-    non_joint = Configuration(generation=6, members=[sk_id_1], new_members=None)
+    non_joint = MembershipConfiguration(generation=6, members=[sk_id_1], new_members=None)
     resp = http_cli.membership_switch(tenant_id, timeline_id, non_joint)
     log.info(f"non joint switch resp: {resp}")
     assert resp.previous_conf.generation == 4
     assert resp.current_conf.generation == 6
 
     # Switch request to lower conf should be rejected.
-    lower_conf = Configuration(generation=3, members=[sk_id_1], new_members=None)
+    lower_conf = MembershipConfiguration(generation=3, members=[sk_id_1], new_members=None)
     with pytest.raises(requests.exceptions.HTTPError):
         http_cli.membership_switch(tenant_id, timeline_id, lower_conf)
 
     # Now, exclude sk from the membership, timeline should be deleted.
-    excluded_conf = Configuration(generation=7, members=[sk_id_2], new_members=None)
+    excluded_conf = MembershipConfiguration(generation=7, members=[sk_id_2], new_members=None)
     http_cli.timeline_exclude(tenant_id, timeline_id, excluded_conf)
     with pytest.raises(requests.exceptions.HTTPError):
         http_cli.timeline_status(tenant_id, timeline_id)
@@ -2000,41 +2041,48 @@ def test_explicit_timeline_creation(neon_env_builder: NeonEnvBuilder):
     created manually, later storcon will do that.
     """
     neon_env_builder.num_safekeepers = 3
+
+    # timelines should be created the old way manually
+    neon_env_builder.storage_controller_config = {
+        "timelines_onto_safekeepers": False,
+    }
+
     env = neon_env_builder.init_start()
 
     tenant_id = env.initial_tenant
     timeline_id = env.initial_timeline
 
-    ps = env.pageservers[0]
-    ps_http_cli = ps.http_client()
-
-    http_clis = [sk.http_client() for sk in env.safekeepers]
-
-    config_lines = [
-        "neon.safekeeper_proto_version = 3",
-    ]
-    ep = env.endpoints.create("main", config_lines=config_lines)
+    ep = env.endpoints.create("main")
 
     # expected to fail because timeline is not created on safekeepers
     with pytest.raises(Exception, match=r".*timed out.*"):
         ep.start(safekeeper_generation=1, safekeepers=[1, 2, 3], timeout="2s")
-    # figure out initial LSN.
-    ps_timeline_detail = ps_http_cli.timeline_detail(tenant_id, timeline_id)
-    init_lsn = ps_timeline_detail["last_record_lsn"]
-    log.info(f"initial LSN: {init_lsn}")
-    # sk timeline creation request expects minor version
-    pg_version = ps_timeline_detail["pg_version"] * 10000
     # create inital mconf
-    sk_ids = [SafekeeperId(sk.id, "localhost", sk.port.pg_tenant_only) for sk in env.safekeepers]
-    mconf = Configuration(generation=1, members=sk_ids, new_members=None)
-    create_r = TimelineCreateRequest(
-        tenant_id, timeline_id, mconf, pg_version, Lsn(init_lsn), commit_lsn=None
+    mconf = MembershipConfiguration(
+        generation=1, members=Safekeeper.sks_to_safekeeper_ids(env.safekeepers), new_members=None
     )
-    log.info(f"sending timeline create: {create_r.to_json()}")
-
-    for sk_http_cli in http_clis:
-        sk_http_cli.timeline_create(create_r)
+    Safekeeper.create_timeline(tenant_id, timeline_id, env.pageservers[0], mconf, env.safekeepers)
     # Once timeline created endpoint should start.
+    ep.start(safekeeper_generation=1, safekeepers=[1, 2, 3])
+    ep.safe_psql("CREATE TABLE IF NOT EXISTS t(key int, value text)")
+
+
+def test_explicit_timeline_creation_storcon(neon_env_builder: NeonEnvBuilder):
+    """
+    Test that having neon.safekeepers starting with g#n: with non zero n enables
+    generations, which as a side effect disables automatic timeline creation.
+    Like test_explicit_timeline_creation, but asks the storcon to
+    create membership conf & timeline.
+    """
+    neon_env_builder.num_safekeepers = 3
+    neon_env_builder.storage_controller_config = {
+        "timelines_onto_safekeepers": True,
+    }
+    env = neon_env_builder.init_start()
+
+    ep = env.endpoints.create("main")
+
+    # endpoint should start.
     ep.start(safekeeper_generation=1, safekeepers=[1, 2, 3])
     ep.safe_psql("CREATE TABLE IF NOT EXISTS t(key int, value text)")
 
@@ -2054,7 +2102,7 @@ def test_idle_reconnections(neon_env_builder: NeonEnvBuilder):
     env = neon_env_builder.init_start()
 
     tenant_id = env.initial_tenant
-    timeline_id = env.create_branch("test_idle_reconnections")
+    timeline_id = env.initial_timeline
 
     def collect_stats() -> dict[str, float]:
         # we need to collect safekeeper_pg_queries_received_total metric from all safekeepers
@@ -2085,7 +2133,7 @@ def test_idle_reconnections(neon_env_builder: NeonEnvBuilder):
 
     collect_stats()
 
-    endpoint = env.endpoints.create_start("test_idle_reconnections")
+    endpoint = env.endpoints.create_start("main")
     # just write something to the timeline
     endpoint.safe_psql("create table t(i int)")
     collect_stats()
@@ -2395,7 +2443,7 @@ def test_s3_eviction(
             for j in range(n_timelines):
                 detail = ps_client.timeline_detail(env.initial_tenant, timelines[j])
                 log.debug(
-                    f'{branch_names[j]}: RCL={detail["remote_consistent_lsn"]}, LRL={detail["last_record_lsn"]}'
+                    f"{branch_names[j]}: RCL={detail['remote_consistent_lsn']}, LRL={detail['last_record_lsn']}"
                 )
 
         i = random.randint(0, n_timelines - 1)

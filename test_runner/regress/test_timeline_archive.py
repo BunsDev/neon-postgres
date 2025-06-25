@@ -4,6 +4,7 @@ import json
 import random
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 import requests
@@ -23,10 +24,12 @@ from fixtures.pageserver.utils import (
 from fixtures.pg_version import PgVersion
 from fixtures.remote_storage import S3Storage, s3_storage
 from fixtures.utils import run_only_on_default_postgres, skip_in_debug_build, wait_until
-from mypy_boto3_s3.type_defs import (
-    ObjectTypeDef,
-)
 from psycopg2.errors import IoError, UndefinedTable
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3.type_defs import (
+        ObjectTypeDef,
+    )
 
 
 @pytest.mark.parametrize("shard_count", [0, 4])
@@ -190,6 +193,11 @@ def test_timeline_offloading(neon_env_builder: NeonEnvBuilder, manual_offload: b
         "test_ancestor_branch_archive_branch1", tenant_id, "test_ancestor_branch_archive_parent"
     )
 
+    offloaded_count = ps_http.get_metric_value(
+        "pageserver_tenant_offloaded_timelines", {"tenant_id": f"{tenant_id}"}
+    )
+    assert offloaded_count == 0
+
     ps_http.timeline_archival_config(
         tenant_id,
         leaf_timeline_id,
@@ -240,6 +248,11 @@ def test_timeline_offloading(neon_env_builder: NeonEnvBuilder, manual_offload: b
 
     wait_until(leaf_offloaded)
     wait_until(parent_offloaded)
+
+    offloaded_count = ps_http.get_metric_value(
+        "pageserver_tenant_offloaded_timelines", {"tenant_id": f"{tenant_id}"}
+    )
+    assert offloaded_count == 2
 
     # Offloaded child timelines should still prevent deletion
     with pytest.raises(
@@ -292,7 +305,7 @@ def test_timeline_offload_persist(neon_env_builder: NeonEnvBuilder, delete_timel
         conf={
             "gc_period": "0s",
             "compaction_period": "0s",
-            "checkpoint_distance": f"{1024 ** 2}",
+            "checkpoint_distance": f"{1024**2}",
         }
     )
 
@@ -315,7 +328,7 @@ def test_timeline_offload_persist(neon_env_builder: NeonEnvBuilder, delete_timel
         neon_env_builder.pageserver_remote_storage,
         prefix=f"tenants/{str(tenant_id)}/",
     )
-    assert_prefix_empty(
+    assert_prefix_not_empty(
         neon_env_builder.pageserver_remote_storage,
         prefix=f"tenants/{str(tenant_id)}/tenant-manifest",
     )
@@ -384,7 +397,7 @@ def test_timeline_offload_persist(neon_env_builder: NeonEnvBuilder, delete_timel
             sum_again = endpoint.safe_psql("SELECT sum(key) from foo where key < 500")
             assert sum == sum_again
 
-        assert_prefix_empty(
+        assert_prefix_not_empty(
             neon_env_builder.pageserver_remote_storage,
             prefix=f"tenants/{str(env.initial_tenant)}/tenant-manifest",
         )
@@ -898,7 +911,7 @@ def test_timeline_offload_generations(neon_env_builder: NeonEnvBuilder):
         conf={
             "gc_period": "0s",
             "compaction_period": "0s",
-            "checkpoint_distance": f"{1024 ** 2}",
+            "checkpoint_distance": f"{1024**2}",
         }
     )
 
@@ -921,7 +934,7 @@ def test_timeline_offload_generations(neon_env_builder: NeonEnvBuilder):
         neon_env_builder.pageserver_remote_storage,
         prefix=f"tenants/{str(tenant_id)}/",
     )
-    assert_prefix_empty(
+    assert_prefix_not_empty(
         neon_env_builder.pageserver_remote_storage,
         prefix=f"tenants/{str(tenant_id)}/tenant-manifest",
     )

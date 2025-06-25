@@ -14,8 +14,9 @@ use hyper::http::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Request, Response, StatusCode, header};
 use indexmap::IndexMap;
 use postgres_client::error::{DbError, ErrorPosition, SqlState};
-use postgres_client::{GenericClient, IsolationLevel, NoTls, ReadyForQueryStatus, Transaction};
-use pq_proto::StartupMessageParamsBuilder;
+use postgres_client::{
+    GenericClient, IsolationLevel, NoTls, ReadyForQueryStatus, RowStream, Transaction,
+};
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -38,11 +39,13 @@ use crate::config::{AuthenticationConfig, HttpConfig, ProxyConfig, TlsConfig};
 use crate::context::RequestContext;
 use crate::error::{ErrorKind, ReportableError, UserFacingError};
 use crate::http::{ReadBodyError, read_body_with_limit};
-use crate::metrics::{HttpDirection, Metrics};
-use crate::proxy::{NeonOptions, run_until_cancelled};
+use crate::metrics::{HttpDirection, Metrics, SniGroup, SniKind};
+use crate::pqproto::StartupMessageParams;
+use crate::proxy::NeonOptions;
 use crate::serverless::backend::HttpConnError;
 use crate::types::{DbName, RoleName};
 use crate::usage_metrics::{MetricCounter, MetricCounterRecorder};
+use crate::util::run_until_cancelled;
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -199,8 +202,7 @@ fn get_conn_info(
     let endpoint = match connection_url.host() {
         Some(url::Host::Domain(hostname)) => {
             if let Some(tls) = tls {
-                endpoint_sni(hostname, &tls.common_names)?
-                    .ok_or(ConnInfoError::MalformedEndpoint)?
+                endpoint_sni(hostname, &tls.common_names).ok_or(ConnInfoError::MalformedEndpoint)?
             } else {
                 hostname
                     .split_once('.')
@@ -218,7 +220,7 @@ fn get_conn_info(
 
     let mut options = Option::None;
 
-    let mut params = StartupMessageParamsBuilder::default();
+    let mut params = StartupMessageParams::default();
     params.insert("user", &username);
     params.insert("database", &dbname);
     for (key, value) in pairs {
@@ -226,6 +228,32 @@ fn get_conn_info(
         if key == "options" {
             options = Some(NeonOptions::parse_options_raw(&value));
         }
+    }
+
+    // check the URL that was used, for metrics
+    {
+        let host_endpoint = headers
+            // get the host header
+            .get("host")
+            // extract the domain
+            .and_then(|h| {
+                let (host, _port) = h.to_str().ok()?.split_once(':')?;
+                Some(host)
+            })
+            // get the endpoint prefix
+            .map(|h| h.split_once('.').map_or(h, |(prefix, _)| prefix));
+
+        let kind = if host_endpoint == Some(&*endpoint) {
+            SniKind::Sni
+        } else {
+            SniKind::NoSni
+        };
+
+        let protocol = ctx.protocol();
+        Metrics::get()
+            .proxy
+            .accepted_connections_by_sni
+            .inc(SniGroup { protocol, kind });
     }
 
     ctx.set_user_agent(
@@ -866,7 +894,7 @@ impl QueryData {
         let (inner, mut discard) = client.inner();
         let cancel_token = inner.cancel_token();
 
-        let res = match select(
+        match select(
             pin!(query_to_json(
                 config,
                 &mut *inner,
@@ -889,7 +917,7 @@ impl QueryData {
             // The query failed with an error
             Either::Left((Err(e), __not_yet_cancelled)) => {
                 discard.discard();
-                return Err(e);
+                Err(e)
             }
             // The query was cancelled.
             Either::Right((_cancelled, query)) => {
@@ -930,8 +958,7 @@ impl QueryData {
                     }
                 }
             }
-        };
-        res
+        }
     }
 }
 
@@ -1068,22 +1095,41 @@ async fn query_to_json<T: GenericClient>(
     let query_start = Instant::now();
 
     let query_params = data.params;
-    let mut row_stream = std::pin::pin!(
-        client
-            .query_raw_txt(&data.query, query_params)
-            .await
-            .map_err(SqlOverHttpError::Postgres)?
-    );
+    let mut row_stream = client
+        .query_raw_txt(&data.query, query_params)
+        .await
+        .map_err(SqlOverHttpError::Postgres)?;
     let query_acknowledged = Instant::now();
+
+    let columns_len = row_stream.statement.columns().len();
+    let mut fields = Vec::with_capacity(columns_len);
+    let mut types = Vec::with_capacity(columns_len);
+
+    for c in row_stream.statement.columns() {
+        fields.push(json!({
+            "name": c.name().to_owned(),
+            "dataTypeID": c.type_().oid(),
+            "tableID": c.table_oid(),
+            "columnID": c.column_id(),
+            "dataTypeSize": c.type_size(),
+            "dataTypeModifier": c.type_modifier(),
+            "format": "text",
+        }));
+
+        types.push(c.type_().clone());
+    }
+
+    let raw_output = parsed_headers.raw_output;
+    let array_mode = data.array_mode.unwrap_or(parsed_headers.default_array_mode);
 
     // Manually drain the stream into a vector to leave row_stream hanging
     // around to get a command tag. Also check that the response is not too
     // big.
-    let mut rows: Vec<postgres_client::Row> = Vec::new();
+    let mut rows = Vec::new();
     while let Some(row) = row_stream.next().await {
         let row = row.map_err(SqlOverHttpError::Postgres)?;
         *current_size += row.body_len();
-        rows.push(row);
+
         // we don't have a streaming response support yet so this is to prevent OOM
         // from a malicious query (eg a cross join)
         if *current_size > config.max_response_size_bytes {
@@ -1091,13 +1137,26 @@ async fn query_to_json<T: GenericClient>(
                 config.max_response_size_bytes,
             ));
         }
+
+        let row = pg_text_row_to_json(&row, &types, raw_output, array_mode)?;
+        rows.push(row);
+
+        // assumption: parsing pg text and converting to json takes CPU time.
+        // let's assume it is slightly expensive, so we should consume some cooperative budget.
+        // Especially considering that `RowStream::next` might be pulling from a batch
+        // of rows and never hit the tokio mpsc for a long time (although unlikely).
+        tokio::task::consume_budget().await;
     }
 
     let query_resp_end = Instant::now();
-    let ready = row_stream.ready_status();
+    let RowStream {
+        command_tag,
+        status: ready,
+        ..
+    } = row_stream;
 
     // grab the command tag and number of rows affected
-    let command_tag = row_stream.command_tag().unwrap_or_default();
+    let command_tag = command_tag.unwrap_or_default();
     let mut command_tag_split = command_tag.split(' ');
     let command_tag_name = command_tag_split.next().unwrap_or_default();
     let command_tag_count = if command_tag_name == "INSERT" {
@@ -1117,38 +1176,6 @@ async fn query_to_json<T: GenericClient>(
         response = ?(query_resp_end - query_start),
         "finished executing query"
     );
-
-    let columns_len = row_stream.columns().len();
-    let mut fields = Vec::with_capacity(columns_len);
-    let mut columns = Vec::with_capacity(columns_len);
-
-    for c in row_stream.columns() {
-        fields.push(json!({
-            "name": c.name().to_owned(),
-            "dataTypeID": c.type_().oid(),
-            "tableID": c.table_oid(),
-            "columnID": c.column_id(),
-            "dataTypeSize": c.type_size(),
-            "dataTypeModifier": c.type_modifier(),
-            "format": "text",
-        }));
-
-        match client.get_type(c.type_oid()).await {
-            Ok(t) => columns.push(t),
-            Err(err) => {
-                tracing::warn!(?err, "unable to query type information");
-                return Err(SqlOverHttpError::InternalPostgres(err));
-            }
-        }
-    }
-
-    let array_mode = data.array_mode.unwrap_or(parsed_headers.default_array_mode);
-
-    // convert rows to JSON
-    let rows = rows
-        .iter()
-        .map(|row| pg_text_row_to_json(row, &columns, parsed_headers.raw_output, array_mode))
-        .collect::<Result<Vec<_>, _>>()?;
 
     // Resulting JSON format is based on the format of node-postgres result.
     let results = json!({
@@ -1210,7 +1237,6 @@ impl Discard<'_> {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

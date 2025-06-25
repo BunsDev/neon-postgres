@@ -33,6 +33,7 @@ use crate::scheduler::{
     RefCountUpdate, ScheduleContext, ScheduleError, Scheduler, SecondaryShardTag, ShardTag,
 };
 use crate::service::ReconcileResultRequest;
+use crate::timeline_import::TimelineImportState;
 use crate::{Sequence, service};
 
 /// Serialization helper
@@ -99,6 +100,10 @@ pub(crate) struct TenantShard {
     /// SplitState set, this acts as a guard against other operations such as background
     /// reconciliation, and timeline creation.
     pub(crate) splitting: SplitState,
+
+    /// Flag indicating whether the tenant has an in-progress timeline import.
+    /// Used to disallow shard splits while an import is in progress.
+    pub(crate) importing: TimelineImportState,
 
     /// If a tenant was enqueued for later reconcile due to hitting concurrency limit, this flag
     /// is set. This flag is cleared when the tenant is popped off the delay queue.
@@ -583,6 +588,7 @@ impl TenantShard {
             config: TenantConfig::default(),
             reconciler: None,
             splitting: SplitState::Idle,
+            importing: TimelineImportState::Idle,
             sequence: Sequence(1),
             delayed_reconcile: false,
             waiter: Arc::new(SeqWait::new(Sequence(0))),
@@ -622,7 +628,7 @@ impl TenantShard {
             .collect::<Vec<_>>();
 
         attached_locs.sort_by_key(|i| i.1);
-        if let Some((node_id, _gen)) = attached_locs.into_iter().last() {
+        if let Some((node_id, _gen)) = attached_locs.into_iter().next_back() {
             self.intent.set_attached(scheduler, Some(*node_id));
         }
 
@@ -1178,10 +1184,18 @@ impl TenantShard {
         for secondary in self.intent.get_secondary() {
             // Make sure we don't try to migrate a secondary to our attached location: this case happens
             // easily in environments without multiple AZs.
-            let exclude = match self.intent.attached {
+            let mut exclude = match self.intent.attached {
                 Some(attached) => vec![attached],
                 None => vec![],
             };
+
+            // Exclude all other secondaries from the scheduling process to avoid replacing
+            // one existing secondary with another existing secondary.
+            for another_secondary in self.intent.secondary.iter() {
+                if another_secondary != secondary {
+                    exclude.push(*another_secondary);
+                }
+            }
 
             let replacement = match &self.policy {
                 PlacementPolicy::Attached(_) => {
@@ -1342,28 +1356,19 @@ impl TenantShard {
     /// Reconciliation may still be needed for other aspects of state such as secondaries (see [`Self::dirty`]): this
     /// funciton should not be used to decide whether to reconcile.
     pub(crate) fn stably_attached(&self) -> Option<NodeId> {
-        if let Some(attach_intent) = self.intent.attached {
-            match self.observed.locations.get(&attach_intent) {
-                Some(loc) => match &loc.conf {
-                    Some(conf) => match conf.mode {
-                        LocationConfigMode::AttachedMulti
-                        | LocationConfigMode::AttachedSingle
-                        | LocationConfigMode::AttachedStale => {
-                            // Our intent and observed state agree that this node is in an attached state.
-                            Some(attach_intent)
-                        }
-                        // Our observed config is not an attached state
-                        _ => None,
-                    },
-                    // Our observed state is None, i.e. in flux
-                    None => None,
-                },
-                // We have no observed state for this node
-                None => None,
-            }
-        } else {
-            // Our intent is not to attach
-            None
+        // We have an intent to attach for this node
+        let attach_intent = self.intent.attached?;
+        // We have an observed state for this node
+        let location = self.observed.locations.get(&attach_intent)?;
+        // Our observed state is not None, i.e. not in flux
+        let location_config = location.conf.as_ref()?;
+
+        // Check if our intent and observed state agree that this node is in an attached state.
+        match location_config.mode {
+            LocationConfigMode::AttachedMulti
+            | LocationConfigMode::AttachedSingle
+            | LocationConfigMode::AttachedStale => Some(attach_intent),
+            _ => None,
         }
     }
 
@@ -1376,8 +1381,13 @@ impl TenantShard {
                 .generation
                 .expect("Attempted to enter attached state without a generation");
 
-            let wanted_conf =
-                attached_location_conf(generation, &self.shard, &self.config, &self.policy);
+            let wanted_conf = attached_location_conf(
+                generation,
+                &self.shard,
+                &self.config,
+                &self.policy,
+                self.intent.get_secondary().len(),
+            );
             match self.observed.locations.get(&node_id) {
                 Some(conf) if conf.conf.as_ref() == Some(&wanted_conf) => {}
                 Some(_) | None => {
@@ -1588,6 +1598,7 @@ impl TenantShard {
         units: ReconcileUnits,
         gate_guard: GateGuard,
         cancel: &CancellationToken,
+        http_client: reqwest::Client,
     ) -> Option<ReconcilerWaiter> {
         // Reconcile in flight for a stale sequence?  Our sequence's task will wait for it before
         // doing our sequence's work.
@@ -1633,6 +1644,7 @@ impl TenantShard {
             cancel: reconciler_cancel.clone(),
             persistence: persistence.clone(),
             compute_notify_failure: false,
+            http_client,
         };
 
         let reconcile_seq = self.sequence;
@@ -1842,6 +1854,8 @@ impl TenantShard {
             config: serde_json::from_str(&tsp.config).unwrap(),
             reconciler: None,
             splitting: tsp.splitting,
+            // Filled in during [`Service::startup_reconcile`]
+            importing: TimelineImportState::Idle,
             waiter: Arc::new(SeqWait::new(Sequence::initial())),
             error_waiter: Arc::new(SeqWait::new(Sequence::initial())),
             last_error: Arc::default(),
@@ -1998,7 +2012,7 @@ pub(crate) mod tests {
     use std::rc::Rc;
 
     use pageserver_api::controller_api::NodeAvailability;
-    use pageserver_api::shard::{ShardCount, ShardNumber};
+    use pageserver_api::shard::{DEFAULT_STRIPE_SIZE, ShardCount, ShardNumber};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use utils::id::TenantId;
@@ -2010,6 +2024,7 @@ pub(crate) mod tests {
         let tenant_id = TenantId::generate();
         let shard_number = ShardNumber(0);
         let shard_count = ShardCount::new(1);
+        let stripe_size = DEFAULT_STRIPE_SIZE;
 
         let tenant_shard_id = TenantShardId {
             tenant_id,
@@ -2018,12 +2033,7 @@ pub(crate) mod tests {
         };
         TenantShard::new(
             tenant_shard_id,
-            ShardIdentity::new(
-                shard_number,
-                shard_count,
-                pageserver_api::shard::ShardStripeSize(32768),
-            )
-            .unwrap(),
+            ShardIdentity::new(shard_number, shard_count, stripe_size).unwrap(),
             policy,
             None,
         )
@@ -2043,6 +2053,7 @@ pub(crate) mod tests {
         shard_count: ShardCount,
         preferred_az: Option<AvailabilityZone>,
     ) -> Vec<TenantShard> {
+        let stripe_size = DEFAULT_STRIPE_SIZE;
         (0..shard_count.count())
             .map(|i| {
                 let shard_number = ShardNumber(i);
@@ -2054,12 +2065,7 @@ pub(crate) mod tests {
                 };
                 TenantShard::new(
                     tenant_shard_id,
-                    ShardIdentity::new(
-                        shard_number,
-                        shard_count,
-                        pageserver_api::shard::ShardStripeSize(32768),
-                    )
-                    .unwrap(),
+                    ShardIdentity::new(shard_number, shard_count, stripe_size).unwrap(),
                     policy.clone(),
                     preferred_az.clone(),
                 )
@@ -3002,21 +3008,18 @@ pub(crate) mod tests {
 
             if attachments_in_wrong_az > 0 {
                 violations.push(format!(
-                    "{} attachments scheduled to the incorrect AZ",
-                    attachments_in_wrong_az
+                    "{attachments_in_wrong_az} attachments scheduled to the incorrect AZ"
                 ));
             }
 
             if secondaries_in_wrong_az > 0 {
                 violations.push(format!(
-                    "{} secondaries scheduled to the incorrect AZ",
-                    secondaries_in_wrong_az
+                    "{secondaries_in_wrong_az} secondaries scheduled to the incorrect AZ"
                 ));
             }
 
             eprintln!(
-                "attachments_in_wrong_az={} secondaries_in_wrong_az={}",
-                attachments_in_wrong_az, secondaries_in_wrong_az
+                "attachments_in_wrong_az={attachments_in_wrong_az} secondaries_in_wrong_az={secondaries_in_wrong_az}"
             );
 
             for (node_id, stats) in &node_stats {

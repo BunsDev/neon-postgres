@@ -280,7 +280,7 @@ impl TryFrom<Option<&str>> for TimelineId {
         value
             .unwrap_or_default()
             .parse::<TimelineId>()
-            .with_context(|| format!("Could not parse timeline id from {:?}", value))
+            .with_context(|| format!("Could not parse timeline id from {value:?}"))
     }
 }
 
@@ -294,6 +294,9 @@ impl TryFrom<Option<&str>> for TimelineId {
 pub struct TenantId(Id);
 
 id_newtype!(TenantId);
+
+/// If needed, reuse small string from proxy/src/types.rc
+pub type EndpointId = String;
 
 // A pair uniquely identifying Neon instance.
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]

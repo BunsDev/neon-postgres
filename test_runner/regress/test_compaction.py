@@ -10,7 +10,6 @@ import pytest
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
     NeonEnvBuilder,
-    PageserverWalReceiverProtocol,
     generate_uploads_and_deletions,
 )
 from fixtures.pageserver.http import PageserverApiException
@@ -38,21 +37,39 @@ PREEMPT_COMPACTION_TENANT_CONF = {
     "compaction_target_size": 1024**2,
     "image_creation_threshold": 1,
     "image_creation_preempt_threshold": 1,
-    # compact more frequently
+    # Compact more frequently
     "compaction_threshold": 3,
     "compaction_upper_limit": 6,
     "lsn_lease_length": "0s",
 }
 
+PREEMPT_GC_COMPACTION_TENANT_CONF = {
+    "gc_period": "5s",
+    "compaction_period": "5s",
+    # Small checkpoint distance to create many layers
+    "checkpoint_distance": 1024**2,
+    # Compact small layers
+    "compaction_target_size": 1024**2,
+    "image_creation_threshold": 10000,  # Do not create image layers at all
+    "image_creation_preempt_threshold": 10000,
+    # Compact more frequently
+    "compaction_threshold": 3,
+    "compaction_upper_limit": 6,
+    "lsn_lease_length": "0s",
+    # Enable gc-compaction
+    "gc_compaction_enabled": "true",
+    "gc_compaction_initial_threshold_kb": 1024,  # At a small threshold
+    "gc_compaction_ratio_percent": 1,
+    # No PiTR interval and small GC horizon
+    "pitr_interval": "0s",
+    "gc_horizon": f"{1024**2}",
+}
+
 
 @skip_in_debug_build("only run with release build")
-@pytest.mark.parametrize(
-    "wal_receiver_protocol",
-    [PageserverWalReceiverProtocol.VANILLA, PageserverWalReceiverProtocol.INTERPRETED],
-)
+@pytest.mark.timeout(900)
 def test_pageserver_compaction_smoke(
     neon_env_builder: NeonEnvBuilder,
-    wal_receiver_protocol: PageserverWalReceiverProtocol,
 ):
     """
     This is a smoke test that compaction kicks in. The workload repeatedly churns
@@ -61,8 +78,6 @@ def test_pageserver_compaction_smoke(
     layers visited to gather reconstruct data for a given key is within the empirically
     observed bounds.
     """
-
-    neon_env_builder.pageserver_wal_receiver_protocol = wal_receiver_protocol
 
     # Effectively disable the page cache to rely only on image layers
     # to shorten reads.
@@ -140,6 +155,8 @@ def test_pageserver_compaction_preempt(
     conf = PREEMPT_COMPACTION_TENANT_CONF.copy()
     env = neon_env_builder.init_start(initial_tenant_conf=conf)
 
+    env.pageserver.allowed_errors.append(".*The timeline or pageserver is shutting down.*")
+
     tenant_id = env.initial_tenant
     timeline_id = env.initial_timeline
 
@@ -166,6 +183,47 @@ def test_pageserver_compaction_preempt(
 
 
 @skip_in_debug_build("only run with release build")
+@pytest.mark.timeout(600)
+def test_pageserver_gc_compaction_preempt(
+    neon_env_builder: NeonEnvBuilder,
+):
+    # Ideally we should be able to do unit tests for this, but we need real Postgres
+    # WALs in order to do unit testing...
+
+    conf = PREEMPT_GC_COMPACTION_TENANT_CONF.copy()
+    env = neon_env_builder.init_start(initial_tenant_conf=conf)
+
+    env.pageserver.allowed_errors.append(".*The timeline or pageserver is shutting down.*")
+    env.pageserver.allowed_errors.append(".*flush task cancelled.*")
+    env.pageserver.allowed_errors.append(".*failed to pipe.*")
+
+    tenant_id = env.initial_tenant
+    timeline_id = env.initial_timeline
+
+    row_count = 200000
+    churn_rounds = 10
+
+    ps_http = env.pageserver.http_client()
+
+    workload = Workload(env, tenant_id, timeline_id)
+    workload.init(env.pageserver.id)
+
+    log.info("Writing initial data ...")
+    workload.write_rows(row_count, env.pageserver.id)
+
+    for i in range(1, churn_rounds + 1):
+        log.info(f"Running churn round {i}/{churn_rounds} ...")
+        workload.churn_rows(row_count, env.pageserver.id, upload=False)
+        workload.validate(env.pageserver.id)
+    ps_http.timeline_compact(tenant_id, timeline_id, wait_until_uploaded=True)
+    log.info("Validating at workload end ...")
+    workload.validate(env.pageserver.id)
+    # ensure gc_compaction gets preempted and then resumed
+    env.pageserver.assert_log_contains("preempt gc-compaction")
+
+
+@skip_in_debug_build("only run with release build")
+@pytest.mark.timeout(900)  # This test is slow with sanitizers enabled, especially on ARM
 @pytest.mark.parametrize(
     "with_branches",
     ["with_branches", "no_branches"],
@@ -177,7 +235,7 @@ def test_pageserver_gc_compaction_smoke(neon_env_builder: NeonEnvBuilder, with_b
         "compaction_period": "5s",
         # No PiTR interval and small GC horizon
         "pitr_interval": "0s",
-        "gc_horizon": f"{1024 ** 2}",
+        "gc_horizon": f"{1024**2}",
         "lsn_lease_length": "0s",
     }
 
@@ -867,7 +925,7 @@ def test_image_layer_compression(neon_env_builder: NeonEnvBuilder, enabled: bool
     )
     assert bytes_in is not None
     assert bytes_out is not None
-    log.info(f"Compression ratio: {bytes_out/bytes_in} ({bytes_out} in, {bytes_out} out)")
+    log.info(f"Compression ratio: {bytes_out / bytes_in} ({bytes_out} in, {bytes_out} out)")
 
     if enabled:
         # We are writing high compressible repetitive plain text, expect excellent compression

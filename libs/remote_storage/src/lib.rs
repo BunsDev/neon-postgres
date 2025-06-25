@@ -31,6 +31,7 @@ use anyhow::Context;
 pub use azure_core::Etag;
 use bytes::Bytes;
 use camino::{Utf8Path, Utf8PathBuf};
+pub use config::TypedRemoteStorageKind;
 pub use error::{DownloadError, TimeTravelError, TimeoutOrCancel};
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -176,6 +177,32 @@ pub struct Listing {
     pub keys: Vec<ListingObject>,
 }
 
+#[derive(Default)]
+pub struct VersionListing {
+    pub versions: Vec<Version>,
+}
+
+pub struct Version {
+    pub key: RemotePath,
+    pub last_modified: SystemTime,
+    pub kind: VersionKind,
+}
+
+impl Version {
+    pub fn version_id(&self) -> Option<&VersionId> {
+        match &self.kind {
+            VersionKind::Version(id) => Some(id),
+            VersionKind::DeletionMarker => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VersionKind {
+    DeletionMarker,
+    Version(VersionId),
+}
+
 /// Options for downloads. The default value is a plain GET.
 pub struct DownloadOpts {
     /// If given, returns [`DownloadError::Unmodified`] if the object still has
@@ -186,6 +213,8 @@ pub struct DownloadOpts {
     /// The end of the byte range to download, or unbounded. Must be after the
     /// start bound.
     pub byte_end: Bound<u64>,
+    /// Optionally request a specific version of a key
+    pub version_id: Option<VersionId>,
     /// Indicate whether we're downloading something small or large: this indirectly controls
     /// timeouts: for something like an index/manifest/heatmap, we should time out faster than
     /// for layer files
@@ -197,12 +226,16 @@ pub enum DownloadKind {
     Small,
 }
 
+#[derive(Debug, Clone)]
+pub struct VersionId(pub String);
+
 impl Default for DownloadOpts {
     fn default() -> Self {
         Self {
             etag: Default::default(),
             byte_start: Bound::Unbounded,
             byte_end: Bound::Unbounded,
+            version_id: None,
             kind: DownloadKind::Large,
         }
     }
@@ -294,6 +327,14 @@ pub trait RemoteStorage: Send + Sync + 'static {
         }
         Ok(combined)
     }
+
+    async fn list_versions(
+        &self,
+        prefix: Option<&RemotePath>,
+        mode: ListingMode,
+        max_keys: Option<NonZeroU32>,
+        cancel: &CancellationToken,
+    ) -> Result<VersionListing, DownloadError>;
 
     /// Obtain metadata information about an object.
     async fn head_object(
@@ -400,6 +441,7 @@ pub trait RemoteStorage: Send + Sync + 'static {
         timestamp: SystemTime,
         done_if_after: SystemTime,
         cancel: &CancellationToken,
+        complexity_limit: Option<NonZeroU32>,
     ) -> Result<(), TimeTravelError>;
 }
 
@@ -472,6 +514,22 @@ impl<Other: RemoteStorage> GenericRemoteStorage<Arc<Other>> {
             Self::AwsS3(s) => Box::pin(s.list_streaming(prefix, mode, max_keys, cancel)),
             Self::AzureBlob(s) => Box::pin(s.list_streaming(prefix, mode, max_keys, cancel)),
             Self::Unreliable(s) => Box::pin(s.list_streaming(prefix, mode, max_keys, cancel)),
+        }
+    }
+
+    // See [`RemoteStorage::list_versions`].
+    pub async fn list_versions<'a>(
+        &'a self,
+        prefix: Option<&'a RemotePath>,
+        mode: ListingMode,
+        max_keys: Option<NonZeroU32>,
+        cancel: &'a CancellationToken,
+    ) -> Result<VersionListing, DownloadError> {
+        match self {
+            Self::LocalFs(s) => s.list_versions(prefix, mode, max_keys, cancel).await,
+            Self::AwsS3(s) => s.list_versions(prefix, mode, max_keys, cancel).await,
+            Self::AzureBlob(s) => s.list_versions(prefix, mode, max_keys, cancel).await,
+            Self::Unreliable(s) => s.list_versions(prefix, mode, max_keys, cancel).await,
         }
     }
 
@@ -595,22 +653,23 @@ impl<Other: RemoteStorage> GenericRemoteStorage<Arc<Other>> {
         timestamp: SystemTime,
         done_if_after: SystemTime,
         cancel: &CancellationToken,
+        complexity_limit: Option<NonZeroU32>,
     ) -> Result<(), TimeTravelError> {
         match self {
             Self::LocalFs(s) => {
-                s.time_travel_recover(prefix, timestamp, done_if_after, cancel)
+                s.time_travel_recover(prefix, timestamp, done_if_after, cancel, complexity_limit)
                     .await
             }
             Self::AwsS3(s) => {
-                s.time_travel_recover(prefix, timestamp, done_if_after, cancel)
+                s.time_travel_recover(prefix, timestamp, done_if_after, cancel, complexity_limit)
                     .await
             }
             Self::AzureBlob(s) => {
-                s.time_travel_recover(prefix, timestamp, done_if_after, cancel)
+                s.time_travel_recover(prefix, timestamp, done_if_after, cancel, complexity_limit)
                     .await
             }
             Self::Unreliable(s) => {
-                s.time_travel_recover(prefix, timestamp, done_if_after, cancel)
+                s.time_travel_recover(prefix, timestamp, done_if_after, cancel, complexity_limit)
                     .await
             }
         }
@@ -618,6 +677,15 @@ impl<Other: RemoteStorage> GenericRemoteStorage<Arc<Other>> {
 }
 
 impl GenericRemoteStorage {
+    pub async fn from_storage_kind(kind: TypedRemoteStorageKind) -> anyhow::Result<Self> {
+        Self::from_config(&RemoteStorageConfig {
+            storage: kind.into(),
+            timeout: RemoteStorageConfig::DEFAULT_TIMEOUT,
+            small_timeout: RemoteStorageConfig::DEFAULT_SMALL_TIMEOUT,
+        })
+        .await
+    }
+
     pub async fn from_config(storage_config: &RemoteStorageConfig) -> anyhow::Result<Self> {
         let timeout = storage_config.timeout;
 
@@ -727,6 +795,7 @@ impl ConcurrencyLimiter {
             RequestKind::Copy => &self.write,
             RequestKind::TimeTravel => &self.write,
             RequestKind::Head => &self.read,
+            RequestKind::ListVersions => &self.read,
         }
     }
 

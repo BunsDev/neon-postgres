@@ -19,6 +19,16 @@ TEST_ROLE_NAMES = [
     {"name": "role$"},
     {"name": "role$$"},
     {"name": "role$x$"},
+    {"name": "x"},
+    {"name": "xx"},
+    {"name": "$x"},
+    {"name": "x$"},
+    {"name": "$x$"},
+    {"name": "xx$"},
+    {"name": "$xx"},
+    {"name": "$xx$"},
+    # 63 bytes is the limit for role/DB names in Postgres
+    {"name": "x" * 63},
 ]
 
 TEST_DB_NAMES = [
@@ -74,6 +84,43 @@ TEST_DB_NAMES = [
         "name": "db name$x$",
         "owner": "role$x$",
     },
+    {
+        "name": "x",
+        "owner": "x",
+    },
+    {
+        "name": "xx",
+        "owner": "xx",
+    },
+    {
+        "name": "$x",
+        "owner": "$x",
+    },
+    {
+        "name": "x$",
+        "owner": "x$",
+    },
+    {
+        "name": "$x$",
+        "owner": "$x$",
+    },
+    {
+        "name": "xx$",
+        "owner": "xx$",
+    },
+    {
+        "name": "$xx",
+        "owner": "$xx",
+    },
+    {
+        "name": "$xx$",
+        "owner": "$xx$",
+    },
+    # 63 bytes is the limit for role/DB names in Postgres
+    {
+        "name": "x" * 63,
+        "owner": "x" * 63,
+    },
 ]
 
 
@@ -90,10 +137,12 @@ def test_compute_catalog(neon_simple_env: NeonEnv):
     # and reconfigure the endpoint to create some test databases.
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "cluster": {
-                "roles": TEST_ROLE_NAMES,
-                "databases": TEST_DB_NAMES,
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "cluster": {
+                    "roles": TEST_ROLE_NAMES,
+                    "databases": TEST_DB_NAMES,
+                },
             },
         }
     )
@@ -103,22 +152,22 @@ def test_compute_catalog(neon_simple_env: NeonEnv):
     objects = client.dbs_and_roles()
 
     # Assert that 'cloud_admin' role exists in the 'roles' list
-    assert any(
-        role["name"] == "cloud_admin" for role in objects["roles"]
-    ), "The 'cloud_admin' role is missing"
+    assert any(role["name"] == "cloud_admin" for role in objects["roles"]), (
+        "The 'cloud_admin' role is missing"
+    )
 
     # Assert that 'postgres' database exists in the 'databases' list
-    assert any(
-        db["name"] == "postgres" for db in objects["databases"]
-    ), "The 'postgres' database is missing"
+    assert any(db["name"] == "postgres" for db in objects["databases"]), (
+        "The 'postgres' database is missing"
+    )
 
     # Check other databases
     for test_db in TEST_DB_NAMES:
         db = next((db for db in objects["databases"] if db["name"] == test_db["name"]), None)
         assert db is not None, f"The '{test_db['name']}' database is missing"
-        assert (
-            db["owner"] == test_db["owner"]
-        ), f"The '{test_db['name']}' database has incorrect owner"
+        assert db["owner"] == test_db["owner"], (
+            f"The '{test_db['name']}' database has incorrect owner"
+        )
 
         ddl = client.database_schema(database=test_db["name"])
 
@@ -135,15 +184,19 @@ def test_compute_catalog(neon_simple_env: NeonEnv):
         client.database_schema(database="nonexistentdb")
         raise AssertionError("Expected HTTPError was not raised")
     except requests.exceptions.HTTPError as e:
-        assert (
-            e.response.status_code == 404
-        ), f"Expected 404 status code, but got {e.response.status_code}"
+        assert e.response.status_code == 404, (
+            f"Expected 404 status code, but got {e.response.status_code}"
+        )
 
 
 def test_compute_create_drop_dbs_and_roles(neon_simple_env: NeonEnv):
     """
     Test that compute_ctl can create and work with databases and roles
     with special characters (whitespaces, %, tabs, etc.) in the name.
+    Also use `drop_subscriptions_before_start: true`. We do not actually
+    have any subscriptions in this test, so it should be no-op, but it
+    i) simulates the case when we create a second dev branch together with
+    a new project creation, and ii) just generally stresses more code paths.
     """
     env = neon_simple_env
 
@@ -155,10 +208,13 @@ def test_compute_create_drop_dbs_and_roles(neon_simple_env: NeonEnv):
     # and reconfigure the endpoint to apply the changes.
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "cluster": {
-                "roles": TEST_ROLE_NAMES,
-                "databases": TEST_DB_NAMES,
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "drop_subscriptions_before_start": True,
+                "cluster": {
+                    "roles": TEST_ROLE_NAMES,
+                    "databases": TEST_DB_NAMES,
+                },
             },
         }
     )
@@ -196,12 +252,15 @@ def test_compute_create_drop_dbs_and_roles(neon_simple_env: NeonEnv):
 
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "cluster": {
-                "roles": [],
-                "databases": [],
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "drop_subscriptions_before_start": True,
+                "cluster": {
+                    "roles": [],
+                    "databases": [],
+                },
+                "delta_operations": delta_operations,
             },
-            "delta_operations": delta_operations,
         }
     )
     endpoint.reconfigure()
@@ -250,9 +309,11 @@ def test_dropdb_with_subscription(neon_simple_env: NeonEnv):
     # and reconfigure the endpoint to apply the changes.
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "cluster": {
-                "databases": TEST_DB_NAMES,
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "cluster": {
+                    "databases": TEST_DB_NAMES,
+                },
             },
         }
     )
@@ -306,17 +367,19 @@ def test_dropdb_with_subscription(neon_simple_env: NeonEnv):
     # and reconfigure the endpoint to apply the changes.
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "cluster": {
-                "databases": TEST_DB_NAMES_NEW,
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "cluster": {
+                    "databases": TEST_DB_NAMES_NEW,
+                },
+                "delta_operations": [
+                    {"action": "delete_db", "name": SUB_DB_NAME},
+                    # also test the case when we try to delete a non-existent database
+                    # shouldn't happen in normal operation,
+                    # but can occur when failed operations are retried
+                    {"action": "delete_db", "name": "nonexistent_db"},
+                ],
             },
-            "delta_operations": [
-                {"action": "delete_db", "name": SUB_DB_NAME},
-                # also test the case when we try to delete a non-existent database
-                # shouldn't happen in normal operation,
-                # but can occur when failed operations are retried
-                {"action": "delete_db", "name": "nonexistent_db"},
-            ],
         }
     )
 
@@ -354,25 +417,27 @@ def test_drop_role_with_table_privileges_from_neon_superuser(neon_simple_env: Ne
 
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "cluster": {
-                "roles": [
-                    {
-                        # We need to create role via compute_ctl, because in this case it will receive
-                        # additional grants equivalent to our real environment, so we can repro some
-                        # issues.
-                        "name": "neon",
-                        # Some autocomplete-suggested hash, no specific meaning.
-                        "encrypted_password": "SCRAM-SHA-256$4096:hBT22QjqpydQWqEulorfXA==$miBogcoj68JWYdsNB5PW1X6PjSLBEcNuctuhtGkb4PY=:hxk2gxkwxGo6P7GCtfpMlhA9zwHvPMsCz+NQf2HfvWk=",
-                        "options": [],
-                    },
-                ],
-                "databases": [
-                    {
-                        "name": TEST_DB_NAME,
-                        "owner": "neon",
-                    },
-                ],
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "cluster": {
+                    "roles": [
+                        {
+                            # We need to create role via compute_ctl, because in this case it will receive
+                            # additional grants equivalent to our real environment, so we can repro some
+                            # issues.
+                            "name": "neon",
+                            # Some autocomplete-suggested hash, no specific meaning.
+                            "encrypted_password": "SCRAM-SHA-256$4096:hBT22QjqpydQWqEulorfXA==$miBogcoj68JWYdsNB5PW1X6PjSLBEcNuctuhtGkb4PY=:hxk2gxkwxGo6P7GCtfpMlhA9zwHvPMsCz+NQf2HfvWk=",
+                            "options": [],
+                        },
+                    ],
+                    "databases": [
+                        {
+                            "name": TEST_DB_NAME,
+                            "owner": "neon",
+                        },
+                    ],
+                },
             },
         }
     )
@@ -415,13 +480,15 @@ def test_drop_role_with_table_privileges_from_neon_superuser(neon_simple_env: Ne
     # Drop role via compute_ctl
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "delta_operations": [
-                {
-                    "action": "delete_role",
-                    "name": TEST_GRANTEE,
-                },
-            ],
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "delta_operations": [
+                    {
+                        "action": "delete_role",
+                        "name": TEST_GRANTEE,
+                    },
+                ],
+            },
         }
     )
     endpoint.reconfigure()
@@ -444,13 +511,15 @@ def test_drop_role_with_table_privileges_from_neon_superuser(neon_simple_env: Ne
 
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "delta_operations": [
-                {
-                    "action": "delete_role",
-                    "name": "readonly2",
-                },
-            ],
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "delta_operations": [
+                    {
+                        "action": "delete_role",
+                        "name": "readonly2",
+                    },
+                ],
+            },
         }
     )
     endpoint.reconfigure()
@@ -475,25 +544,27 @@ def test_drop_role_with_table_privileges_from_non_neon_superuser(neon_simple_env
     endpoint = env.endpoints.create_start("main")
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "cluster": {
-                "roles": [
-                    {
-                        # We need to create role via compute_ctl, because in this case it will receive
-                        # additional grants equivalent to our real environment, so we can repro some
-                        # issues.
-                        "name": TEST_GRANTOR,
-                        # Some autocomplete-suggested hash, no specific meaning.
-                        "encrypted_password": "SCRAM-SHA-256$4096:hBT22QjqpydQWqEulorfXA==$miBogcoj68JWYdsNB5PW1X6PjSLBEcNuctuhtGkb4PY=:hxk2gxkwxGo6P7GCtfpMlhA9zwHvPMsCz+NQf2HfvWk=",
-                        "options": [],
-                    },
-                ],
-                "databases": [
-                    {
-                        "name": TEST_DB_NAME,
-                        "owner": TEST_GRANTOR,
-                    },
-                ],
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "cluster": {
+                    "roles": [
+                        {
+                            # We need to create role via compute_ctl, because in this case it will receive
+                            # additional grants equivalent to our real environment, so we can repro some
+                            # issues.
+                            "name": TEST_GRANTOR,
+                            # Some autocomplete-suggested hash, no specific meaning.
+                            "encrypted_password": "SCRAM-SHA-256$4096:hBT22QjqpydQWqEulorfXA==$miBogcoj68JWYdsNB5PW1X6PjSLBEcNuctuhtGkb4PY=:hxk2gxkwxGo6P7GCtfpMlhA9zwHvPMsCz+NQf2HfvWk=",
+                            "options": [],
+                        },
+                    ],
+                    "databases": [
+                        {
+                            "name": TEST_DB_NAME,
+                            "owner": TEST_GRANTOR,
+                        },
+                    ],
+                },
             },
         }
     )
@@ -507,13 +578,15 @@ def test_drop_role_with_table_privileges_from_non_neon_superuser(neon_simple_env
 
     endpoint.respec_deep(
         **{
-            "skip_pg_catalog_updates": False,
-            "delta_operations": [
-                {
-                    "action": "delete_role",
-                    "name": TEST_GRANTEE,
-                },
-            ],
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "delta_operations": [
+                    {
+                        "action": "delete_role",
+                        "name": TEST_GRANTEE,
+                    },
+                ],
+            },
         }
     )
     endpoint.reconfigure()
@@ -524,3 +597,69 @@ def test_drop_role_with_table_privileges_from_non_neon_superuser(neon_simple_env
         )
         role = cursor.fetchone()
         assert role is None
+
+
+def test_db_with_custom_settings(neon_simple_env: NeonEnv):
+    """
+    Test that compute_ctl can work with databases that have some custom settings.
+    For example, role=some_other_role, default_transaction_read_only=on,
+    search_path=non_public_schema, statement_timeout=1 (1ms).
+    """
+    env = neon_simple_env
+
+    endpoint = env.endpoints.create_start("main")
+
+    TEST_ROLE = "some_other_role"
+    TEST_DB = "db_with_custom_settings"
+    TEST_SCHEMA = "non_public_schema"
+
+    endpoint.respec_deep(
+        **{
+            "spec": {
+                "skip_pg_catalog_updates": False,
+                "cluster": {
+                    "databases": [
+                        {
+                            "name": TEST_DB,
+                            "owner": TEST_ROLE,
+                        }
+                    ],
+                    "roles": [
+                        {
+                            "name": TEST_ROLE,
+                        }
+                    ],
+                },
+            }
+        }
+    )
+
+    endpoint.reconfigure()
+
+    with endpoint.cursor(dbname=TEST_DB) as cursor:
+        cursor.execute(f"CREATE SCHEMA {TEST_SCHEMA}")
+        cursor.execute(f"ALTER DATABASE {TEST_DB} SET role = {TEST_ROLE}")
+        cursor.execute(f"ALTER DATABASE {TEST_DB} SET default_transaction_read_only = on")
+        cursor.execute(f"ALTER DATABASE {TEST_DB} SET search_path = {TEST_SCHEMA}")
+        cursor.execute(f"ALTER DATABASE {TEST_DB} SET statement_timeout = 1")
+
+    with endpoint.cursor(dbname=TEST_DB) as cursor:
+        cursor.execute("SELECT current_role")
+        role = cursor.fetchone()
+        assert role is not None
+        assert role[0] == TEST_ROLE
+
+        cursor.execute("SHOW default_transaction_read_only")
+        default_transaction_read_only = cursor.fetchone()
+        assert default_transaction_read_only is not None
+        assert default_transaction_read_only[0] == "on"
+
+        cursor.execute("SHOW search_path")
+        search_path = cursor.fetchone()
+        assert search_path is not None
+        assert search_path[0] == TEST_SCHEMA
+
+        # Do not check statement_timeout, because we force it to 2min
+        # in `endpoint.cursor()` fixture.
+
+    endpoint.reconfigure()

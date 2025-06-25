@@ -1,24 +1,17 @@
-use std::{collections::HashSet, net::SocketAddr};
-
 use anyhow::{Result, anyhow};
-use axum::{RequestExt, body::Body, extract::ConnectInfo};
+use axum::{RequestExt, body::Body};
 use axum_extra::{
     TypedHeader,
     headers::{Authorization, authorization::Bearer},
 };
+use compute_api::requests::{COMPUTE_AUDIENCE, ComputeClaims, ComputeClaimsScope};
 use futures::future::BoxFuture;
 use http::{Request, Response, StatusCode};
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, jwk::JwkSet};
-use serde::Deserialize;
 use tower_http::auth::AsyncAuthorizeRequest;
-use tracing::warn;
+use tracing::{debug, warn};
 
-use crate::http::{JsonResponse, extract::RequestId};
-
-#[derive(Clone, Debug, Deserialize)]
-pub(in crate::http) struct Claims {
-    compute_id: String,
-}
+use crate::http::JsonResponse;
 
 #[derive(Clone, Debug)]
 pub(in crate::http) struct Authorize {
@@ -30,13 +23,14 @@ pub(in crate::http) struct Authorize {
 impl Authorize {
     pub fn new(compute_id: String, jwks: JwkSet) -> Self {
         let mut validation = Validation::new(Algorithm::EdDSA);
-        // Nothing is currently required
-        validation.required_spec_claims = HashSet::new();
         validation.validate_exp = true;
         // Unused by the control plane
-        validation.validate_aud = false;
-        // Unused by the control plane
         validation.validate_nbf = false;
+        // Unused by the control plane
+        validation.validate_aud = false;
+        validation.set_audience(&[COMPUTE_AUDIENCE]);
+        // Nothing is currently required
+        validation.set_required_spec_claims(&[] as &[&str; 0]);
 
         Self {
             compute_id,
@@ -57,28 +51,6 @@ impl AsyncAuthorizeRequest<Body> for Authorize {
         let validation = self.validation.clone();
 
         Box::pin(async move {
-            let request_id = request.extract_parts::<RequestId>().await.unwrap();
-
-            // TODO: Remove this check after a successful rollout
-            if jwks.keys.is_empty() {
-                warn!(%request_id, "Authorization has not been configured");
-
-                return Ok(request);
-            }
-
-            let connect_info = request
-                .extract_parts::<ConnectInfo<SocketAddr>>()
-                .await
-                .unwrap();
-
-            // In the event the request is coming from the loopback interface,
-            // allow all requests
-            if connect_info.ip().is_loopback() {
-                warn!(%request_id, "Bypassed authorization because request is coming from the loopback interface");
-
-                return Ok(request);
-            }
-
             let TypedHeader(Authorization(bearer)) = request
                 .extract_parts::<TypedHeader<Authorization<Bearer>>>()
                 .await
@@ -91,11 +63,47 @@ impl AsyncAuthorizeRequest<Body> for Authorize {
                 Err(e) => return Err(JsonResponse::error(StatusCode::UNAUTHORIZED, e)),
             };
 
-            if data.claims.compute_id != compute_id {
-                return Err(JsonResponse::error(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid claims in authorization token",
-                ));
+            match data.claims.scope {
+                // TODO: We should validate audience for every token, but
+                // instead of this ad-hoc validation, we should turn
+                // [`Validation::validate_aud`] on. This is merely a stopgap
+                // while we roll out `aud` deployment. We return a 401
+                // Unauthorized because when we eventually do use
+                // [`Validation`], we will hit the above `Err` match arm which
+                // returns 401 Unauthorized.
+                Some(ComputeClaimsScope::Admin) => {
+                    let Some(ref audience) = data.claims.audience else {
+                        return Err(JsonResponse::error(
+                            StatusCode::UNAUTHORIZED,
+                            "missing audience in authorization token claims",
+                        ));
+                    };
+
+                    if !audience.iter().any(|a| a == COMPUTE_AUDIENCE) {
+                        return Err(JsonResponse::error(
+                            StatusCode::UNAUTHORIZED,
+                            "invalid audience in authorization token claims",
+                        ));
+                    }
+                }
+
+                // If the scope is not [`ComputeClaimsScope::Admin`], then we
+                // must validate the compute_id
+                _ => {
+                    let Some(ref claimed_compute_id) = data.claims.compute_id else {
+                        return Err(JsonResponse::error(
+                            StatusCode::FORBIDDEN,
+                            "missing compute_id in authorization token claims",
+                        ));
+                    };
+
+                    if *claimed_compute_id != compute_id {
+                        return Err(JsonResponse::error(
+                            StatusCode::FORBIDDEN,
+                            "invalid compute ID in authorization token claims",
+                        ));
+                    }
+                }
             }
 
             // Make claims available to any subsequent middleware or request
@@ -109,15 +117,21 @@ impl AsyncAuthorizeRequest<Body> for Authorize {
 
 impl Authorize {
     /// Verify the token using the JSON Web Key set and return the token data.
-    fn verify(jwks: &JwkSet, token: &str, validation: &Validation) -> Result<TokenData<Claims>> {
+    fn verify(
+        jwks: &JwkSet,
+        token: &str,
+        validation: &Validation,
+    ) -> Result<TokenData<ComputeClaims>> {
         debug_assert!(!jwks.keys.is_empty());
+
+        debug!("verifying token {}", token);
 
         for jwk in jwks.keys.iter() {
             let decoding_key = match DecodingKey::from_jwk(jwk) {
                 Ok(key) => key,
                 Err(e) => {
                     warn!(
-                        "Failed to construct decoding key from {}: {}",
+                        "failed to construct decoding key from {}: {}",
                         jwk.common.key_id.as_ref().unwrap(),
                         e
                     );
@@ -126,11 +140,11 @@ impl Authorize {
                 }
             };
 
-            match jsonwebtoken::decode::<Claims>(token, &decoding_key, validation) {
+            match jsonwebtoken::decode::<ComputeClaims>(token, &decoding_key, validation) {
                 Ok(data) => return Ok(data),
                 Err(e) => {
                     warn!(
-                        "Failed to decode authorization token using {}: {}",
+                        "failed to decode authorization token using {}: {}",
                         jwk.common.key_id.as_ref().unwrap(),
                         e
                     );
@@ -140,6 +154,6 @@ impl Authorize {
             }
         }
 
-        Err(anyhow!("Failed to verify authorization token"))
+        Err(anyhow!("failed to verify authorization token"))
     }
 }

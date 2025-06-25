@@ -22,7 +22,7 @@ pub async fn get_dbs_and_roles(compute: &Arc<ComputeNode>) -> anyhow::Result<Cat
 
     spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
+            eprintln!("connection error: {e}");
         }
     });
 
@@ -98,13 +98,15 @@ pub async fn get_database_schema(
         .kill_on_drop(true)
         .spawn()?;
 
-    let stdout = cmd.stdout.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture stdout.")
-    })?;
+    let stdout = cmd
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("Failed to capture stdout."))?;
 
-    let stderr = cmd.stderr.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture stderr.")
-    })?;
+    let stderr = cmd
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("Failed to capture stderr."))?;
 
     let mut stdout_reader = FramedRead::new(stdout, BytesCodec::new());
     let stderr_reader = BufReader::new(stderr);
@@ -117,7 +119,7 @@ pub async fn get_database_schema(
         _ => {
             let mut lines = stderr_reader.lines();
             if let Some(line) = lines.next_line().await? {
-                if line.contains(&format!("FATAL:  database \"{}\" does not exist", dbname)) {
+                if line.contains(&format!("FATAL:  database \"{dbname}\" does not exist")) {
                     return Err(SchemaDumpError::DatabaseDoesNotExist);
                 }
                 warn!("pg_dump stderr: {}", line)
@@ -128,8 +130,7 @@ pub async fn get_database_schema(
                 }
             });
 
-            return Err(SchemaDumpError::IO(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(SchemaDumpError::IO(std::io::Error::other(
                 "failed to start pg_dump",
             )));
         }

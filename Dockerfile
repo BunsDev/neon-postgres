@@ -2,11 +2,9 @@
 ### The image itself is mainly used as a container for the binaries and for starting e2e tests with custom parameters.
 ### By default, the binaries inside the image have some mock parameters and can start, but are not intended to be used
 ### inside this image in the real deployments.
-ARG REPOSITORY=neondatabase
+ARG REPOSITORY=ghcr.io/neondatabase
 ARG IMAGE=build-tools
 ARG TAG=pinned
-ARG DEFAULT_PG_VERSION=17
-ARG STABLE_PG_VERSION=16
 ARG DEBIAN_VERSION=bookworm
 ARG DEBIAN_FLAVOR=${DEBIAN_VERSION}-slim
 
@@ -47,7 +45,6 @@ COPY --chown=nonroot scripts/ninstall.sh scripts/ninstall.sh
 ENV BUILD_TYPE=release
 RUN set -e \
     && mold -run make -j $(nproc) -s neon-pg-ext \
-    && rm -rf pg_install/build \
     && tar -C pg_install -czf /home/nonroot/postgres_install.tar.gz .
 
 # Prepare cargo-chef recipe
@@ -63,14 +60,11 @@ FROM $REPOSITORY/$IMAGE:$TAG AS build
 WORKDIR /home/nonroot
 ARG GIT_VERSION=local
 ARG BUILD_TAG
-ARG STABLE_PG_VERSION
 
 COPY --from=pg-build /home/nonroot/pg_install/v14/include/postgresql/server pg_install/v14/include/postgresql/server
 COPY --from=pg-build /home/nonroot/pg_install/v15/include/postgresql/server pg_install/v15/include/postgresql/server
 COPY --from=pg-build /home/nonroot/pg_install/v16/include/postgresql/server pg_install/v16/include/postgresql/server
 COPY --from=pg-build /home/nonroot/pg_install/v17/include/postgresql/server pg_install/v17/include/postgresql/server
-COPY --from=pg-build /home/nonroot/pg_install/v16/lib                       pg_install/v16/lib
-COPY --from=pg-build /home/nonroot/pg_install/v17/lib                       pg_install/v17/lib
 COPY --from=plan     /home/nonroot/recipe.json                              recipe.json
 
 ARG ADDITIONAL_RUSTFLAGS=""
@@ -89,6 +83,7 @@ RUN set -e \
       --bin storage_broker  \
       --bin storage_controller  \
       --bin proxy  \
+      --bin endpoint_storage \
       --bin neon_local \
       --bin storage_scrubber \
       --locked --release
@@ -96,7 +91,6 @@ RUN set -e \
 # Build final image
 #
 FROM $BASE_IMAGE_SHA
-ARG DEFAULT_PG_VERSION
 WORKDIR /data
 
 RUN set -e \
@@ -106,9 +100,20 @@ RUN set -e \
         libreadline-dev \
         libseccomp-dev \
         ca-certificates \
-	# System postgres for use with client libraries (e.g. in storage controller)
-        postgresql-15 \
         openssl \
+        unzip \
+        curl \
+    && ARCH=$(uname -m) \
+    && if [ "$ARCH" = "x86_64" ]; then \
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"; \
+    elif [ "$ARCH" = "aarch64" ]; then \
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"; \
+    else \
+        echo "Unsupported architecture: $ARCH" && exit 1; \
+    fi \
+    && unzip awscliv2.zip \
+    && ./aws/install \
+    && rm -rf aws awscliv2.zip \
     && rm -f /etc/apt/apt.conf.d/80-retries \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && useradd -d /data neon \
@@ -121,6 +126,7 @@ COPY --from=build --chown=neon:neon /home/nonroot/target/release/safekeeper     
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/storage_broker      /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/storage_controller  /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/proxy               /usr/local/bin
+COPY --from=build --chown=neon:neon /home/nonroot/target/release/endpoint_storage    /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/neon_local          /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/storage_scrubber    /usr/local/bin
 

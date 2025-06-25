@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 /// API (`/control/v1` prefix).  Implemented by the server
 /// in [`storage_controller::http`]
 use serde::{Deserialize, Serialize};
-use utils::id::{NodeId, TenantId};
+use utils::id::{NodeId, TenantId, TimelineId};
+use utils::lsn::Lsn;
 
 use crate::models::{PageserverUtilization, ShardParameters, TenantConfig};
 use crate::shard::{ShardStripeSize, TenantShardId};
@@ -51,6 +52,8 @@ pub struct NodeRegisterRequest {
 
     pub listen_pg_addr: String,
     pub listen_pg_port: u16,
+    pub listen_grpc_addr: Option<String>,
+    pub listen_grpc_port: Option<u16>,
 
     pub listen_http_addr: String,
     pub listen_http_port: u16,
@@ -100,6 +103,8 @@ pub struct TenantLocateResponseShard {
 
     pub listen_pg_addr: String,
     pub listen_pg_port: u16,
+    pub listen_grpc_addr: Option<String>,
+    pub listen_grpc_port: Option<u16>,
 
     pub listen_http_addr: String,
     pub listen_http_port: u16,
@@ -151,6 +156,8 @@ pub struct NodeDescribeResponse {
 
     pub listen_pg_addr: String,
     pub listen_pg_port: u16,
+    pub listen_grpc_addr: Option<String>,
+    pub listen_grpc_port: Option<u16>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -168,6 +175,8 @@ pub struct TenantDescribeResponseShard {
     pub is_pending_compute_notification: bool,
     /// A shard split is currently underway
     pub is_splitting: bool,
+    /// A timeline is being imported into this tenant
+    pub is_importing: bool,
 
     pub scheduling_policy: ShardSchedulingPolicy,
 
@@ -342,6 +351,35 @@ impl Default for ShardSchedulingPolicy {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq, Debug)]
+pub enum NodeLifecycle {
+    Active,
+    Deleted,
+}
+
+impl FromStr for NodeLifecycle {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(Self::Active),
+            "deleted" => Ok(Self::Deleted),
+            _ => Err(anyhow::anyhow!("Unknown node lifecycle '{s}'")),
+        }
+    }
+}
+
+impl From<NodeLifecycle> for String {
+    fn from(value: NodeLifecycle) -> String {
+        use NodeLifecycle::*;
+        match value {
+            Active => "active",
+            Deleted => "deleted",
+        }
+        .to_string()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq, Debug)]
 pub enum NodeSchedulingPolicy {
     Active,
     Filling,
@@ -499,6 +537,15 @@ pub struct SafekeeperSchedulingPolicyRequest {
     pub scheduling_policy: SkSchedulingPolicy,
 }
 
+/// Import request for safekeeper timelines.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TimelineImportRequest {
+    pub tenant_id: TenantId,
+    pub timeline_id: TimelineId,
+    pub start_lsn: Lsn,
+    pub sk_set: Vec<NodeId>,
+}
+
 #[cfg(test)]
 mod test {
     use serde_json;
@@ -530,8 +577,7 @@ mod test {
         let err = serde_json::from_value::<TenantCreateRequest>(create_request).unwrap_err();
         assert!(
             err.to_string().contains("unknown field `unknown_field`"),
-            "expect unknown field `unknown_field` error, got: {}",
-            err
+            "expect unknown field `unknown_field` error, got: {err}"
         );
     }
 

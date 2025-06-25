@@ -7,8 +7,7 @@ import string
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -25,6 +24,9 @@ from fixtures.log_helper import log
 from fixtures.metrics import Metrics, MetricsGetter, parse_metrics
 from fixtures.pg_version import PgVersion
 from fixtures.utils import EnhancedJSONEncoder, Fn
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 class PageserverApiException(Exception):
@@ -673,7 +675,7 @@ class PageserverHttpClient(requests.Session, MetricsGetter):
 
     def timeline_delete(
         self, tenant_id: TenantId | TenantShardId, timeline_id: TimelineId, **kwargs
-    ):
+    ) -> int:
         """
         Note that deletion is not instant, it is scheduled and performed mostly in the background.
         So if you need to wait for it to complete use `timeline_delete_wait_completed`.
@@ -685,6 +687,8 @@ class PageserverHttpClient(requests.Session, MetricsGetter):
         self.verbose_error(res)
         res_json = res.json()
         assert res_json is None
+
+        return res.status_code
 
     def timeline_gc(
         self,
@@ -850,6 +854,25 @@ class PageserverHttpClient(requests.Session, MetricsGetter):
         self.verbose_error(res)
         res_json = res.json()
         return res_json
+
+    def timeline_mark_invisible(
+        self,
+        tenant_id: TenantId | TenantShardId,
+        timeline_id: TimelineId,
+        is_visible: bool | None = None,
+    ):
+        data = {
+            "is_visible": is_visible,
+        }
+
+        log.info(
+            f"Requesting marking timeline invisible for {is_visible=}, {tenant_id=}, {timeline_id=}"
+        )
+        res = self.put(
+            f"http://localhost:{self.port}/v1/tenant/{tenant_id}/timeline/{timeline_id}/mark_invisible",
+            json=data,
+        )
+        self.verbose_error(res)
 
     def timeline_get_timestamp_of_lsn(
         self, tenant_id: TenantId | TenantShardId, timeline_id: TimelineId, lsn: Lsn
@@ -1169,5 +1192,58 @@ class PageserverHttpClient(requests.Session, MetricsGetter):
             f"http://localhost:{self.port}/v1/tenant/{tenant_id}/timeline/{timeline_id}/perf_info",
         )
         log.info(f"Got perf info response code: {res.status_code}")
+        self.verbose_error(res)
+        return res.json()
+
+    def ingest_aux_files(
+        self,
+        tenant_id: TenantId | TenantShardId,
+        timeline_id: TimelineId,
+        aux_files: dict[str, bytes],
+    ):
+        res = self.post(
+            f"http://localhost:{self.port}/v1/tenant/{tenant_id}/timeline/{timeline_id}/ingest_aux_files",
+            json={
+                "aux_files": aux_files,
+            },
+        )
+        self.verbose_error(res)
+        return res.json()
+
+    def list_aux_files(
+        self, tenant_id: TenantId | TenantShardId, timeline_id: TimelineId, lsn: Lsn
+    ) -> Any:
+        res = self.post(
+            f"http://localhost:{self.port}/v1/tenant/{tenant_id}/timeline/{timeline_id}/list_aux_files",
+            json={"lsn": str(lsn)},
+        )
+        self.verbose_error(res)
+        return res.json()
+
+    def force_override_feature_flag(self, flag: str, value: str | None = None):
+        if value is None:
+            res = self.delete(
+                f"http://localhost:{self.port}/v1/feature_flag/{flag}",
+            )
+        else:
+            res = self.put(
+                f"http://localhost:{self.port}/v1/feature_flag/{flag}",
+                params={"value": value},
+            )
+        self.verbose_error(res)
+
+    def evaluate_feature_flag_boolean(self, tenant_id: TenantId, flag: str) -> Any:
+        res = self.get(
+            f"http://localhost:{self.port}/v1/tenant/{tenant_id}/feature_flag/{flag}",
+            params={"as": "boolean"},
+        )
+        self.verbose_error(res)
+        return res.json()
+
+    def evaluate_feature_flag_multivariate(self, tenant_id: TenantId, flag: str) -> Any:
+        res = self.get(
+            f"http://localhost:{self.port}/v1/tenant/{tenant_id}/feature_flag/{flag}",
+            params={"as": "multivariate"},
+        )
         self.verbose_error(res)
         return res.json()

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -21,6 +20,8 @@ from fixtures.remote_storage import s3_storage
 from fixtures.utils import skip_in_debug_build
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from fixtures.neon_fixtures import PgBin
     from pytest import CaptureFixture
 
@@ -172,7 +173,11 @@ def test_pg_regress(
     (runpath / "testtablespace").mkdir(parents=True)
 
     # Compute all the file locations that pg_regress will need.
-    build_path = pg_distrib_dir / f"build/{env.pg_version.v_prefixed}/src/test/regress"
+    #
+    # XXX: We assume that the `build` directory is a sibling of the
+    # pg_distrib_dir.  That is the default when you check out the
+    # repository; `build` and `pg_install` are created side by side.
+    build_path = pg_distrib_dir / f"../build/{env.pg_version.v_prefixed}/src/test/regress"
     src_path = base_dir / f"vendor/postgres-{env.pg_version.v_prefixed}/src/test/regress"
     bindir = pg_distrib_dir / f"v{env.pg_version}/bin"
     schedule = src_path / "parallel_schedule"
@@ -238,6 +243,8 @@ def test_isolation(
             "neon.regress_test_mode = true",
             # Stack size should be increased for tests to pass with asan.
             "max_stack_depth = 4MB",
+            # Neon extensiosn starts 2 BGW so decreasing number of parallel workers which can affect deadlock-parallel test if it hits max_worker_processes.
+            "max_worker_processes = 16",
         ],
     )
     endpoint.safe_psql(f"CREATE DATABASE {DBNAME}")
@@ -247,7 +254,11 @@ def test_isolation(
     (runpath / "testtablespace").mkdir(parents=True)
 
     # Compute all the file locations that pg_isolation_regress will need.
-    build_path = pg_distrib_dir / f"build/{env.pg_version.v_prefixed}/src/test/isolation"
+    #
+    # XXX: We assume that the `build` directory is a sibling of the
+    # pg_distrib_dir.  That is the default when you check out the
+    # repository; `build` and `pg_install` are created side by side.
+    build_path = pg_distrib_dir / f"../build/{env.pg_version.v_prefixed}/src/test/isolation"
     src_path = base_dir / f"vendor/postgres-{env.pg_version.v_prefixed}/src/test/isolation"
     bindir = pg_distrib_dir / f"v{env.pg_version}/bin"
     schedule = src_path / "isolation_schedule"
@@ -303,13 +314,7 @@ def test_sql_regress(
     )
 
     # Connect to postgres and create a database called "regression".
-    endpoint = env.endpoints.create_start(
-        "main",
-        config_lines=[
-            # Enable the test mode, so that we don't need to patch the test cases.
-            "neon.regress_test_mode = true",
-        ],
-    )
+    endpoint = env.endpoints.create_start("main")
     endpoint.safe_psql(f"CREATE DATABASE {DBNAME}")
 
     # Create some local directories for pg_regress to run in.
@@ -317,8 +322,11 @@ def test_sql_regress(
     (runpath / "testtablespace").mkdir(parents=True)
 
     # Compute all the file locations that pg_regress will need.
-    # This test runs neon specific tests
-    build_path = pg_distrib_dir / f"build/v{env.pg_version}/src/test/regress"
+    #
+    # XXX: We assume that the `build` directory is a sibling of the
+    # pg_distrib_dir.  That is the default when you check out the
+    # repository; `build` and `pg_install` are created side by side.
+    build_path = pg_distrib_dir / f"../build/{env.pg_version.v_prefixed}/src/test/regress"
     src_path = base_dir / "test_runner/sql_regress"
     bindir = pg_distrib_dir / f"v{env.pg_version}/bin"
     schedule = src_path / "parallel_schedule"
@@ -468,7 +476,7 @@ def test_tx_abort_with_many_relations(
         try:
             # Rollback phase should be fast: this is one WAL record that we should process efficiently
             fut = exec.submit(rollback_and_wait)
-            fut.result(timeout=15)
+            fut.result(timeout=15 if reldir_type == "v1" else 30)
         except:
             exec.shutdown(wait=False, cancel_futures=True)
             raise

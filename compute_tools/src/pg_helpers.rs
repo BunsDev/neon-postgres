@@ -36,9 +36,9 @@ pub fn escape_literal(s: &str) -> String {
     let res = s.replace('\'', "''").replace('\\', "\\\\");
 
     if res.contains('\\') {
-        format!("E'{}'", res)
+        format!("E'{res}'")
     } else {
-        format!("'{}'", res)
+        format!("'{res}'")
     }
 }
 
@@ -46,7 +46,7 @@ pub fn escape_literal(s: &str) -> String {
 /// with `'{}'` is not required, as it returns a ready-to-use config string.
 pub fn escape_conf_value(s: &str) -> String {
     let res = s.replace('\'', "''").replace('\\', "\\\\");
-    format!("'{}'", res)
+    format!("'{res}'")
 }
 
 pub trait GenericOptionExt {
@@ -213,8 +213,10 @@ impl Escaping for PgIdent {
 
         // Find the first suitable tag that is not present in the string.
         // Postgres' max role/DB name length is 63 bytes, so even in the
-        // worst case it won't take long.
-        while self.contains(&format!("${tag}$")) || self.contains(&format!("${outer_tag}$")) {
+        // worst case it won't take long. Outer tag is always `tag + "x"`,
+        // so if `tag` is not present in the string, `outer_tag` is not
+        // present in the string either.
+        while self.contains(&tag.to_string()) {
             tag += "x";
             outer_tag = tag.clone() + "x";
         }
@@ -444,7 +446,7 @@ pub async fn tune_pgbouncer(
         let mut pgbouncer_connstr =
             "host=localhost port=6432 dbname=pgbouncer user=postgres sslmode=disable".to_string();
         if let Ok(pass) = std::env::var("PGBOUNCER_PASSWORD") {
-            pgbouncer_connstr.push_str(format!(" password={}", pass).as_str());
+            pgbouncer_connstr.push_str(format!(" password={pass}").as_str());
         }
         pgbouncer_connstr
     };
@@ -462,7 +464,7 @@ pub async fn tune_pgbouncer(
             Ok((client, connection)) => {
                 tokio::spawn(async move {
                     if let Err(e) = connection.await {
-                        eprintln!("connection error: {}", e);
+                        eprintln!("connection error: {e}");
                     }
                 });
                 break client;

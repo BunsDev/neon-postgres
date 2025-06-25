@@ -8,6 +8,7 @@ use bytes::{Bytes, BytesMut};
 use hyper::header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, HeaderName};
 use hyper::http::HeaderValue;
 use hyper::{Body, Method, Request, Response};
+use jsonwebtoken::TokenData;
 use metrics::{Encoder, IntCounter, TextEncoder, register_int_counter};
 use once_cell::sync::Lazy;
 use pprof::ProfilerGuardBuilder;
@@ -581,14 +582,14 @@ pub fn attach_openapi_ui(
                             deepLinking: true,
                             showExtensions: true,
                             showCommonExtensions: true,
-                            url: "{}",
+                            url: "{spec_mount_path}",
                         }})
                         window.ui = ui;
                     }};
                 </script>
                 </body>
                 </html>
-            "#, spec_mount_path))).unwrap())
+            "#))).unwrap())
              })
         )
 }
@@ -618,7 +619,7 @@ pub fn auth_middleware<B: hyper::body::HttpBody + Send + Sync + 'static>(
                     })?;
                     let token = parse_token(header_value)?;
 
-                    let data = auth.decode(token).map_err(|err| {
+                    let data: TokenData<Claims> = auth.decode(token).map_err(|err| {
                         warn!("Authentication error: {err}");
                         // Rely on From<AuthError> for ApiError impl
                         err
@@ -695,7 +696,7 @@ mod tests {
         let remote_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 80);
         let mut service = builder.build(remote_addr);
         if let Err(e) = poll_fn(|ctx| service.poll_ready(ctx)).await {
-            panic!("request service is not ready: {:?}", e);
+            panic!("request service is not ready: {e:?}");
         }
 
         let mut req: Request<Body> = Request::default();
@@ -715,7 +716,7 @@ mod tests {
         let remote_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 80);
         let mut service = builder.build(remote_addr);
         if let Err(e) = poll_fn(|ctx| service.poll_ready(ctx)).await {
-            panic!("request service is not ready: {:?}", e);
+            panic!("request service is not ready: {e:?}");
         }
 
         let req: Request<Body> = Request::default();

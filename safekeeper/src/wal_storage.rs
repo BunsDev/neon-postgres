@@ -19,8 +19,10 @@ use futures::future::BoxFuture;
 use postgres_ffi::v14::xlog_utils::{IsPartialXLogFileName, IsXLogFileName, XLogFromFileName};
 use postgres_ffi::waldecoder::WalStreamDecoder;
 use postgres_ffi::{PG_TLI, XLogFileName, XLogSegNo, dispatch_pgversion};
+use postgres_versioninfo::{PgMajorVersion, PgVersionId};
 use pq_proto::SystemId;
 use remote_storage::RemotePath;
+use std::sync::Arc;
 use tokio::fs::{self, File, OpenOptions, remove_file};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::*;
@@ -32,7 +34,7 @@ use crate::metrics::{
     REMOVED_WAL_SEGMENTS, WAL_STORAGE_OPERATION_SECONDS, WalStorageMetrics, time_io_closure,
 };
 use crate::state::TimelinePersistentState;
-use crate::wal_backup::{read_object, remote_timeline_path};
+use crate::wal_backup::{WalBackup, read_object, remote_timeline_path};
 
 pub trait Storage {
     // Last written LSN.
@@ -91,7 +93,7 @@ pub struct PhysicalStorage {
 
     /// Size of WAL segment in bytes.
     wal_seg_size: usize,
-    pg_version: u32,
+    pg_version: PgVersionId,
     system_id: u64,
 
     /// Written to disk, but possibly still in the cache and not fully persisted.
@@ -179,7 +181,7 @@ impl PhysicalStorage {
         let write_lsn = if state.commit_lsn == Lsn(0) {
             Lsn(0)
         } else {
-            let version = state.server.pg_version / 10000;
+            let version = PgMajorVersion::try_from(state.server.pg_version).unwrap();
 
             dispatch_pgversion!(
                 version,
@@ -225,7 +227,10 @@ impl PhysicalStorage {
             write_record_lsn: write_lsn,
             flush_lsn,
             flush_record_lsn: flush_lsn,
-            decoder: WalStreamDecoder::new(write_lsn, state.server.pg_version / 10000),
+            decoder: WalStreamDecoder::new(
+                write_lsn,
+                PgMajorVersion::try_from(state.server.pg_version).unwrap(),
+            ),
             file: None,
             pending_wal_truncation: true,
         })
@@ -407,7 +412,7 @@ impl Storage for PhysicalStorage {
 
         let segno = init_lsn.segment_number(self.wal_seg_size);
         let (mut file, _) = self.open_or_create(segno).await?;
-        let major_pg_version = self.pg_version / 10000;
+        let major_pg_version = PgMajorVersion::try_from(self.pg_version).unwrap();
         let wal_seg =
             postgres_ffi::generate_wal_segment(segno, self.system_id, major_pg_version, init_lsn)?;
         file.seek(SeekFrom::Start(0)).await?;
@@ -645,7 +650,7 @@ pub struct WalReader {
     wal_segment: Option<Pin<Box<dyn AsyncRead + Send + Sync>>>,
 
     // S3 will be used to read WAL if LSN is not available locally
-    enable_remote_read: bool,
+    wal_backup: Arc<WalBackup>,
 
     // We don't have WAL locally if LSN is less than local_start_lsn
     local_start_lsn: Lsn,
@@ -653,7 +658,7 @@ pub struct WalReader {
     // pos is in the same segment as timeline_start_lsn.
     timeline_start_lsn: Lsn,
     // integer version number of PostgreSQL, e.g. 14; 15; 16
-    pg_version: u32,
+    pg_version: PgMajorVersion,
     system_id: SystemId,
     timeline_start_segment: Option<Bytes>,
 }
@@ -664,7 +669,7 @@ impl WalReader {
         timeline_dir: Utf8PathBuf,
         state: &TimelinePersistentState,
         start_pos: Lsn,
-        enable_remote_read: bool,
+        wal_backup: Arc<WalBackup>,
     ) -> Result<Self> {
         if state.server.wal_seg_size == 0 || state.local_start_lsn == Lsn(0) {
             bail!("state uninitialized, no data to read");
@@ -693,10 +698,10 @@ impl WalReader {
             wal_seg_size: state.server.wal_seg_size as usize,
             pos: start_pos,
             wal_segment: None,
-            enable_remote_read,
+            wal_backup,
             local_start_lsn: state.local_start_lsn,
             timeline_start_lsn: state.timeline_start_lsn,
-            pg_version: state.server.pg_version / 10000,
+            pg_version: PgMajorVersion::try_from(state.server.pg_version).unwrap(),
             system_id: state.server.system_id,
             timeline_start_segment: None,
         })
@@ -812,9 +817,9 @@ impl WalReader {
         }
 
         // Try to open remote file, if remote reads are enabled
-        if self.enable_remote_read {
+        if let Some(storage) = self.wal_backup.get_storage() {
             let remote_wal_file_path = self.remote_path.join(&wal_file_name);
-            return read_object(&remote_wal_file_path, xlogoff as u64).await;
+            return read_object(&storage, &remote_wal_file_path, xlogoff as u64).await;
         }
 
         bail!("WAL segment is not found")
@@ -840,7 +845,7 @@ pub(crate) async fn open_wal_file(
     // If that failed, try it without the .partial extension.
     let pf = tokio::fs::File::open(&wal_file_path)
         .await
-        .with_context(|| format!("failed to open WAL file {:#}", wal_file_path))
+        .with_context(|| format!("failed to open WAL file {wal_file_path:#}"))
         .map_err(|e| {
             warn!("{}", e);
             e

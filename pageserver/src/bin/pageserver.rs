@@ -12,14 +12,18 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use camino::Utf8Path;
 use clap::{Arg, ArgAction, Command};
+use http_utils::tls_certs::ReloadingCertificateResolver;
 use metrics::launch_timestamp::{LaunchTimestamp, set_launch_timestamp_metric};
 use metrics::set_build_info_metric;
 use nix::sys::socket::{setsockopt, sockopt};
-use pageserver::config::{PageServerConf, PageserverIdentity};
-use pageserver::controller_upcall_client::ControllerUpcallClient;
+use pageserver::basebackup_cache::BasebackupCache;
+use pageserver::config::{PageServerConf, PageserverIdentity, ignored_fields};
+use pageserver::controller_upcall_client::StorageControllerUpcallClient;
 use pageserver::deletion_queue::DeletionQueue;
 use pageserver::disk_usage_eviction_task::{self, launch_disk_usage_global_eviction_task};
+use pageserver::feature_resolver::FeatureResolver;
 use pageserver::metrics::{STARTUP_DURATION, STARTUP_IS_LOADING};
+use pageserver::page_service::GrpcPageServiceHandler;
 use pageserver::task_mgr::{
     BACKGROUND_RUNTIME, COMPUTE_REQUEST_RUNTIME, MGMT_REQUEST_RUNTIME, WALRECEIVER_RUNTIME,
 };
@@ -30,10 +34,10 @@ use pageserver::{
 };
 use postgres_backend::AuthType;
 use remote_storage::GenericRemoteStorage;
-use tokio::signal::unix::SignalKind;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::*;
+use tracing_utils::OtelGuard;
 use utils::auth::{JwtAuth, SwappableJwtAuth};
 use utils::crashsafe::syncfs;
 use utils::logging::TracingErrorLayerEnablement;
@@ -96,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     env::set_current_dir(&workdir)
         .with_context(|| format!("Failed to set application's current dir to '{workdir}'"))?;
 
-    let conf = initialize_config(&identity_file_path, &cfg_file_path, &workdir)?;
+    let (conf, ignored) = initialize_config(&identity_file_path, &cfg_file_path, &workdir)?;
 
     // Initialize logging.
     //
@@ -117,6 +121,21 @@ fn main() -> anyhow::Result<()> {
         logging::Output::Stdout,
     )?;
 
+    let otel_enablement = match &conf.tracing {
+        Some(cfg) => tracing_utils::OtelEnablement::Enabled {
+            service_name: "pageserver".to_string(),
+            export_config: (&cfg.export_config).into(),
+            runtime: *COMPUTE_REQUEST_RUNTIME,
+        },
+        None => tracing_utils::OtelEnablement::Disabled,
+    };
+
+    let otel_guard = tracing_utils::init_performance_tracing(otel_enablement);
+
+    if otel_guard.is_some() {
+        info!(?conf.tracing, "starting with OTEL tracing enabled");
+    }
+
     // mind the order required here: 1. logging, 2. panic_hook, 3. sentry.
     // disarming this hook on pageserver, because we never tear down tracing.
     logging::replace_panic_hook_with_tracing_panic_hook().forget();
@@ -127,10 +146,19 @@ fn main() -> anyhow::Result<()> {
         &[("node_id", &conf.id.to_string())],
     );
 
-    // after setting up logging, log the effective IO engine choice and read path implementations
+    // Warn about ignored config items; see pageserver_api::config::ConfigToml
+    // doc comment for rationale why we prefer this over serde(deny_unknown_fields).
+    {
+        let ignored_fields::Paths { paths } = &ignored;
+        for path in paths {
+            warn!(?path, "ignoring unknown configuration item");
+        }
+    }
+
+    // Log configuration items for feature-flag-like config
+    // (maybe we should automate this with a visitor?).
     info!(?conf.virtual_file_io_engine, "starting with virtual_file IO engine");
     info!(?conf.virtual_file_io_mode, "starting with virtual_file IO mode");
-    info!(?conf.wal_receiver_protocol, "starting with WAL receiver protocol");
     info!(?conf.validate_wal_contiguity, "starting with WAL contiguity validation");
     info!(?conf.page_service_pipelining, "starting with page service pipelining config");
     info!(?conf.get_vectored_concurrent_io, "starting with get_vectored IO concurrency config");
@@ -190,7 +218,7 @@ fn main() -> anyhow::Result<()> {
     tracing::info!("Initializing page_cache...");
     page_cache::init(conf.page_cache_size);
 
-    start_pageserver(launch_ts, conf).context("Failed to start pageserver")?;
+    start_pageserver(launch_ts, conf, ignored, otel_guard).context("Failed to start pageserver")?;
 
     scenario.teardown();
     Ok(())
@@ -200,7 +228,7 @@ fn initialize_config(
     identity_file_path: &Utf8Path,
     cfg_file_path: &Utf8Path,
     workdir: &Utf8Path,
-) -> anyhow::Result<&'static PageServerConf> {
+) -> anyhow::Result<(&'static PageServerConf, ignored_fields::Paths)> {
     // The deployment orchestrator writes out an indentity file containing the node id
     // for all pageservers. This file is the source of truth for the node id. In order
     // to allow for rolling back pageserver releases, the node id is also included in
@@ -229,15 +257,36 @@ fn initialize_config(
 
     let config_file_contents =
         std::fs::read_to_string(cfg_file_path).context("read config file from filesystem")?;
-    let config_toml = serde_path_to_error::deserialize(
-        toml_edit::de::Deserializer::from_str(&config_file_contents)
-            .context("build toml deserializer")?,
-    )
-    .context("deserialize config toml")?;
+
+    // Deserialize the config file contents into a ConfigToml.
+    let config_toml: pageserver_api::config::ConfigToml = {
+        let deserializer = toml_edit::de::Deserializer::from_str(&config_file_contents)
+            .context("build toml deserializer")?;
+        let mut path_to_error_track = serde_path_to_error::Track::new();
+        let deserializer =
+            serde_path_to_error::Deserializer::new(deserializer, &mut path_to_error_track);
+        serde::Deserialize::deserialize(deserializer).context("deserialize config toml")?
+    };
+
+    // Find unknown fields by re-serializing the parsed ConfigToml and comparing it to the on-disk file.
+    // Any fields that are only in the on-disk version are unknown.
+    // (The assumption here is that the ConfigToml doesn't to skip_serializing_if.)
+    // (Make sure to read the ConfigToml doc comment on why we only want to warn about, but not fail startup, on unknown fields).
+    let ignored = {
+        let ondisk_toml = config_file_contents
+            .parse::<toml_edit::DocumentMut>()
+            .context("parse original config as toml document")?;
+        let parsed_toml = toml_edit::ser::to_document(&config_toml)
+            .context("re-serialize config to toml document")?;
+        pageserver::config::ignored_fields::find(ondisk_toml, parsed_toml)
+    };
+
+    // Construct the runtime god object (it's called PageServerConf but actually is just global shared state).
     let conf = PageServerConf::parse_and_validate(identity.id, config_toml, workdir)
         .context("runtime-validation of config toml")?;
+    let conf = Box::leak(Box::new(conf));
 
-    Ok(Box::leak(Box::new(conf)))
+    Ok((conf, ignored))
 }
 
 struct WaitForPhaseResult<F: std::future::Future + Unpin> {
@@ -288,6 +337,8 @@ fn startup_checkpoint(started_at: Instant, phase: &str, human_phase: &str) {
 fn start_pageserver(
     launch_ts: &'static LaunchTimestamp,
     conf: &'static PageServerConf,
+    ignored: ignored_fields::Paths,
+    otel_guard: Option<OtelGuard>,
 ) -> anyhow::Result<()> {
     // Monotonic time for later calculating startup duration
     let started_startup_at = Instant::now();
@@ -310,7 +361,7 @@ fn start_pageserver(
         pageserver::metrics::tokio_epoll_uring::Collector::new(),
     ))
     .unwrap();
-    pageserver::preinitialize_metrics(conf);
+    pageserver::preinitialize_metrics(conf, ignored);
 
     // If any failpoints were set from FAILPOINTS environment variable,
     // print them to the log for debugging purposes
@@ -338,23 +389,30 @@ fn start_pageserver(
     // We need to release the lock file only when the process exits.
     std::mem::forget(lock_file);
 
-    // Bind the HTTP and libpq ports early, so that if they are in use by some other
-    // process, we error out early.
-    let http_addr = &conf.listen_http_addr;
-    info!("Starting pageserver http handler on {http_addr}");
-    let http_listener = tcp_listener::bind(http_addr)?;
+    // Bind the HTTP, libpq, and gRPC ports early, to error out if they are
+    // already in use.
+    info!(
+        "Starting pageserver http handler on {} with auth {:#?}",
+        conf.listen_http_addr, conf.http_auth_type
+    );
+    let http_listener = tcp_listener::bind(&conf.listen_http_addr)?;
 
     let https_listener = match conf.listen_https_addr.as_ref() {
         Some(https_addr) => {
-            info!("Starting pageserver https handler on {https_addr}");
+            info!(
+                "Starting pageserver https handler on {https_addr} with auth {:#?}",
+                conf.http_auth_type
+            );
             Some(tcp_listener::bind(https_addr)?)
         }
         None => None,
     };
 
-    let pg_addr = &conf.listen_pg_addr;
-    info!("Starting pageserver pg protocol handler on {pg_addr}");
-    let pageserver_listener = tcp_listener::bind(pg_addr)?;
+    info!(
+        "Starting pageserver pg protocol handler on {} with auth {:#?}",
+        conf.listen_pg_addr, conf.pg_auth_type,
+    );
+    let pageserver_listener = tcp_listener::bind(&conf.listen_pg_addr)?;
 
     // Enable SO_KEEPALIVE on the socket, to detect dead connections faster.
     // These are configured via net.ipv4.tcp_keepalive_* sysctls.
@@ -363,12 +421,31 @@ fn start_pageserver(
     // support enabling keepalives while using the default OS sysctls.
     setsockopt(&pageserver_listener, sockopt::KeepAlive, &true)?;
 
+    let mut grpc_listener = None;
+    if let Some(grpc_addr) = &conf.listen_grpc_addr {
+        info!(
+            "Starting pageserver gRPC handler on {grpc_addr} with auth {:#?}",
+            conf.grpc_auth_type
+        );
+        grpc_listener = Some(tcp_listener::bind(grpc_addr).map_err(|e| anyhow!("{e}"))?);
+    }
+
     // Launch broker client
     // The storage_broker::connect call needs to happen inside a tokio runtime thread.
     let broker_client = WALRECEIVER_RUNTIME
         .block_on(async {
+            let tls_config = storage_broker::ClientTlsConfig::new().ca_certificates(
+                conf.ssl_ca_certs
+                    .iter()
+                    .map(pem::encode)
+                    .map(storage_broker::Certificate::from_pem),
+            );
             // Note: we do not attempt connecting here (but validate endpoints sanity).
-            storage_broker::connect(conf.broker_endpoint.clone(), conf.broker_keepalive_interval)
+            storage_broker::connect(
+                conf.broker_endpoint.clone(),
+                conf.broker_keepalive_interval,
+                tls_config,
+            )
         })
         .with_context(|| {
             format!(
@@ -380,7 +457,8 @@ fn start_pageserver(
     // Initialize authentication for incoming connections
     let http_auth;
     let pg_auth;
-    if conf.http_auth_type == AuthType::NeonJWT || conf.pg_auth_type == AuthType::NeonJWT {
+    let grpc_auth;
+    if [conf.http_auth_type, conf.pg_auth_type, conf.grpc_auth_type].contains(&AuthType::NeonJWT) {
         // unwrap is ok because check is performed when creating config, so path is set and exists
         let key_path = conf.auth_validation_public_key_path.as_ref().unwrap();
         info!("Loading public key(s) for verifying JWT tokens from {key_path:?}");
@@ -388,20 +466,41 @@ fn start_pageserver(
         let jwt_auth = JwtAuth::from_key_path(key_path)?;
         let auth: Arc<SwappableJwtAuth> = Arc::new(SwappableJwtAuth::new(jwt_auth));
 
-        http_auth = match &conf.http_auth_type {
+        http_auth = match conf.http_auth_type {
             AuthType::Trust => None,
             AuthType::NeonJWT => Some(auth.clone()),
         };
-        pg_auth = match &conf.pg_auth_type {
+        pg_auth = match conf.pg_auth_type {
+            AuthType::Trust => None,
+            AuthType::NeonJWT => Some(auth.clone()),
+        };
+        grpc_auth = match conf.grpc_auth_type {
             AuthType::Trust => None,
             AuthType::NeonJWT => Some(auth),
         };
     } else {
         http_auth = None;
         pg_auth = None;
+        grpc_auth = None;
     }
-    info!("Using auth for http API: {:#?}", conf.http_auth_type);
-    info!("Using auth for pg connections: {:#?}", conf.pg_auth_type);
+
+    let tls_server_config = if conf.listen_https_addr.is_some() || conf.enable_tls_page_service_api
+    {
+        let resolver = BACKGROUND_RUNTIME.block_on(ReloadingCertificateResolver::new(
+            "main",
+            &conf.ssl_key_file,
+            &conf.ssl_cert_file,
+            conf.ssl_cert_reload_period,
+        ))?;
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+
+        Some(Arc::new(server_config))
+    } else {
+        None
+    };
 
     match var("NEON_AUTH_TOKEN") {
         Ok(v) => {
@@ -424,10 +523,16 @@ fn start_pageserver(
     // Set up remote storage client
     let remote_storage = BACKGROUND_RUNTIME.block_on(create_remote_storage_client(conf))?;
 
+    let feature_resolver = create_feature_resolver(
+        conf,
+        shutdown_pageserver.clone(),
+        BACKGROUND_RUNTIME.handle(),
+    )?;
+
     // Set up deletion queue
     let (deletion_queue, deletion_workers) = DeletionQueue::new(
         remote_storage.clone(),
-        ControllerUpcallClient::new(conf, &shutdown_pageserver),
+        StorageControllerUpcallClient::new(conf, &shutdown_pageserver),
         conf,
     );
     deletion_workers.spawn_with(BACKGROUND_RUNTIME.handle());
@@ -464,9 +569,12 @@ fn start_pageserver(
         pageserver::l0_flush::L0FlushGlobalState::new(conf.l0_flush.clone());
 
     // Scan the local 'tenants/' directory and start loading the tenants
+    let (basebackup_prepare_sender, basebackup_prepare_receiver) =
+        tokio::sync::mpsc::unbounded_channel();
     let deletion_queue_client = deletion_queue.new_client();
     let background_purges = mgr::BackgroundPurges::default();
-    let tenant_manager = BACKGROUND_RUNTIME.block_on(mgr::init_tenant_mgr(
+
+    let tenant_manager = mgr::init(
         conf,
         background_purges.clone(),
         TenantSharedResources {
@@ -474,11 +582,22 @@ fn start_pageserver(
             remote_storage: remote_storage.clone(),
             deletion_queue_client,
             l0_flush_global_state,
+            basebackup_prepare_sender,
+            feature_resolver: feature_resolver.clone(),
         },
-        order,
         shutdown_pageserver.clone(),
-    ))?;
+    );
     let tenant_manager = Arc::new(tenant_manager);
+    BACKGROUND_RUNTIME.block_on(mgr::init_tenant_mgr(tenant_manager.clone(), order))?;
+
+    let basebackup_cache = BasebackupCache::spawn(
+        BACKGROUND_RUNTIME.handle(),
+        conf.basebackup_cache_dir(),
+        conf.basebackup_cache_config.clone(),
+        basebackup_prepare_receiver,
+        Arc::clone(&tenant_manager),
+        shutdown_pageserver.child_token(),
+    );
 
     BACKGROUND_RUNTIME.spawn({
         let shutdown_pageserver = shutdown_pageserver.clone();
@@ -596,6 +715,7 @@ fn start_pageserver(
                 disk_usage_eviction_state,
                 deletion_queue.new_client(),
                 secondary_controller,
+                feature_resolver,
             )
             .context("Failed to initialize router state")?,
         );
@@ -621,14 +741,11 @@ fn start_pageserver(
 
         let https_task = match https_listener {
             Some(https_listener) => {
-                let certs = http_utils::tls_certs::load_cert_chain(&conf.ssl_cert_file)?;
-                let key = http_utils::tls_certs::load_private_key(&conf.ssl_key_file)?;
+                let tls_server_config = tls_server_config
+                    .clone()
+                    .expect("tls_server_config is set earlier if https is enabled");
 
-                let server_config = rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)?;
-
-                let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+                let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_server_config);
 
                 let server =
                     http_utils::server::Server::new(service, https_listener, Some(tls_acceptor))?;
@@ -670,45 +787,51 @@ fn start_pageserver(
 
     // Spawn a task to listen for libpq connections. It will spawn further tasks
     // for each connection. We created the listener earlier already.
-    let page_service = page_service::spawn(conf, tenant_manager.clone(), pg_auth, {
-        let _entered = COMPUTE_REQUEST_RUNTIME.enter(); // TcpListener::from_std requires it
-        pageserver_listener
-            .set_nonblocking(true)
-            .context("set listener to nonblocking")?;
-        tokio::net::TcpListener::from_std(pageserver_listener).context("create tokio listener")?
-    });
+    let perf_trace_dispatch = otel_guard.as_ref().map(|g| g.dispatch.clone());
+    let page_service = page_service::spawn(
+        conf,
+        tenant_manager.clone(),
+        pg_auth,
+        perf_trace_dispatch,
+        {
+            let _entered = COMPUTE_REQUEST_RUNTIME.enter(); // TcpListener::from_std requires it
+            pageserver_listener
+                .set_nonblocking(true)
+                .context("set listener to nonblocking")?;
+            tokio::net::TcpListener::from_std(pageserver_listener)
+                .context("create tokio listener")?
+        },
+        if conf.enable_tls_page_service_api {
+            tls_server_config
+        } else {
+            None
+        },
+        basebackup_cache,
+    );
+
+    // Spawn a Pageserver gRPC server task. It will spawn separate tasks for
+    // each stream/request.
+    //
+    // TODO: this uses a separate Tokio runtime for the page service. If we want
+    // other gRPC services, they will need their own port and runtime. Is this
+    // necessary?
+    let mut page_service_grpc = None;
+    if let Some(grpc_listener) = grpc_listener {
+        page_service_grpc = Some(GrpcPageServiceHandler::spawn(
+            tenant_manager.clone(),
+            grpc_auth,
+            otel_guard.as_ref().map(|g| g.dispatch.clone()),
+            conf.get_vectored_concurrent_io,
+            grpc_listener,
+        )?);
+    }
 
     // All started up! Now just sit and wait for shutdown signal.
     BACKGROUND_RUNTIME.block_on(async move {
         let signal_token = CancellationToken::new();
         let signal_cancel = signal_token.child_token();
 
-        // Spawn signal handlers. Runs in a loop since we want to be responsive to multiple signals
-        // even after triggering shutdown (e.g. a SIGQUIT after a slow SIGTERM shutdown). See:
-        // https://github.com/neondatabase/neon/issues/9740.
-        tokio::spawn(async move {
-            let mut sigint = tokio::signal::unix::signal(SignalKind::interrupt()).unwrap();
-            let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate()).unwrap();
-            let mut sigquit = tokio::signal::unix::signal(SignalKind::quit()).unwrap();
-
-            loop {
-                let signal = tokio::select! {
-                    _ = sigquit.recv() => {
-                        info!("Got signal SIGQUIT. Terminating in immediate shutdown mode.");
-                        std::process::exit(111);
-                    }
-                    _ = sigint.recv() => "SIGINT",
-                    _ = sigterm.recv() => "SIGTERM",
-                };
-
-                if !signal_token.is_cancelled() {
-                    info!("Got signal {signal}. Terminating gracefully in fast shutdown mode.");
-                    signal_token.cancel();
-                } else {
-                    info!("Got signal {signal}. Already shutting down.");
-                }
-            }
-        });
+        tokio::spawn(utils::signals::signal_handler(signal_token));
 
         // Wait for cancellation signal and shut down the pageserver.
         //
@@ -721,6 +844,7 @@ fn start_pageserver(
             http_endpoint_listener,
             https_endpoint_listener,
             page_service,
+            page_service_grpc,
             consumption_metrics_tasks,
             disk_usage_eviction_task,
             &tenant_manager,
@@ -732,6 +856,14 @@ fn start_pageserver(
         .await;
         unreachable!();
     })
+}
+
+fn create_feature_resolver(
+    conf: &'static PageServerConf,
+    shutdown_pageserver: CancellationToken,
+    handle: &tokio::runtime::Handle,
+) -> anyhow::Result<FeatureResolver> {
+    FeatureResolver::spawn(conf, shutdown_pageserver, handle)
 }
 
 async fn create_remote_storage_client(

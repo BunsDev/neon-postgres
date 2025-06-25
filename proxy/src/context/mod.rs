@@ -4,7 +4,6 @@ use std::net::IpAddr;
 
 use chrono::Utc;
 use once_cell::sync::OnceCell;
-use pq_proto::StartupMessageParams;
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
 use tracing::field::display;
@@ -20,6 +19,7 @@ use crate::metrics::{
     ConnectOutcome, InvalidEndpointsGroup, LatencyAccumulated, LatencyTimer, Metrics, Protocol,
     Waiting,
 };
+use crate::pqproto::StartupMessageParams;
 use crate::protocol2::{ConnectionInfo, ConnectionInfoExtra};
 use crate::types::{DbName, EndpointId, RoleName};
 
@@ -63,7 +63,7 @@ struct RequestContextInner {
     success: bool,
     pub(crate) cold_start_info: ColdStartInfo,
     pg_options: Option<StartupMessageParams>,
-    testodrome_query_id: Option<String>,
+    testodrome_query_id: Option<SmolStr>,
 
     // extra
     // This sender is here to keep the request monitoring channel open while requests are taking place.
@@ -78,7 +78,7 @@ struct RequestContextInner {
 
 #[derive(Clone, Debug)]
 pub(crate) enum AuthMethod {
-    // aka passwordless, fka link
+    // aka link
     ConsoleRedirect,
     ScramSha256,
     ScramSha256Plus,
@@ -219,7 +219,7 @@ impl RequestContext {
             for option in options_str.split_whitespace() {
                 if option.starts_with("neon_query_id:") {
                     if let Some(value) = option.strip_prefix("neon_query_id:") {
-                        this.set_testodrome_id(value.to_string());
+                        this.set_testodrome_id(value.into());
                         break;
                     }
                 }
@@ -272,7 +272,7 @@ impl RequestContext {
             .set_user_agent(user_agent);
     }
 
-    pub(crate) fn set_testodrome_id(&self, query_id: String) {
+    pub(crate) fn set_testodrome_id(&self, query_id: SmolStr) {
         self.0
             .try_lock()
             .expect("should not deadlock")
@@ -370,6 +370,18 @@ impl RequestContext {
         }
     }
 
+    pub(crate) fn latency_timer_pause_at(
+        &self,
+        at: tokio::time::Instant,
+        waiting_for: Waiting,
+    ) -> LatencyTimerPause<'_> {
+        LatencyTimerPause {
+            ctx: self,
+            start: at,
+            waiting_for,
+        }
+    }
+
     pub(crate) fn get_proxy_latency(&self) -> LatencyAccumulated {
         self.0
             .try_lock()
@@ -378,7 +390,7 @@ impl RequestContext {
             .accumulated()
     }
 
-    pub(crate) fn get_testodrome_id(&self) -> Option<String> {
+    pub(crate) fn get_testodrome_id(&self) -> Option<SmolStr> {
         self.0
             .try_lock()
             .expect("should not deadlock")
@@ -447,7 +459,7 @@ impl RequestContextInner {
         self.user = Some(user);
     }
 
-    fn set_testodrome_id(&mut self, query_id: String) {
+    fn set_testodrome_id(&mut self, query_id: SmolStr) {
         self.testodrome_query_id = Some(query_id);
     }
 

@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::error::Error as _;
+use std::time::Duration;
 
 use bytes::Bytes;
 use detach_ancestor::AncestorDetached;
 use http_utils::error::HttpErrorBody;
 use pageserver_api::models::*;
 use pageserver_api::shard::TenantShardId;
+use postgres_versioninfo::PgMajorVersion;
 pub use reqwest::Body as ReqwestBody;
-use reqwest::{Certificate, IntoUrl, Method, StatusCode, Url};
+use reqwest::{IntoUrl, Method, StatusCode, Url};
 use utils::id::{TenantId, TimelineId};
 use utils::lsn::Lsn;
 
@@ -39,8 +41,8 @@ pub enum Error {
     #[error("Cancelled")]
     Cancelled,
 
-    #[error("create client: {0}{}", .0.source().map(|e| format!(": {e}")).unwrap_or_default())]
-    CreateClient(reqwest::Error),
+    #[error("request timed out: {0}")]
+    Timeout(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -72,24 +74,7 @@ pub enum ForceAwaitLogicalSize {
 }
 
 impl Client {
-    pub fn new(
-        mgmt_api_endpoint: String,
-        jwt: Option<&str>,
-        ssl_ca_cert: Option<Certificate>,
-    ) -> Result<Self> {
-        let mut http_client = reqwest::Client::builder();
-        if let Some(ssl_ca_cert) = ssl_ca_cert {
-            http_client = http_client.add_root_certificate(ssl_ca_cert);
-        }
-        let http_client = http_client.build().map_err(Error::CreateClient)?;
-        Ok(Self::from_client(http_client, mgmt_api_endpoint, jwt))
-    }
-
-    pub fn from_client(
-        client: reqwest::Client,
-        mgmt_api_endpoint: String,
-        jwt: Option<&str>,
-    ) -> Self {
+    pub fn new(client: reqwest::Client, mgmt_api_endpoint: String, jwt: Option<&str>) -> Self {
         Self {
             mgmt_api_endpoint,
             authorization_header: jwt.map(|jwt| format!("Bearer {jwt}")),
@@ -103,17 +88,17 @@ impl Client {
         resp.json().await.map_err(Error::ReceiveBody)
     }
 
-    /// Get an arbitrary path and returning a streaming Response.  This function is suitable
-    /// for pass-through/proxy use cases where we don't care what the response content looks
-    /// like.
+    /// Send an HTTP request to an arbitrary path with a desired HTTP method and returning a streaming
+    /// Response.  This function is suitable for pass-through/proxy use cases where we don't care
+    /// what the response content looks like.
     ///
     /// Use/add one of the properly typed methods below if you know aren't proxying, and
     /// know what kind of response you expect.
-    pub async fn get_raw(&self, path: String) -> Result<reqwest::Response> {
+    pub async fn op_raw(&self, method: Method, path: String) -> Result<reqwest::Response> {
         debug_assert!(path.starts_with('/'));
         let uri = format!("{}{}", self.mgmt_api_endpoint, path);
 
-        let mut req = self.client.request(Method::GET, uri);
+        let mut req = self.client.request(method, uri);
         if let Some(value) = &self.authorization_header {
             req = req.header(reqwest::header::AUTHORIZATION, value);
         }
@@ -436,6 +421,23 @@ impl Client {
         }
     }
 
+    pub async fn timeline_detail(
+        &self,
+        tenant_shard_id: TenantShardId,
+        timeline_id: TimelineId,
+    ) -> Result<TimelineInfo> {
+        let uri = format!(
+            "{}/v1/tenant/{tenant_shard_id}/timeline/{timeline_id}",
+            self.mgmt_api_endpoint
+        );
+
+        self.request(Method::GET, &uri, ())
+            .await?
+            .json()
+            .await
+            .map_err(Error::ReceiveBody)
+    }
+
     pub async fn timeline_archival_config(
         &self,
         tenant_shard_id: TenantShardId,
@@ -507,11 +509,11 @@ impl Client {
         .expect("Cannot build URL");
 
         path.query_pairs_mut()
-            .append_pair("recurse", &format!("{}", recurse));
+            .append_pair("recurse", &format!("{recurse}"));
 
         if let Some(concurrency) = concurrency {
             path.query_pairs_mut()
-                .append_pair("concurrency", &format!("{}", concurrency));
+                .append_pair("concurrency", &format!("{concurrency}"));
         }
 
         self.request(Method::POST, path, ()).await.map(|_| ())
@@ -744,9 +746,11 @@ impl Client {
         timeline_id: TimelineId,
         base_lsn: Lsn,
         end_lsn: Lsn,
-        pg_version: u32,
+        pg_version: PgMajorVersion,
         basebackup_tarball: ReqwestBody,
     ) -> Result<()> {
+        let pg_version = pg_version.major_version_num();
+
         let uri = format!(
             "{}/v1/tenant/{tenant_id}/timeline/{timeline_id}/import_basebackup?base_lsn={base_lsn}&end_lsn={end_lsn}&pg_version={pg_version}",
             self.mgmt_api_endpoint,
@@ -818,5 +822,35 @@ impl Client {
         self.request_noerror(Method::POST, uri, request)
             .await
             .map(|resp| resp.status())
+    }
+
+    pub async fn activate_post_import(
+        &self,
+        tenant_shard_id: TenantShardId,
+        timeline_id: TimelineId,
+        activate_timeline_timeout: Duration,
+    ) -> Result<TimelineInfo> {
+        let uri = format!(
+            "{}/v1/tenant/{}/timeline/{}/activate_post_import?timeline_activate_timeout_ms={}",
+            self.mgmt_api_endpoint,
+            tenant_shard_id,
+            timeline_id,
+            activate_timeline_timeout.as_millis()
+        );
+
+        self.request(Method::PUT, uri, ())
+            .await?
+            .json()
+            .await
+            .map_err(Error::ReceiveBody)
+    }
+
+    pub async fn update_feature_flag_spec(&self, spec: String) -> Result<()> {
+        let uri = format!("{}/v1/feature_flag_spec", self.mgmt_api_endpoint);
+        self.request(Method::POST, uri, spec)
+            .await?
+            .json()
+            .await
+            .map_err(Error::ReceiveBody)
     }
 }

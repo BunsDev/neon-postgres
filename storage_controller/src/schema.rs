@@ -33,6 +33,9 @@ diesel::table! {
         listen_pg_port -> Int4,
         availability_zone_id -> Varchar,
         listen_https_port -> Nullable<Int4>,
+        lifecycle -> Varchar,
+        listen_grpc_addr -> Nullable<Varchar>,
+        listen_grpc_port -> Nullable<Int4>,
     }
 }
 
@@ -77,6 +80,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    timeline_imports (tenant_id, timeline_id) {
+        tenant_id -> Varchar,
+        timeline_id -> Varchar,
+        shard_statuses -> Jsonb,
+    }
+}
+
+diesel::table! {
     use diesel::sql_types::*;
     use super::sql_types::PgLsn;
 
@@ -99,5 +110,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     safekeeper_timeline_pending_ops,
     safekeepers,
     tenant_shards,
+    timeline_imports,
     timelines,
 );

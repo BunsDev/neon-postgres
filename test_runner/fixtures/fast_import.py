@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -11,7 +12,9 @@ from _pytest.config import Config
 
 from fixtures.log_helper import log
 from fixtures.neon_cli import AbstractNeonCli
+from fixtures.neon_fixtures import Endpoint, VanillaPostgres
 from fixtures.pg_version import PgVersion
+from fixtures.remote_storage import MockS3Server
 
 
 class FastImport(AbstractNeonCli):
@@ -111,6 +114,18 @@ class FastImport(AbstractNeonCli):
         self.cmd = self.raw_cli(args)
         return self.cmd
 
+    def set_aws_creds(self, mock_s3_server: MockS3Server, extra_env: dict[str, str] | None = None):
+        if self.extra_env is None:
+            self.extra_env = {}
+        self.extra_env["AWS_ACCESS_KEY_ID"] = mock_s3_server.access_key()
+        self.extra_env["AWS_SECRET_ACCESS_KEY"] = mock_s3_server.secret_key()
+        self.extra_env["AWS_SESSION_TOKEN"] = mock_s3_server.session_token()
+        self.extra_env["AWS_REGION"] = mock_s3_server.region()
+        self.extra_env["AWS_ENDPOINT_URL"] = mock_s3_server.endpoint()
+
+        if extra_env is not None:
+            self.extra_env.update(extra_env)
+
     def __enter__(self):
         return self
 
@@ -134,7 +149,7 @@ def fast_import(
         pg_distrib_dir,
         pg_version,
         workdir,
-        cleanup=not cast(bool, pytestconfig.getoption("--preserve-database-files")),
+        cleanup=not cast("bool", pytestconfig.getoption("--preserve-database-files")),
     ) as fi:
         yield fi
 
@@ -148,3 +163,57 @@ def fast_import(
             f.write(fi.cmd.stderr)
 
         log.info("Written logs to %s", test_output_dir)
+
+
+def mock_import_bucket(vanilla_pg: VanillaPostgres, path: Path):
+    """
+    Mock the import S3 bucket into a local directory for a provided vanilla PG instance.
+    """
+    assert not vanilla_pg.is_running()
+
+    path.mkdir()
+    # what cplane writes before scheduling fast_import
+    specpath = path / "spec.json"
+    specpath.write_text(json.dumps({"branch_id": "somebranch", "project_id": "someproject"}))
+    # what fast_import writes
+    vanilla_pg.pgdatadir.rename(path / "pgdata")
+    statusdir = path / "status"
+    statusdir.mkdir()
+    (statusdir / "pgdata").write_text(json.dumps({"done": True}))
+    (statusdir / "fast_import").write_text(json.dumps({"command": "pgdata", "done": True}))
+
+
+def populate_vanilla_pg(vanilla_pg: VanillaPostgres, target_relblock_size: int) -> int:
+    assert vanilla_pg.is_running()
+
+    vanilla_pg.safe_psql("create user cloud_admin with password 'postgres' superuser")
+    # fillfactor so we don't need to produce that much data
+    # 900 byte per row is > 10% => 1 row per page
+    vanilla_pg.safe_psql("""create table t (data char(900)) with (fillfactor = 10)""")
+
+    nrows = 0
+    while True:
+        relblock_size = vanilla_pg.safe_psql_scalar("select pg_relation_size('t')")
+        log.info(
+            f"relblock size: {relblock_size / 8192} pages (target: {target_relblock_size // 8192}) pages"
+        )
+        if relblock_size >= target_relblock_size:
+            break
+        addrows = int((target_relblock_size - relblock_size) // 8192)
+        assert addrows >= 1, "forward progress"
+        vanilla_pg.safe_psql(
+            f"insert into t select generate_series({nrows + 1}, {nrows + addrows})"
+        )
+        nrows += addrows
+
+    return nrows
+
+
+def validate_import_from_vanilla_pg(endpoint: Endpoint, nrows: int):
+    assert endpoint.safe_psql_many(
+        [
+            "set effective_io_concurrency=32;",
+            "SET statement_timeout='300s';",
+            "select count(*), sum(data::bigint)::bigint from t",
+        ]
+    ) == [[], [], [(nrows, nrows * (nrows + 1) // 2)]]

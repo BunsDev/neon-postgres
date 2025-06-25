@@ -4,24 +4,30 @@
 //! file, or on the command line.
 //! See also `settings.md` for better description on every parameter.
 
+pub mod ignored_fields;
+
 use std::env;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
 use once_cell::sync::OnceCell;
-use pageserver_api::config::{DiskUsageEvictionTaskConfig, MaxVectoredReadBytes};
+use pageserver_api::config::{
+    DiskUsageEvictionTaskConfig, MaxGetVectoredKeys, MaxVectoredReadBytes,
+    PageServicePipeliningConfig, PageServicePipeliningConfigPipelined, PostHogConfig,
+};
 use pageserver_api::models::ImageCompressionAlgorithm;
 use pageserver_api::shard::TenantShardId;
+use pem::Pem;
 use postgres_backend::AuthType;
+use postgres_ffi::PgMajorVersion;
 use remote_storage::{RemotePath, RemoteStorageConfig};
 use reqwest::Url;
 use storage_broker::Uri;
 use utils::id::{NodeId, TimelineId};
 use utils::logging::{LogFormat, SecretString};
-use utils::postgres_client::PostgresClientProtocol;
 
 use crate::tenant::storage_layer::inmemory_layer::IndexEntry;
 use crate::tenant::{TENANTS_SEGMENT_NAME, TIMELINES_SEGMENT_NAME};
@@ -43,7 +49,7 @@ use crate::{TENANT_HEATMAP_BASENAME, TENANT_LOCATION_CONFIG_NAME, virtual_file};
 ///
 /// For fields that require additional validation or filling in of defaults at runtime,
 /// check for examples in the [`PageServerConf::parse_and_validate`] method.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PageServerConf {
     // Identifier of that particular pageserver so e g safekeepers
     // can safely distinguish different pageservers
@@ -55,9 +61,23 @@ pub struct PageServerConf {
     pub listen_http_addr: String,
     /// Example: 127.0.0.1:9899
     pub listen_https_addr: Option<String>,
+    /// If set, expose a gRPC API on this address.
+    /// Example: 127.0.0.1:51051
+    ///
+    /// EXPERIMENTAL: this protocol is unstable and under active development.
+    pub listen_grpc_addr: Option<String>,
 
+    /// Path to a file with certificate's private key for https and gRPC API.
+    /// Default: server.key
     pub ssl_key_file: Utf8PathBuf,
+    /// Path to a file with a X509 certificate for https and gRPC API.
+    /// Default: server.crt
     pub ssl_cert_file: Utf8PathBuf,
+    /// Period to reload certificate and private key from files.
+    /// Default: 60s.
+    pub ssl_cert_reload_period: Duration,
+    /// Trusted root CA certificates to use in https APIs in PEM format.
+    pub ssl_ca_certs: Vec<Pem>,
 
     /// Current availability zone. Used for traffic metrics.
     pub availability_zone: Option<String>,
@@ -88,13 +108,15 @@ pub struct PageServerConf {
     pub http_auth_type: AuthType,
     /// authentication method for libpq connections from compute
     pub pg_auth_type: AuthType,
+    /// authentication method for gRPC connections from compute
+    pub grpc_auth_type: AuthType,
     /// Path to a file or directory containing public key(s) for verifying JWT tokens.
     /// Used for both mgmt and compute auth, if enabled.
     pub auth_validation_public_key_path: Option<Utf8PathBuf>,
 
     pub remote_storage_config: Option<RemoteStorageConfig>,
 
-    pub default_tenant_conf: crate::tenant::config::TenantConf,
+    pub default_tenant_conf: pageserver_api::config::TenantConfigToml,
 
     /// Storage broker endpoints to connect to.
     pub broker_endpoint: Uri,
@@ -107,13 +129,13 @@ pub struct PageServerConf {
     /// A lower value implicitly deprioritizes loading such tenants, vs. other work in the system.
     pub concurrent_tenant_warmup: ConfigurableSemaphore,
 
-    /// Number of concurrent [`Tenant::gather_size_inputs`](crate::tenant::Tenant::gather_size_inputs) allowed.
+    /// Number of concurrent [`TenantShard::gather_size_inputs`](crate::tenant::TenantShard::gather_size_inputs) allowed.
     pub concurrent_tenant_size_logical_size_queries: ConfigurableSemaphore,
-    /// Limit of concurrent [`Tenant::gather_size_inputs`] issued by module `eviction_task`.
+    /// Limit of concurrent [`TenantShard::gather_size_inputs`] issued by module `eviction_task`.
     /// The number of permits is the same as `concurrent_tenant_size_logical_size_queries`.
     /// See the comment in `eviction_task` for details.
     ///
-    /// [`Tenant::gather_size_inputs`]: crate::tenant::Tenant::gather_size_inputs
+    /// [`TenantShard::gather_size_inputs`]: crate::tenant::TenantShard::gather_size_inputs
     pub eviction_task_immitated_concurrent_logical_size_queries: ConfigurableSemaphore,
 
     // How often to collect metrics and send them to the metrics endpoint.
@@ -138,7 +160,7 @@ pub struct PageServerConf {
     /// not terrible.
     pub background_task_maximum_delay: Duration,
 
-    pub control_plane_api: Option<Url>,
+    pub control_plane_api: Url,
 
     /// JWT token for use with the control plane API.
     pub control_plane_api_token: Option<SecretString>,
@@ -166,6 +188,9 @@ pub struct PageServerConf {
 
     pub max_vectored_read_bytes: MaxVectoredReadBytes,
 
+    /// Maximum number of keys to be read in a single get_vectored call.
+    pub max_get_vectored_keys: MaxGetVectoredKeys,
+
     pub image_compression: ImageCompressionAlgorithm,
 
     /// Whether to offload archived timelines automatically
@@ -186,8 +211,6 @@ pub struct PageServerConf {
     /// Optionally disable disk syncs (unsafe!)
     pub no_sync: bool,
 
-    pub wal_receiver_protocol: PostgresClientProtocol,
-
     pub page_service_pipelining: pageserver_api::config::PageServicePipeliningConfig,
 
     pub get_vectored_concurrent_io: pageserver_api::config::GetVectoredConcurrentIo,
@@ -206,6 +229,25 @@ pub struct PageServerConf {
 
     /// When set, include visible layers in the next uploaded heatmaps of an unarchived timeline.
     pub generate_unarchival_heatmap: bool,
+
+    pub tracing: Option<pageserver_api::config::Tracing>,
+
+    /// Enable TLS in page service API.
+    /// Does not force TLS: the client negotiates TLS usage during the handshake.
+    /// Uses key and certificate from ssl_key_file/ssl_cert_file.
+    pub enable_tls_page_service_api: bool,
+
+    /// Run in development mode, which disables certain safety checks
+    /// such as authentication requirements for HTTP and PostgreSQL APIs.
+    /// This is insecure and should only be used in development environments.
+    pub dev_mode: bool,
+
+    /// PostHog integration config.
+    pub posthog_config: Option<PostHogConfig>,
+
+    pub timeline_import_config: pageserver_api::config::TimelineImportConfig,
+
+    pub basebackup_cache_config: Option<pageserver_api::config::BasebackupCacheConfig>,
 }
 
 /// Token for authentication to safekeepers
@@ -233,6 +275,10 @@ impl PageServerConf {
 
     pub fn metadata_path(&self) -> Utf8PathBuf {
         self.workdir.join("metadata.json")
+    }
+
+    pub fn basebackup_cache_dir(&self) -> Utf8PathBuf {
+        self.workdir.join("basebackup_cache")
     }
 
     pub fn deletion_list_path(&self, sequence: u64) -> Utf8PathBuf {
@@ -293,20 +339,16 @@ impl PageServerConf {
     //
     // Postgres distribution paths
     //
-    pub fn pg_distrib_dir(&self, pg_version: u32) -> anyhow::Result<Utf8PathBuf> {
+    pub fn pg_distrib_dir(&self, pg_version: PgMajorVersion) -> anyhow::Result<Utf8PathBuf> {
         let path = self.pg_distrib_dir.clone();
 
-        #[allow(clippy::manual_range_patterns)]
-        match pg_version {
-            14 | 15 | 16 | 17 => Ok(path.join(format!("v{pg_version}"))),
-            _ => bail!("Unsupported postgres version: {}", pg_version),
-        }
+        Ok(path.join(pg_version.v_str()))
     }
 
-    pub fn pg_bin_dir(&self, pg_version: u32) -> anyhow::Result<Utf8PathBuf> {
+    pub fn pg_bin_dir(&self, pg_version: PgMajorVersion) -> anyhow::Result<Utf8PathBuf> {
         Ok(self.pg_distrib_dir(pg_version)?.join("bin"))
     }
-    pub fn pg_lib_dir(&self, pg_version: u32) -> anyhow::Result<Utf8PathBuf> {
+    pub fn pg_lib_dir(&self, pg_version: PgMajorVersion) -> anyhow::Result<Utf8PathBuf> {
         Ok(self.pg_distrib_dir(pg_version)?.join("lib"))
     }
 
@@ -323,8 +365,11 @@ impl PageServerConf {
             listen_pg_addr,
             listen_http_addr,
             listen_https_addr,
+            listen_grpc_addr,
             ssl_key_file,
             ssl_cert_file,
+            ssl_cert_reload_period,
+            ssl_ca_file,
             availability_zone,
             wait_lsn_timeout,
             wal_redo_timeout,
@@ -335,6 +380,7 @@ impl PageServerConf {
             pg_distrib_dir,
             http_auth_type,
             pg_auth_type,
+            grpc_auth_type,
             auth_validation_public_key_path,
             remote_storage,
             broker_endpoint,
@@ -358,6 +404,7 @@ impl PageServerConf {
             secondary_download_concurrency,
             ingest_batch_size,
             max_vectored_read_bytes,
+            max_get_vectored_keys,
             image_compression,
             timeline_offloading,
             ephemeral_bytes_per_memory_kb,
@@ -368,13 +415,18 @@ impl PageServerConf {
             virtual_file_io_engine,
             tenant_config,
             no_sync,
-            wal_receiver_protocol,
             page_service_pipelining,
             get_vectored_concurrent_io,
             enable_read_path_debugging,
             validate_wal_contiguity,
             load_previous_heatmap,
             generate_unarchival_heatmap,
+            tracing,
+            enable_tls_page_service_api,
+            dev_mode,
+            posthog_config,
+            timeline_import_config,
+            basebackup_cache_config,
         } = config_toml;
 
         let mut conf = PageServerConf {
@@ -384,8 +436,10 @@ impl PageServerConf {
             listen_pg_addr,
             listen_http_addr,
             listen_https_addr,
+            listen_grpc_addr,
             ssl_key_file,
             ssl_cert_file,
+            ssl_cert_reload_period,
             availability_zone,
             wait_lsn_timeout,
             wal_redo_timeout,
@@ -395,6 +449,7 @@ impl PageServerConf {
             max_file_descriptors,
             http_auth_type,
             pg_auth_type,
+            grpc_auth_type,
             auth_validation_public_key_path,
             remote_storage_config: remote_storage,
             broker_endpoint,
@@ -408,21 +463,27 @@ impl PageServerConf {
             test_remote_failures,
             ondemand_download_behavior_treat_error_as_warn,
             background_task_maximum_delay,
-            control_plane_api,
+            control_plane_api: control_plane_api
+                .ok_or_else(|| anyhow::anyhow!("`control_plane_api` must be set"))?,
             control_plane_emergency_mode,
             heatmap_upload_concurrency,
             secondary_download_concurrency,
             ingest_batch_size,
             max_vectored_read_bytes,
+            max_get_vectored_keys,
             image_compression,
             timeline_offloading,
             ephemeral_bytes_per_memory_kb,
             import_pgdata_upcall_api,
             import_pgdata_upcall_api_token: import_pgdata_upcall_api_token.map(SecretString::from),
             import_pgdata_aws_endpoint_url,
-            wal_receiver_protocol,
             page_service_pipelining,
             get_vectored_concurrent_io,
+            tracing,
+            enable_tls_page_service_api,
+            dev_mode,
+            timeline_import_config,
+            basebackup_cache_config,
 
             // ------------------------------------------------------------
             // fields that require additional validation or custom handling
@@ -469,13 +530,26 @@ impl PageServerConf {
             validate_wal_contiguity: validate_wal_contiguity.unwrap_or(false),
             load_previous_heatmap: load_previous_heatmap.unwrap_or(true),
             generate_unarchival_heatmap: generate_unarchival_heatmap.unwrap_or(true),
+            ssl_ca_certs: match ssl_ca_file {
+                Some(ssl_ca_file) => {
+                    let buf = std::fs::read(ssl_ca_file)?;
+                    pem::parse_many(&buf)?
+                        .into_iter()
+                        .filter(|pem| pem.tag() == "CERTIFICATE")
+                        .collect()
+                }
+                None => Vec::new(),
+            },
+            posthog_config,
         };
 
         // ------------------------------------------------------------
         // custom validation code that covers more than one field in isolation
         // ------------------------------------------------------------
 
-        if conf.http_auth_type == AuthType::NeonJWT || conf.pg_auth_type == AuthType::NeonJWT {
+        if [conf.http_auth_type, conf.pg_auth_type, conf.grpc_auth_type]
+            .contains(&AuthType::NeonJWT)
+        {
             let auth_validation_public_key_path = conf
                 .auth_validation_public_key_path
                 .get_or_insert_with(|| workdir.join("auth_public_key.pem"));
@@ -483,6 +557,34 @@ impl PageServerConf {
                 auth_validation_public_key_path.exists(),
                 format!(
                     "Can't find auth_validation_public_key at '{auth_validation_public_key_path}'",
+                )
+            );
+        }
+
+        if let Some(tracing_config) = conf.tracing.as_ref() {
+            let ratio = &tracing_config.sampling_ratio;
+            ensure!(
+                ratio.denominator != 0 && ratio.denominator >= ratio.numerator,
+                format!(
+                    "Invalid sampling ratio: {}/{}",
+                    ratio.numerator, ratio.denominator
+                )
+            );
+
+            let url = Url::parse(&tracing_config.export_config.endpoint)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!(
+                        "tracing endpoint URL is invalid : {}",
+                        tracing_config.export_config.endpoint
+                    )
+                })?;
+
+            ensure!(
+                url.scheme() == "http" || url.scheme() == "https",
+                format!(
+                    "tracing endpoint URL must start with http:// or https://: {}",
+                    tracing_config.export_config.endpoint
                 )
             );
         }
@@ -495,6 +597,19 @@ impl PageServerConf {
                     conf.default_tenant_conf.checkpoint_distance
                 )
             })?;
+
+        if let PageServicePipeliningConfig::Pipelined(PageServicePipeliningConfigPipelined {
+            max_batch_size,
+            ..
+        }) = conf.page_service_pipelining
+        {
+            if max_batch_size.get() > conf.max_get_vectored_keys.get() {
+                return Err(anyhow::anyhow!(
+                    "`max_batch_size` ({max_batch_size}) must be less than or equal to `max_get_vectored_keys` ({})",
+                    conf.max_get_vectored_keys.get()
+                ));
+            }
+        };
 
         Ok(conf)
     }
@@ -519,6 +634,7 @@ impl PageServerConf {
             background_task_maximum_delay: Duration::ZERO,
             load_previous_heatmap: Some(true),
             generate_unarchival_heatmap: Some(true),
+            control_plane_api: Some(Url::parse("http://localhost:6666").unwrap()),
             ..Default::default()
         };
         PageServerConf::parse_and_validate(NodeId(0), config_toml, &repo_dir).unwrap()
@@ -526,7 +642,6 @@ impl PageServerConf {
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct PageserverIdentity {
     pub id: NodeId,
 }
@@ -546,10 +661,10 @@ impl ConfigurableSemaphore {
     /// Initializse using a non-zero amount of permits.
     ///
     /// Require a non-zero initial permits, because using permits == 0 is a crude way to disable a
-    /// feature such as [`Tenant::gather_size_inputs`]. Otherwise any semaphore using future will
+    /// feature such as [`TenantShard::gather_size_inputs`]. Otherwise any semaphore using future will
     /// behave like [`futures::future::pending`], just waiting until new permits are added.
     ///
-    /// [`Tenant::gather_size_inputs`]: crate::tenant::Tenant::gather_size_inputs
+    /// [`TenantShard::gather_size_inputs`]: crate::tenant::TenantShard::gather_size_inputs
     pub fn new(initial_permits: NonZeroUsize) -> Self {
         ConfigurableSemaphore {
             initial_permits,
@@ -583,14 +698,18 @@ impl ConfigurableSemaphore {
 mod tests {
 
     use camino::Utf8PathBuf;
+    use rstest::rstest;
     use utils::id::NodeId;
 
     use super::PageServerConf;
 
     #[test]
-    fn test_empty_config_toml_is_valid() {
-        // we use Default impl of everything in this situation
+    fn test_minimal_config_toml_is_valid() {
+        // The minimal valid config for running a pageserver:
+        // - control_plane_api is mandatory, as pageservers cannot run in isolation
+        // - we use Default impl of everything else in this situation
         let input = r#"
+            control_plane_api = "http://localhost:6666"
         "#;
         let config_toml = toml_edit::de::from_str::<pageserver_api::config::ConfigToml>(input)
             .expect("empty config is valid");
@@ -599,81 +718,48 @@ mod tests {
             .expect("parse_and_validate");
     }
 
-    /// If there's a typo in the pageserver config, we'd rather catch that typo
-    /// and fail pageserver startup than silently ignoring the typo, leaving whoever
-    /// made it in the believe that their config change is effective.
-    ///
-    /// The default in serde is to allow unknown fields, so, we rely
-    /// on developer+review discipline to add `deny_unknown_fields` when adding
-    /// new structs to the config, and these tests here as a regression test.
-    ///
-    /// The alternative to all of this would be to allow unknown fields in the config.
-    /// To catch them, we could have a config check tool or mgmt API endpoint that
-    /// compares the effective config with the TOML on disk and makes sure that
-    /// the on-disk TOML is a strict subset of the effective config.
-    mod unknown_fields_handling {
-        macro_rules! test {
-            ($short_name:ident, $input:expr) => {
-                #[test]
-                fn $short_name() {
-                    let input = $input;
-                    let err = toml_edit::de::from_str::<pageserver_api::config::ConfigToml>(&input)
-                        .expect_err("some_invalid_field is an invalid field");
-                    dbg!(&err);
-                    assert!(err.to_string().contains("some_invalid_field"));
-                }
-            };
-        }
-        use indoc::indoc;
+    #[test]
+    fn test_config_tracing_endpoint_is_invalid() {
+        let input = r#"
+            control_plane_api = "http://localhost:6666"
 
-        test!(
-            toplevel,
-            indoc! {r#"
-                some_invalid_field = 23
-            "#}
+            [tracing]
+
+            sampling_ratio = { numerator = 1, denominator = 0 }
+
+            [tracing.export_config]
+            endpoint = "localhost:4317"
+            protocol = "http-binary"
+            timeout = "1ms"
+        "#;
+        let config_toml = toml_edit::de::from_str::<pageserver_api::config::ConfigToml>(input)
+            .expect("config has valid fields");
+        let workdir = Utf8PathBuf::from("/nonexistent");
+        PageServerConf::parse_and_validate(NodeId(0), config_toml, &workdir)
+            .expect_err("parse_and_validate should fail for endpoint without scheme");
+    }
+
+    #[rstest]
+    #[case(32, 32, true)]
+    #[case(64, 32, false)]
+    #[case(64, 64, true)]
+    #[case(128, 128, true)]
+    fn test_config_max_batch_size_is_valid(
+        #[case] max_batch_size: usize,
+        #[case] max_get_vectored_keys: usize,
+        #[case] is_valid: bool,
+    ) {
+        let input = format!(
+            r#"
+            control_plane_api = "http://localhost:6666"
+            max_get_vectored_keys = {max_get_vectored_keys}
+            page_service_pipelining = {{ mode="pipelined", execution="concurrent-futures", max_batch_size={max_batch_size}, batching="uniform-lsn" }}
+        "#,
         );
-
-        test!(
-            toplevel_nested,
-            indoc! {r#"
-                [some_invalid_field]
-                foo = 23
-            "#}
-        );
-
-        test!(
-            disk_usage_based_eviction,
-            indoc! {r#"
-                [disk_usage_based_eviction]
-                some_invalid_field = 23
-            "#}
-        );
-
-        test!(
-            tenant_config,
-            indoc! {r#"
-                [tenant_config]
-                some_invalid_field = 23
-            "#}
-        );
-
-        test!(
-            l0_flush,
-            indoc! {r#"
-                [l0_flush]
-                mode = "direct"
-                some_invalid_field = 23
-            "#}
-        );
-
-        // TODO: fix this => https://github.com/neondatabase/neon/issues/8915
-        // test!(
-        //     remote_storage_config,
-        //     indoc! {r#"
-        //         [remote_storage_config]
-        //         local_path = "/nonexistent"
-        //         some_invalid_field = 23
-        //     "#}
-        // );
+        let config_toml = toml_edit::de::from_str::<pageserver_api::config::ConfigToml>(&input)
+            .expect("config has valid fields");
+        let workdir = Utf8PathBuf::from("/nonexistent");
+        let result = PageServerConf::parse_and_validate(NodeId(0), config_toml, &workdir);
+        assert_eq!(result.is_ok(), is_valid);
     }
 }

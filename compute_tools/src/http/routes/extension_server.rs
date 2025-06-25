@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use serde::Deserialize;
 
-use crate::compute::ComputeNode;
+use crate::compute::{BUILD_TAG, ComputeNode};
 use crate::http::JsonResponse;
 use crate::http::extract::{Path, Query};
 
@@ -22,7 +22,7 @@ pub(in crate::http) async fn download_extension(
     State(compute): State<Arc<ComputeNode>>,
 ) -> Response {
     // Don't even try to download extensions if no remote storage is configured
-    if compute.params.ext_remote_storage.is_none() {
+    if compute.params.remote_ext_base_url.is_none() {
         return JsonResponse::error(
             StatusCode::PRECONDITION_FAILED,
             "remote storage is not configured",
@@ -47,7 +47,7 @@ pub(in crate::http) async fn download_extension(
         remote_extensions.get_ext(
             &filename,
             ext_server_params.is_library,
-            &compute.params.build_tag,
+            &BUILD_TAG,
             &compute.params.pgversion,
         )
     };

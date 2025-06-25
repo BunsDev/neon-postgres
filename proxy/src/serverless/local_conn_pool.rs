@@ -16,6 +16,8 @@ use std::sync::atomic::AtomicUsize;
 use std::task::{Poll, ready};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use futures::Future;
 use futures::future::poll_fn;
@@ -41,7 +43,7 @@ use crate::control_plane::messages::{ColdStartInfo, MetricsAuxInfo};
 use crate::metrics::Metrics;
 
 pub(crate) const EXT_NAME: &str = "pg_session_jwt";
-pub(crate) const EXT_VERSION: &str = "0.2.0";
+pub(crate) const EXT_VERSION: &str = "0.3.1";
 pub(crate) const EXT_SCHEMA: &str = "auth";
 
 #[derive(Clone)]
@@ -346,7 +348,7 @@ fn sign_jwt(sk: &SigningKey, payload: &[u8]) -> String {
     jwt.push_str("eyJhbGciOiJFZERTQSJ9.");
 
     // encode the jwt payload in-place
-    base64::encode_config_buf(payload, base64::URL_SAFE_NO_PAD, &mut jwt);
+    BASE64_URL_SAFE_NO_PAD.encode_string(payload, &mut jwt);
 
     // create the signature from the encoded header || payload
     let sig: Signature = sk.sign(jwt.as_bytes());
@@ -354,7 +356,7 @@ fn sign_jwt(sk: &SigningKey, payload: &[u8]) -> String {
     jwt.push('.');
 
     // encode the jwt signature in-place
-    base64::encode_config_buf(sig.to_bytes(), base64::URL_SAFE_NO_PAD, &mut jwt);
+    BASE64_URL_SAFE_NO_PAD.encode_string(sig.to_bytes(), &mut jwt);
 
     debug_assert_eq!(
         jwt.len(),
@@ -367,7 +369,6 @@ fn sign_jwt(sk: &SigningKey, payload: &[u8]) -> String {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used)]
 mod tests {
     use ed25519_dalek::SigningKey;
     use typed_json::json;

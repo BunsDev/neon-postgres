@@ -8,7 +8,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
@@ -16,20 +15,24 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use compute_api::requests::ComputeClaimsScope;
 use compute_api::spec::ComputeMode;
-use control_plane::endpoint::ComputeControlPlane;
+use control_plane::broker::StorageBroker;
+use control_plane::endpoint::{ComputeControlPlane, EndpointTerminateMode, PageserverProtocol};
+use control_plane::endpoint_storage::{ENDPOINT_STORAGE_DEFAULT_ADDR, EndpointStorage};
+use control_plane::local_env;
 use control_plane::local_env::{
-    InitForceMode, LocalEnv, NeonBroker, NeonLocalInitConf, NeonLocalInitPageserverConf,
-    SafekeeperConf,
+    EndpointStorageConf, InitForceMode, LocalEnv, NeonBroker, NeonLocalInitConf,
+    NeonLocalInitPageserverConf, SafekeeperConf,
 };
 use control_plane::pageserver::PageServerNode;
 use control_plane::safekeeper::SafekeeperNode;
 use control_plane::storage_controller::{
     NeonStorageControllerStartArgs, NeonStorageControllerStopArgs, StorageController,
 };
-use control_plane::{broker, local_env};
-use nix::fcntl::{FlockArg, flock};
+use nix::fcntl::{Flock, FlockArg};
 use pageserver_api::config::{
+    DEFAULT_GRPC_LISTEN_PORT as DEFAULT_PAGESERVER_GRPC_PORT,
     DEFAULT_HTTP_LISTEN_PORT as DEFAULT_PAGESERVER_HTTP_PORT,
     DEFAULT_PG_LISTEN_PORT as DEFAULT_PAGESERVER_PG_PORT,
 };
@@ -39,13 +42,13 @@ use pageserver_api::controller_api::{
 use pageserver_api::models::{
     ShardParameters, TenantConfigRequest, TimelineCreateRequest, TimelineInfo,
 };
-use pageserver_api::shard::{ShardCount, ShardStripeSize, TenantShardId};
+use pageserver_api::shard::{DEFAULT_STRIPE_SIZE, ShardCount, ShardStripeSize, TenantShardId};
 use postgres_backend::AuthType;
 use postgres_connection::parse_host_port;
-use safekeeper_api::membership::SafekeeperGeneration;
+use safekeeper_api::membership::{SafekeeperGeneration, SafekeeperId};
 use safekeeper_api::{
     DEFAULT_HTTP_LISTEN_PORT as DEFAULT_SAFEKEEPER_HTTP_PORT,
-    DEFAULT_PG_LISTEN_PORT as DEFAULT_SAFEKEEPER_PG_PORT,
+    DEFAULT_PG_LISTEN_PORT as DEFAULT_SAFEKEEPER_PG_PORT, PgMajorVersion, PgVersionId,
 };
 use storage_broker::DEFAULT_LISTEN_ADDR as DEFAULT_BROKER_ADDR;
 use tokio::task::JoinSet;
@@ -61,7 +64,7 @@ const DEFAULT_PAGESERVER_ID: NodeId = NodeId(1);
 const DEFAULT_BRANCH_NAME: &str = "main";
 project_git_version!(GIT_VERSION);
 
-const DEFAULT_PG_VERSION: u32 = 16;
+const DEFAULT_PG_VERSION: PgMajorVersion = PgMajorVersion::PG17;
 
 const DEFAULT_PAGESERVER_CONTROL_PLANE_API: &str = "http://127.0.0.1:1234/upcall/v1/";
 
@@ -90,6 +93,8 @@ enum NeonLocalCmd {
     StorageBroker(StorageBrokerCmd),
     #[command(subcommand)]
     Safekeeper(SafekeeperCmd),
+    #[command(subcommand)]
+    EndpointStorage(EndpointStorageCmd),
     #[command(subcommand)]
     Endpoint(EndpointCmd),
     #[command(subcommand)]
@@ -164,7 +169,7 @@ struct TenantCreateCmdArgs {
 
     #[arg(default_value_t = DEFAULT_PG_VERSION)]
     #[clap(long, help = "Postgres version to use for the initial timeline")]
-    pg_version: u32,
+    pg_version: PgMajorVersion,
 
     #[clap(
         long,
@@ -287,7 +292,7 @@ struct TimelineCreateCmdArgs {
 
     #[arg(default_value_t = DEFAULT_PG_VERSION)]
     #[clap(long, help = "Postgres version")]
-    pg_version: u32,
+    pg_version: PgMajorVersion,
 }
 
 #[derive(clap::Args)]
@@ -319,7 +324,7 @@ struct TimelineImportCmdArgs {
 
     #[arg(default_value_t = DEFAULT_PG_VERSION)]
     #[clap(long, help = "Postgres version of the backup being imported")]
-    pg_version: u32,
+    pg_version: PgMajorVersion,
 }
 
 #[derive(clap::Subcommand)]
@@ -454,6 +459,32 @@ enum SafekeeperCmd {
     Restart(SafekeeperRestartCmdArgs),
 }
 
+#[derive(clap::Subcommand)]
+#[clap(about = "Manage object storage")]
+enum EndpointStorageCmd {
+    Start(EndpointStorageStartCmd),
+    Stop(EndpointStorageStopCmd),
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Start object storage")]
+struct EndpointStorageStartCmd {
+    #[clap(short = 't', long, help = "timeout until we fail the command")]
+    #[arg(default_value = "10s")]
+    start_timeout: humantime::Duration,
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Stop object storage")]
+struct EndpointStorageStopCmd {
+    #[arg(value_enum, default_value = "fast")]
+    #[clap(
+        short = 'm',
+        help = "If 'immediate', don't flush repository data at shutdown"
+    )]
+    stop_mode: StopMode,
+}
+
 #[derive(clap::Args)]
 #[clap(about = "Start local safekeeper")]
 struct SafekeeperStartCmdArgs {
@@ -522,6 +553,7 @@ enum EndpointCmd {
     Start(EndpointStartCmdArgs),
     Reconfigure(EndpointReconfigureCmdArgs),
     Stop(EndpointStopCmdArgs),
+    GenerateJwt(EndpointGenerateJwtCmdArgs),
 }
 
 #[derive(clap::Args)]
@@ -571,7 +603,15 @@ struct EndpointCreateCmdArgs {
 
     #[arg(default_value_t = DEFAULT_PG_VERSION)]
     #[clap(long, help = "Postgres version")]
-    pg_version: u32,
+    pg_version: PgMajorVersion,
+
+    /// Use gRPC to communicate with Pageservers, by generating grpc:// connstrings.
+    ///
+    /// Specified on creation such that it's retained across reconfiguration and restarts.
+    ///
+    /// NB: not yet supported by computes.
+    #[clap(long)]
+    grpc: bool,
 
     #[clap(
         long,
@@ -612,9 +652,10 @@ struct EndpointStartCmdArgs {
 
     #[clap(
         long,
-        help = "Configure the remote extensions storage proxy gateway to request for extensions."
+        help = "Configure the remote extensions storage proxy gateway URL to request for extensions.",
+        alias = "remote-ext-config"
     )]
-    remote_ext_config: Option<String>,
+    remote_ext_base_url: Option<String>,
 
     #[clap(
         long,
@@ -631,6 +672,13 @@ struct EndpointStartCmdArgs {
     #[clap(short = 't', long, value_parser= humantime::parse_duration, help = "timeout until we fail the command")]
     #[arg(default_value = "90s")]
     start_timeout: Duration,
+
+    #[clap(
+        long,
+        help = "Run in development mode, skipping VM-specific operations like process termination",
+        action = clap::ArgAction::SetTrue
+    )]
+    dev: bool,
 }
 
 #[derive(clap::Args)]
@@ -663,10 +711,19 @@ struct EndpointStopCmdArgs {
     )]
     destroy: bool,
 
-    #[clap(long, help = "Postgres shutdown mode, passed to \"pg_ctl -m <mode>\"")]
-    #[arg(value_parser(["smart", "fast", "immediate"]))]
-    #[arg(default_value = "fast")]
-    mode: String,
+    #[clap(long, help = "Postgres shutdown mode")]
+    #[clap(default_value = "fast")]
+    mode: EndpointTerminateMode,
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Generate a JWT for an endpoint")]
+struct EndpointGenerateJwtCmdArgs {
+    #[clap(help = "Postgres endpoint id")]
+    endpoint_id: String,
+
+    #[clap(short = 's', long, help = "Scope to generate the JWT with", value_parser = ComputeClaimsScope::from_str)]
+    scope: Option<ComputeClaimsScope>,
 }
 
 #[derive(clap::Subcommand)]
@@ -706,16 +763,16 @@ struct TimelineTreeEl {
 
 /// A flock-based guard over the neon_local repository directory
 struct RepoLock {
-    _file: File,
+    _file: Flock<File>,
 }
 
 impl RepoLock {
     fn new() -> Result<Self> {
         let repo_dir = File::open(local_env::base_path())?;
-        let repo_dir_fd = repo_dir.as_raw_fd();
-        flock(repo_dir_fd, FlockArg::LockExclusive)?;
-
-        Ok(Self { _file: repo_dir })
+        match Flock::lock(repo_dir, FlockArg::LockExclusive) {
+            Ok(f) => Ok(Self { _file: f }),
+            Err((_, e)) => Err(e).context("flock error"),
+        }
     }
 }
 
@@ -759,6 +816,9 @@ fn main() -> Result<()> {
             }
             NeonLocalCmd::StorageBroker(subcmd) => rt.block_on(handle_storage_broker(&subcmd, env)),
             NeonLocalCmd::Safekeeper(subcmd) => rt.block_on(handle_safekeeper(&subcmd, env)),
+            NeonLocalCmd::EndpointStorage(subcmd) => {
+                rt.block_on(handle_endpoint_storage(&subcmd, env))
+            }
             NeonLocalCmd::Endpoint(subcmd) => rt.block_on(handle_endpoint(&subcmd, env)),
             NeonLocalCmd::Mappings(subcmd) => handle_mappings(&subcmd, env),
         };
@@ -859,7 +919,7 @@ fn print_timeline(
             br_sym = "┗━";
         }
 
-        print!("{} @{}: ", br_sym, ancestor_lsn);
+        print!("{br_sym} @{ancestor_lsn}: ");
     }
 
     // Finally print a timeline id and name with new line
@@ -948,7 +1008,8 @@ fn handle_init(args: &InitCmdArgs) -> anyhow::Result<LocalEnv> {
         NeonLocalInitConf {
             control_plane_api: Some(DEFAULT_PAGESERVER_CONTROL_PLANE_API.parse().unwrap()),
             broker: NeonBroker {
-                listen_addr: DEFAULT_BROKER_ADDR.parse().unwrap(),
+                listen_addr: Some(DEFAULT_BROKER_ADDR.parse().unwrap()),
+                listen_https_addr: None,
             },
             safekeepers: vec![SafekeeperConf {
                 id: DEFAULT_SAFEKEEPER_ID,
@@ -961,13 +1022,16 @@ fn handle_init(args: &InitCmdArgs) -> anyhow::Result<LocalEnv> {
                     let pageserver_id = NodeId(DEFAULT_PAGESERVER_ID.0 + i as u64);
                     let pg_port = DEFAULT_PAGESERVER_PG_PORT + i;
                     let http_port = DEFAULT_PAGESERVER_HTTP_PORT + i;
+                    let grpc_port = DEFAULT_PAGESERVER_GRPC_PORT + i;
                     NeonLocalInitPageserverConf {
                         id: pageserver_id,
                         listen_pg_addr: format!("127.0.0.1:{pg_port}"),
                         listen_http_addr: format!("127.0.0.1:{http_port}"),
                         listen_https_addr: None,
+                        listen_grpc_addr: Some(format!("127.0.0.1:{grpc_port}")),
                         pg_auth_type: AuthType::Trust,
                         http_auth_type: AuthType::Trust,
+                        grpc_auth_type: AuthType::Trust,
                         other: Default::default(),
                         // Typical developer machines use disks with slow fsync, and we don't care
                         // about data integrity: disable disk syncs.
@@ -975,6 +1039,9 @@ fn handle_init(args: &InitCmdArgs) -> anyhow::Result<LocalEnv> {
                     }
                 })
                 .collect(),
+            endpoint_storage: EndpointStorageConf {
+                listen_addr: ENDPOINT_STORAGE_DEFAULT_ADDR,
+            },
             pg_distrib_dir: None,
             neon_distrib_dir: None,
             default_tenant_id: TenantId::from_array(std::array::from_fn(|_| 0)),
@@ -1083,7 +1150,7 @@ async fn handle_tenant(subcmd: &TenantCmd, env: &mut local_env::LocalEnv) -> any
                         stripe_size: args
                             .shard_stripe_size
                             .map(ShardStripeSize)
-                            .unwrap_or(ShardParameters::DEFAULT_STRIPE_SIZE),
+                            .unwrap_or(DEFAULT_STRIPE_SIZE),
                     },
                     placement_policy: args.placement_policy.clone(),
                     config: tenant_conf,
@@ -1202,6 +1269,45 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
             pageserver
                 .timeline_import(tenant_id, timeline_id, base, pg_wal, args.pg_version)
                 .await?;
+            if env.storage_controller.timelines_onto_safekeepers {
+                println!("Creating timeline on safekeeper ...");
+                let timeline_info = pageserver
+                    .timeline_info(
+                        TenantShardId::unsharded(tenant_id),
+                        timeline_id,
+                        pageserver_client::mgmt_api::ForceAwaitLogicalSize::No,
+                    )
+                    .await?;
+                let default_sk = SafekeeperNode::from_env(env, env.safekeepers.first().unwrap());
+                let default_host = default_sk
+                    .conf
+                    .listen_addr
+                    .clone()
+                    .unwrap_or_else(|| "localhost".to_string());
+                let mconf = safekeeper_api::membership::Configuration {
+                    generation: SafekeeperGeneration::new(1),
+                    members: safekeeper_api::membership::MemberSet {
+                        m: vec![SafekeeperId {
+                            host: default_host,
+                            id: default_sk.conf.id,
+                            pg_port: default_sk.conf.pg_port,
+                        }],
+                    },
+                    new_members: None,
+                };
+                let pg_version = PgVersionId::from(args.pg_version);
+                let req = safekeeper_api::models::TimelineCreateRequest {
+                    tenant_id,
+                    timeline_id,
+                    mconf,
+                    pg_version,
+                    system_id: None,
+                    wal_seg_size: None,
+                    start_lsn: timeline_info.last_record_lsn,
+                    commit_lsn: None,
+                };
+                default_sk.create_timeline(&req).await?;
+            }
             env.register_branch_mapping(branch_name.to_string(), tenant_id, timeline_id)?;
             println!("Done");
         }
@@ -1226,6 +1332,7 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                 mode: pageserver_api::models::TimelineCreateRequestMode::Branch {
                     ancestor_timeline_id,
                     ancestor_start_lsn: start_lsn,
+                    read_only: false,
                     pg_version: None,
                 },
             };
@@ -1358,6 +1465,7 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 args.internal_http_port,
                 args.pg_version,
                 mode,
+                args.grpc,
                 !args.update_catalog,
                 false,
             )?;
@@ -1365,9 +1473,16 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
         EndpointCmd::Start(args) => {
             let endpoint_id = &args.endpoint_id;
             let pageserver_id = args.endpoint_pageserver_id;
-            let remote_ext_config = &args.remote_ext_config;
+            let remote_ext_base_url = &args.remote_ext_base_url;
 
-            let safekeepers_generation = args.safekeepers_generation.map(SafekeeperGeneration::new);
+            let default_generation = env
+                .storage_controller
+                .timelines_onto_safekeepers
+                .then_some(1);
+            let safekeepers_generation = args
+                .safekeepers_generation
+                .or(default_generation)
+                .map(SafekeeperGeneration::new);
             // If --safekeepers argument is given, use only the listed
             // safekeeper nodes; otherwise all from the env.
             let safekeepers = if let Some(safekeepers) = parse_safekeepers(&args.safekeepers)? {
@@ -1391,13 +1506,20 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
 
             let (pageservers, stripe_size) = if let Some(pageserver_id) = pageserver_id {
                 let conf = env.get_pageserver_conf(pageserver_id).unwrap();
-                let parsed = parse_host_port(&conf.listen_pg_addr).expect("Bad config");
-                (
-                    vec![(parsed.0, parsed.1.unwrap_or(5432))],
-                    // If caller is telling us what pageserver to use, this is not a tenant which is
-                    // full managed by storage controller, therefore not sharded.
-                    ShardParameters::DEFAULT_STRIPE_SIZE,
-                )
+                // Use gRPC if requested.
+                let pageserver = if endpoint.grpc {
+                    let grpc_addr = conf.listen_grpc_addr.as_ref().expect("bad config");
+                    let (host, port) = parse_host_port(grpc_addr)?;
+                    let port = port.unwrap_or(DEFAULT_PAGESERVER_GRPC_PORT);
+                    (PageserverProtocol::Grpc, host, port)
+                } else {
+                    let (host, port) = parse_host_port(&conf.listen_pg_addr)?;
+                    let port = port.unwrap_or(5432);
+                    (PageserverProtocol::Libpq, host, port)
+                };
+                // If caller is telling us what pageserver to use, this is not a tenant which is
+                // fully managed by storage controller, therefore not sharded.
+                (vec![pageserver], DEFAULT_STRIPE_SIZE)
             } else {
                 // Look up the currently attached location of the tenant, and its striping metadata,
                 // to pass these on to postgres.
@@ -1416,11 +1538,20 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                                 .await?;
                         }
 
-                        anyhow::Ok((
-                            Host::parse(&shard.listen_pg_addr)
-                                .expect("Storage controller reported bad hostname"),
-                            shard.listen_pg_port,
-                        ))
+                        let pageserver = if endpoint.grpc {
+                            (
+                                PageserverProtocol::Grpc,
+                                Host::parse(&shard.listen_grpc_addr.expect("no gRPC address"))?,
+                                shard.listen_grpc_port.expect("no gRPC port"),
+                            )
+                        } else {
+                            (
+                                PageserverProtocol::Libpq,
+                                Host::parse(&shard.listen_pg_addr)?,
+                                shard.listen_pg_port,
+                            )
+                        };
+                        anyhow::Ok(pageserver)
                     }),
                 )
                 .await?;
@@ -1439,17 +1570,33 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 None
             };
 
+            let exp = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?
+                + Duration::from_secs(86400))
+            .as_secs();
+            let claims = endpoint_storage::claims::EndpointStorageClaims {
+                tenant_id: endpoint.tenant_id,
+                timeline_id: endpoint.timeline_id,
+                endpoint_id: endpoint_id.to_string(),
+                exp,
+            };
+
+            let endpoint_storage_token = env.generate_auth_token(&claims)?;
+            let endpoint_storage_addr = env.endpoint_storage.listen_addr.to_string();
+
             println!("Starting existing endpoint {endpoint_id}...");
             endpoint
                 .start(
                     &auth_token,
+                    endpoint_storage_token,
+                    endpoint_storage_addr,
                     safekeepers_generation,
                     safekeepers,
                     pageservers,
-                    remote_ext_config.as_ref(),
+                    remote_ext_base_url.as_ref(),
                     stripe_size.0 as usize,
                     args.create_test_user,
                     args.start_timeout,
+                    args.dev,
                 )
                 .await?;
         }
@@ -1460,11 +1607,19 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 .get(endpoint_id.as_str())
                 .with_context(|| format!("postgres endpoint {endpoint_id} is not found"))?;
             let pageservers = if let Some(ps_id) = args.endpoint_pageserver_id {
-                let pageserver = PageServerNode::from_env(env, env.get_pageserver_conf(ps_id)?);
-                vec![(
-                    pageserver.pg_connection_config.host().clone(),
-                    pageserver.pg_connection_config.port(),
-                )]
+                let conf = env.get_pageserver_conf(ps_id)?;
+                // Use gRPC if requested.
+                let pageserver = if endpoint.grpc {
+                    let grpc_addr = conf.listen_grpc_addr.as_ref().expect("bad config");
+                    let (host, port) = parse_host_port(grpc_addr)?;
+                    let port = port.unwrap_or(DEFAULT_PAGESERVER_GRPC_PORT);
+                    (PageserverProtocol::Grpc, host, port)
+                } else {
+                    let (host, port) = parse_host_port(&conf.listen_pg_addr)?;
+                    let port = port.unwrap_or(5432);
+                    (PageserverProtocol::Libpq, host, port)
+                };
+                vec![pageserver]
             } else {
                 let storage_controller = StorageController::from_env(env);
                 storage_controller
@@ -1473,11 +1628,21 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                     .shards
                     .into_iter()
                     .map(|shard| {
-                        (
-                            Host::parse(&shard.listen_pg_addr)
-                                .expect("Storage controller reported malformed host"),
-                            shard.listen_pg_port,
-                        )
+                        // Use gRPC if requested.
+                        if endpoint.grpc {
+                            (
+                                PageserverProtocol::Grpc,
+                                Host::parse(&shard.listen_grpc_addr.expect("no gRPC address"))
+                                    .expect("bad hostname"),
+                                shard.listen_grpc_port.expect("no gRPC port"),
+                            )
+                        } else {
+                            (
+                                PageserverProtocol::Libpq,
+                                Host::parse(&shard.listen_pg_addr).expect("bad hostname"),
+                                shard.listen_pg_port,
+                            )
+                        }
                     })
                     .collect::<Vec<_>>()
             };
@@ -1492,7 +1657,24 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 .endpoints
                 .get(endpoint_id)
                 .with_context(|| format!("postgres endpoint {endpoint_id} is not found"))?;
-            endpoint.stop(&args.mode, args.destroy)?;
+            match endpoint.stop(args.mode, args.destroy).await?.lsn {
+                Some(lsn) => println!("{lsn}"),
+                None => println!("null"),
+            }
+        }
+        EndpointCmd::GenerateJwt(args) => {
+            let endpoint = {
+                let endpoint_id = &args.endpoint_id;
+
+                cplane
+                    .endpoints
+                    .get(endpoint_id)
+                    .with_context(|| format!("postgres endpoint {endpoint_id} is not found"))?
+            };
+
+            let jwt = endpoint.generate_jwt(args.scope)?;
+
+            print!("{jwt}");
         }
     }
 
@@ -1560,7 +1742,7 @@ async fn handle_pageserver(subcmd: &PageserverCmd, env: &local_env::LocalEnv) ->
                 StopMode::Immediate => true,
             };
             if let Err(e) = get_pageserver(env, args.pageserver_id)?.stop(immediate) {
-                eprintln!("pageserver stop failed: {}", e);
+                eprintln!("pageserver stop failed: {e}");
                 exit(1);
             }
         }
@@ -1569,7 +1751,7 @@ async fn handle_pageserver(subcmd: &PageserverCmd, env: &local_env::LocalEnv) ->
             let pageserver = get_pageserver(env, args.pageserver_id)?;
             //TODO what shutdown strategy should we use here?
             if let Err(e) = pageserver.stop(false) {
-                eprintln!("pageserver stop failed: {}", e);
+                eprintln!("pageserver stop failed: {e}");
                 exit(1);
             }
 
@@ -1586,7 +1768,7 @@ async fn handle_pageserver(subcmd: &PageserverCmd, env: &local_env::LocalEnv) ->
             {
                 Ok(_) => println!("Page server is up and running"),
                 Err(err) => {
-                    eprintln!("Page server is not available: {}", err);
+                    eprintln!("Page server is not available: {err}");
                     exit(1);
                 }
             }
@@ -1623,7 +1805,7 @@ async fn handle_storage_controller(
                 },
             };
             if let Err(e) = svc.stop(stop_args).await {
-                eprintln!("stop failed: {}", e);
+                eprintln!("stop failed: {e}");
                 exit(1);
             }
         }
@@ -1645,7 +1827,7 @@ async fn handle_safekeeper(subcmd: &SafekeeperCmd, env: &local_env::LocalEnv) ->
             let safekeeper = get_safekeeper(env, args.id)?;
 
             if let Err(e) = safekeeper.start(&args.extra_opt, &args.start_timeout).await {
-                eprintln!("safekeeper start failed: {}", e);
+                eprintln!("safekeeper start failed: {e}");
                 exit(1);
             }
         }
@@ -1657,7 +1839,7 @@ async fn handle_safekeeper(subcmd: &SafekeeperCmd, env: &local_env::LocalEnv) ->
                 StopMode::Immediate => true,
             };
             if let Err(e) = safekeeper.stop(immediate) {
-                eprintln!("safekeeper stop failed: {}", e);
+                eprintln!("safekeeper stop failed: {e}");
                 exit(1);
             }
         }
@@ -1670,12 +1852,12 @@ async fn handle_safekeeper(subcmd: &SafekeeperCmd, env: &local_env::LocalEnv) ->
             };
 
             if let Err(e) = safekeeper.stop(immediate) {
-                eprintln!("safekeeper stop failed: {}", e);
+                eprintln!("safekeeper stop failed: {e}");
                 exit(1);
             }
 
             if let Err(e) = safekeeper.start(&args.extra_opt, &args.start_timeout).await {
-                eprintln!("safekeeper start failed: {}", e);
+                eprintln!("safekeeper start failed: {e}");
                 exit(1);
             }
         }
@@ -1683,10 +1865,49 @@ async fn handle_safekeeper(subcmd: &SafekeeperCmd, env: &local_env::LocalEnv) ->
     Ok(())
 }
 
+async fn handle_endpoint_storage(
+    subcmd: &EndpointStorageCmd,
+    env: &local_env::LocalEnv,
+) -> Result<()> {
+    use EndpointStorageCmd::*;
+    let storage = EndpointStorage::from_env(env);
+
+    // In tests like test_forward_compatibility or test_graceful_cluster_restart
+    // old neon binaries (without endpoint_storage) are present
+    if !storage.bin.exists() {
+        eprintln!(
+            "{} binary not found. Ignore if this is a compatibility test",
+            storage.bin
+        );
+        return Ok(());
+    }
+
+    match subcmd {
+        Start(EndpointStorageStartCmd { start_timeout }) => {
+            if let Err(e) = storage.start(start_timeout).await {
+                eprintln!("endpoint_storage start failed: {e}");
+                exit(1);
+            }
+        }
+        Stop(EndpointStorageStopCmd { stop_mode }) => {
+            let immediate = match stop_mode {
+                StopMode::Fast => false,
+                StopMode::Immediate => true,
+            };
+            if let Err(e) = storage.stop(immediate) {
+                eprintln!("proxy stop failed: {e}");
+                exit(1);
+            }
+        }
+    };
+    Ok(())
+}
+
 async fn handle_storage_broker(subcmd: &StorageBrokerCmd, env: &local_env::LocalEnv) -> Result<()> {
     match subcmd {
         StorageBrokerCmd::Start(args) => {
-            if let Err(e) = broker::start_broker_process(env, &args.start_timeout).await {
+            let storage_broker = StorageBroker::from_env(env);
+            if let Err(e) = storage_broker.start(&args.start_timeout).await {
                 eprintln!("broker start failed: {e}");
                 exit(1);
             }
@@ -1694,7 +1915,8 @@ async fn handle_storage_broker(subcmd: &StorageBrokerCmd, env: &local_env::Local
 
         StorageBrokerCmd::Stop(_args) => {
             // FIXME: stop_mode unused
-            if let Err(e) = broker::stop_broker_process(env) {
+            let storage_broker = StorageBroker::from_env(env);
+            if let Err(e) = storage_broker.stop() {
                 eprintln!("broker stop failed: {e}");
                 exit(1);
             }
@@ -1744,8 +1966,11 @@ async fn handle_start_all_impl(
     #[allow(clippy::redundant_closure_call)]
     (|| {
         js.spawn(async move {
-            let retry_timeout = retry_timeout;
-            broker::start_broker_process(env, &retry_timeout).await
+            let storage_broker = StorageBroker::from_env(env);
+            storage_broker
+                .start(&retry_timeout)
+                .await
+                .map_err(|e| e.context("start storage_broker"))
         });
 
         js.spawn(async move {
@@ -1777,6 +2002,13 @@ async fn handle_start_all_impl(
                     .map_err(|e| e.context(format!("start safekeeper {}", safekeeper.id)))
             });
         }
+
+        js.spawn(async move {
+            EndpointStorage::from_env(env)
+                .start(&retry_timeout)
+                .await
+                .map_err(|e| e.context("start endpoint_storage"))
+        });
     })();
 
     let mut errors = Vec::new();
@@ -1860,11 +2092,16 @@ async fn handle_stop_all(args: &StopCmdArgs, env: &local_env::LocalEnv) -> Resul
 }
 
 async fn try_stop_all(env: &local_env::LocalEnv, immediate: bool) {
+    let mode = if immediate {
+        EndpointTerminateMode::Immediate
+    } else {
+        EndpointTerminateMode::Fast
+    };
     // Stop all endpoints
     match ComputeControlPlane::load(env.clone()) {
         Ok(cplane) => {
             for (_k, node) in cplane.endpoints {
-                if let Err(e) = node.stop(if immediate { "immediate" } else { "fast" }, false) {
+                if let Err(e) = node.stop(mode, false).await {
                     eprintln!("postgres stop failed: {e:#}");
                 }
             }
@@ -1872,6 +2109,11 @@ async fn try_stop_all(env: &local_env::LocalEnv, immediate: bool) {
         Err(e) => {
             eprintln!("postgres stop failed, could not restore control plane data from env: {e:#}")
         }
+    }
+
+    let storage = EndpointStorage::from_env(env);
+    if let Err(e) = storage.stop(immediate) {
+        eprintln!("endpoint_storage stop failed: {e:#}");
     }
 
     for ps_conf in &env.pageservers {
@@ -1888,7 +2130,8 @@ async fn try_stop_all(env: &local_env::LocalEnv, immediate: bool) {
         }
     }
 
-    if let Err(e) = broker::stop_broker_process(env) {
+    let storage_broker = StorageBroker::from_env(env);
+    if let Err(e) = storage_broker.stop() {
         eprintln!("neon broker stop failed: {e:#}");
     }
 

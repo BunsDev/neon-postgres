@@ -1,22 +1,176 @@
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use itertools::Itertools;
+use pageserver_api::keyspace::KeySpace;
 use pageserver_api::shard::TenantShardId;
+use tokio_util::sync::CancellationToken;
 use tracing::trace;
 use utils::id::TimelineId;
 use utils::lsn::{AtomicLsn, Lsn};
 
-use super::{ReadableLayer, TimelineWriterState};
+use super::{LayerFringe, ReadableLayer, TimelineWriterState};
 use crate::config::PageServerConf;
 use crate::context::RequestContext;
 use crate::metrics::TimelineMetrics;
-use crate::tenant::layer_map::{BatchedUpdates, LayerMap};
+use crate::tenant::layer_map::{BatchedUpdates, LayerMap, SearchResult};
 use crate::tenant::storage_layer::{
     AsLayerDesc, InMemoryLayer, Layer, LayerVisibilityHint, PersistentLayerDesc,
     PersistentLayerKey, ReadableLayerWeak, ResidentLayer,
 };
+
+/// Warn if the lock was held for longer than this threshold.
+/// It's very generous and we should bring this value down over time.
+const LAYER_MANAGER_LOCK_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+const LAYER_MANAGER_LOCK_READ_WARN_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// Describes the operation that is holding the layer manager lock
+#[derive(Debug, Clone, Copy, strum_macros::Display)]
+#[strum(serialize_all = "kebab_case")]
+pub(crate) enum LayerManagerLockHolder {
+    GetLayerMapInfo,
+    GenerateHeatmap,
+    GetPage,
+    Init,
+    LoadLayerMap,
+    GetLayerForWrite,
+    TryFreezeLayer,
+    FlushFrozenLayer,
+    FlushLoop,
+    Compaction,
+    GarbageCollection,
+    Shutdown,
+    ImportPgData,
+    DetachAncestor,
+    Eviction,
+    #[cfg(test)]
+    Testing,
+}
+
+/// Wrapper for the layer manager that tracks the amount of time during which
+/// it was held under read or write lock
+#[derive(Default)]
+pub(crate) struct LockedLayerManager {
+    locked: tokio::sync::RwLock<LayerManager>,
+}
+
+pub(crate) struct LayerManagerReadGuard<'a> {
+    guard: ManuallyDrop<tokio::sync::RwLockReadGuard<'a, LayerManager>>,
+    acquired_at: std::time::Instant,
+    holder: LayerManagerLockHolder,
+}
+
+pub(crate) struct LayerManagerWriteGuard<'a> {
+    guard: ManuallyDrop<tokio::sync::RwLockWriteGuard<'a, LayerManager>>,
+    acquired_at: std::time::Instant,
+    holder: LayerManagerLockHolder,
+}
+
+impl Drop for LayerManagerReadGuard<'_> {
+    fn drop(&mut self) {
+        // Drop the lock first, before potentially warning if it was held for too long.
+        // SAFETY: ManuallyDrop in Drop implementation
+        unsafe { ManuallyDrop::drop(&mut self.guard) };
+
+        let held_for = self.acquired_at.elapsed();
+        if held_for >= LAYER_MANAGER_LOCK_READ_WARN_THRESHOLD {
+            tracing::warn!(
+                holder=%self.holder,
+                "Layer manager read lock held for {}s",
+                held_for.as_secs_f64(),
+            );
+        }
+    }
+}
+
+impl Drop for LayerManagerWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Drop the lock first, before potentially warning if it was held for too long.
+        // SAFETY: ManuallyDrop in Drop implementation
+        unsafe { ManuallyDrop::drop(&mut self.guard) };
+
+        let held_for = self.acquired_at.elapsed();
+        if held_for >= LAYER_MANAGER_LOCK_WARN_THRESHOLD {
+            tracing::warn!(
+                holder=%self.holder,
+                "Layer manager write lock held for {}s",
+                held_for.as_secs_f64(),
+            );
+        }
+    }
+}
+
+impl Deref for LayerManagerReadGuard<'_> {
+    type Target = LayerManager;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+impl Deref for LayerManagerWriteGuard<'_> {
+    type Target = LayerManager;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+impl DerefMut for LayerManagerWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.deref_mut()
+    }
+}
+
+impl LockedLayerManager {
+    pub(crate) async fn read(&self, holder: LayerManagerLockHolder) -> LayerManagerReadGuard {
+        let guard = ManuallyDrop::new(self.locked.read().await);
+        LayerManagerReadGuard {
+            guard,
+            acquired_at: std::time::Instant::now(),
+            holder,
+        }
+    }
+
+    pub(crate) fn try_read(
+        &self,
+        holder: LayerManagerLockHolder,
+    ) -> Result<LayerManagerReadGuard, tokio::sync::TryLockError> {
+        let guard = ManuallyDrop::new(self.locked.try_read()?);
+
+        Ok(LayerManagerReadGuard {
+            guard,
+            acquired_at: std::time::Instant::now(),
+            holder,
+        })
+    }
+
+    pub(crate) async fn write(&self, holder: LayerManagerLockHolder) -> LayerManagerWriteGuard {
+        let guard = ManuallyDrop::new(self.locked.write().await);
+        LayerManagerWriteGuard {
+            guard,
+            acquired_at: std::time::Instant::now(),
+            holder,
+        }
+    }
+
+    pub(crate) fn try_write(
+        &self,
+        holder: LayerManagerLockHolder,
+    ) -> Result<LayerManagerWriteGuard, tokio::sync::TryLockError> {
+        let guard = ManuallyDrop::new(self.locked.try_write()?);
+
+        Ok(LayerManagerWriteGuard {
+            guard,
+            acquired_at: std::time::Instant::now(),
+            holder,
+        })
+    }
+}
 
 /// Provides semantic APIs to manipulate the layer map.
 pub(crate) enum LayerManager {
@@ -37,7 +191,7 @@ impl Default for LayerManager {
 }
 
 impl LayerManager {
-    pub(crate) fn upgrade(&self, weak: ReadableLayerWeak) -> ReadableLayer {
+    fn upgrade(&self, weak: ReadableLayerWeak) -> ReadableLayer {
         match weak {
             ReadableLayerWeak::PersistentLayer(desc) => {
                 ReadableLayer::PersistentLayer(self.get_from_desc(&desc))
@@ -146,6 +300,36 @@ impl LayerManager {
         self.layers().keys().cloned().collect_vec()
     }
 
+    /// Update the [`LayerFringe`] of a read request
+    ///
+    /// Take a key space at a given LSN and query the layer map below each range
+    /// of the key space to find the next layers to visit.
+    pub(crate) fn update_search_fringe(
+        &self,
+        keyspace: &KeySpace,
+        cont_lsn: Lsn,
+        fringe: &mut LayerFringe,
+    ) -> Result<(), Shutdown> {
+        let map = self.layer_map()?;
+
+        for range in keyspace.ranges.iter() {
+            let results = map.range_search(range.clone(), cont_lsn);
+            results
+                .found
+                .into_iter()
+                .map(|(SearchResult { layer, lsn_floor }, keyspace_accum)| {
+                    (
+                        self.upgrade(layer),
+                        keyspace_accum.to_keyspace(),
+                        lsn_floor..cont_lsn,
+                    )
+                })
+                .for_each(|(layer, keyspace, lsn_range)| fringe.update(layer, keyspace, lsn_range));
+        }
+
+        Ok(())
+    }
+
     fn layers(&self) -> &HashMap<PersistentLayerKey, Layer> {
         use LayerManager::*;
         match self {
@@ -193,6 +377,7 @@ impl OpenLayerManager {
 
     /// Open a new writable layer to append data if there is no open layer, otherwise return the
     /// current open layer, called within `get_layer_for_write`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn get_layer_for_write(
         &mut self,
         lsn: Lsn,
@@ -200,6 +385,7 @@ impl OpenLayerManager {
         timeline_id: TimelineId,
         tenant_shard_id: TenantShardId,
         gate: &utils::sync::gate::Gate,
+        cancel: &CancellationToken,
         ctx: &RequestContext,
     ) -> anyhow::Result<Arc<InMemoryLayer>> {
         ensure!(lsn.is_aligned());
@@ -227,9 +413,16 @@ impl OpenLayerManager {
                 timeline_id, start_lsn, lsn
             );
 
-            let new_layer =
-                InMemoryLayer::create(conf, timeline_id, tenant_shard_id, start_lsn, gate, ctx)
-                    .await?;
+            let new_layer = InMemoryLayer::create(
+                conf,
+                timeline_id,
+                tenant_shard_id,
+                start_lsn,
+                gate,
+                cancel,
+                ctx,
+            )
+            .await?;
             let layer = Arc::new(new_layer);
 
             self.layer_map.open_layer = Some(layer.clone());

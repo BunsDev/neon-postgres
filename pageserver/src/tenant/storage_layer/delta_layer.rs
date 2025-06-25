@@ -29,11 +29,11 @@
 //!
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::SeekFrom;
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -44,17 +44,18 @@ use pageserver_api::key::{DBDIR_KEY, KEY_SIZE, Key};
 use pageserver_api::keyspace::KeySpace;
 use pageserver_api::models::ImageCompressionAlgorithm;
 use pageserver_api::shard::TenantShardId;
-use pageserver_api::value::Value;
-use rand::Rng;
-use rand::distributions::Alphanumeric;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use tokio_epoll_uring::IoBuf;
+use tokio_util::sync::CancellationToken;
 use tracing::*;
 use utils::bin_ser::BeSer;
+use utils::bin_ser::SerializeError;
 use utils::id::{TenantId, TimelineId};
 use utils::lsn::Lsn;
+use wal_decoder::models::value::Value;
 
+use super::errors::PutError;
 use super::{
     AsLayerDesc, LayerName, OnDiskValue, OnDiskValueIo, PersistentLayerDesc, ResidentLayer,
     ValuesReconstructState,
@@ -73,8 +74,10 @@ use crate::tenant::vectored_blob_io::{
     BlobFlag, BufView, StreamingVectoredReadPlanner, VectoredBlobReader, VectoredRead,
     VectoredReadPlanner,
 };
+use crate::virtual_file::TempVirtualFile;
 use crate::virtual_file::owned_buffers_io::io_buf_ext::{FullSlice, IoBufExt};
-use crate::virtual_file::{self, IoBufferMut, MaybeFatalIo, VirtualFile};
+use crate::virtual_file::owned_buffers_io::write::{Buffer, BufferedWriterShutdownMode};
+use crate::virtual_file::{self, IoBuffer, IoBufferMut, MaybeFatalIo, VirtualFile};
 use crate::{DELTA_FILE_MAGIC, STORAGE_FORMAT_VERSION, TEMP_FILE_SUFFIX};
 
 ///
@@ -112,6 +115,15 @@ impl From<&DeltaLayer> for Summary {
 }
 
 impl Summary {
+    /// Serializes the summary header into an aligned buffer of lenth `PAGE_SZ`.
+    pub fn ser_into_page(&self) -> Result<IoBuffer, SerializeError> {
+        let mut buf = IoBufferMut::with_capacity(PAGE_SZ);
+        Self::ser_into(self, &mut buf)?;
+        // Pad zeroes to the buffer so the length is a multiple of the alignment.
+        buf.extend_with(0, buf.capacity() - buf.len());
+        Ok(buf.freeze())
+    }
+
     pub(super) fn expected(
         tenant_id: TenantId,
         timeline_id: TimelineId,
@@ -287,19 +299,20 @@ impl DeltaLayer {
         key_start: Key,
         lsn_range: &Range<Lsn>,
     ) -> Utf8PathBuf {
-        let rand_string: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(8)
-            .map(char::from)
-            .collect();
+        // TempVirtualFile requires us to never reuse a filename while an old
+        // instance of TempVirtualFile created with that filename is not done dropping yet.
+        // So, we use a monotonic counter to disambiguate the filenames.
+        static NEXT_TEMP_DISAMBIGUATOR: AtomicU64 = AtomicU64::new(1);
+        let filename_disambiguator =
+            NEXT_TEMP_DISAMBIGUATOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         conf.timeline_path(tenant_shard_id, timeline_id)
             .join(format!(
-                "{}-XXX__{:016X}-{:016X}.{}.{}",
+                "{}-XXX__{:016X}-{:016X}.{:x}.{}",
                 key_start,
                 u64::from(lsn_range.start),
                 u64::from(lsn_range.end),
-                rand_string,
+                filename_disambiguator,
                 TEMP_FILE_SUFFIX,
             ))
     }
@@ -390,7 +403,7 @@ struct DeltaLayerWriterInner {
 
     tree: DiskBtreeBuilder<BlockBuf, DELTA_KEY_SIZE>,
 
-    blob_writer: BlobWriter<true>,
+    blob_writer: BlobWriter<TempVirtualFile>,
 
     // Number of key-lsns in the layer.
     num_keys: usize,
@@ -400,27 +413,43 @@ impl DeltaLayerWriterInner {
     ///
     /// Start building a new delta layer.
     ///
+    #[allow(clippy::too_many_arguments)]
     async fn new(
         conf: &'static PageServerConf,
         timeline_id: TimelineId,
         tenant_shard_id: TenantShardId,
         key_start: Key,
         lsn_range: Range<Lsn>,
+        gate: &utils::sync::gate::Gate,
+        cancel: CancellationToken,
         ctx: &RequestContext,
     ) -> anyhow::Result<Self> {
         // Create the file initially with a temporary filename. We don't know
         // the end key yet, so we cannot form the final filename yet. We will
         // rename it when we're done.
-        //
-        // Note: This overwrites any existing file. There shouldn't be any.
-        // FIXME: throw an error instead?
         let path =
             DeltaLayer::temp_path_for(conf, &tenant_shard_id, &timeline_id, key_start, &lsn_range);
+        let file = TempVirtualFile::new(
+            VirtualFile::open_with_options_v2(
+                &path,
+                virtual_file::OpenOptions::new()
+                    .create_new(true)
+                    .write(true),
+                ctx,
+            )
+            .await?,
+            gate.enter()?,
+        );
 
-        let mut file = VirtualFile::create(&path, ctx).await?;
-        // make room for the header block
-        file.seek(SeekFrom::Start(PAGE_SZ as u64)).await?;
-        let blob_writer = BlobWriter::new(file, PAGE_SZ as u64);
+        // Start at PAGE_SZ, make room for the header block
+        let blob_writer = BlobWriter::new(
+            file,
+            PAGE_SZ as u64,
+            gate,
+            cancel,
+            ctx,
+            info_span!(parent: None, "delta_layer_writer_flush_task", tenant_id=%tenant_shard_id.tenant_id, shard_id=%tenant_shard_id.shard_slug(), timeline_id=%timeline_id, path = %path),
+        )?;
 
         // Initialize the b-tree index builder
         let block_buf = BlockBuf::new();
@@ -449,12 +478,15 @@ impl DeltaLayerWriterInner {
         lsn: Lsn,
         val: Value,
         ctx: &RequestContext,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), PutError> {
         let (_, res) = self
             .put_value_bytes(
                 key,
                 lsn,
-                Value::ser(&val)?.slice_len(),
+                Value::ser(&val)
+                    .map_err(anyhow::Error::new)
+                    .map_err(PutError::Other)?
+                    .slice_len(),
                 val.will_init(),
                 ctx,
             )
@@ -469,7 +501,7 @@ impl DeltaLayerWriterInner {
         val: FullSlice<Buf>,
         will_init: bool,
         ctx: &RequestContext,
-    ) -> (FullSlice<Buf>, anyhow::Result<()>)
+    ) -> (FullSlice<Buf>, Result<(), PutError>)
     where
         Buf: IoBuf + Send,
     {
@@ -485,19 +517,24 @@ impl DeltaLayerWriterInner {
             .blob_writer
             .write_blob_maybe_compressed(val, ctx, compression)
             .await;
+        let res = res.map_err(PutError::WriteBlob);
         let off = match res {
             Ok((off, _)) => off,
-            Err(e) => return (val, Err(anyhow::anyhow!(e))),
+            Err(e) => return (val, Err(e)),
         };
 
         let blob_ref = BlobRef::new(off, will_init);
 
         let delta_key = DeltaKey::from_key_lsn(&key, lsn);
-        let res = self.tree.append(&delta_key.0, blob_ref.0);
+        let res = self
+            .tree
+            .append(&delta_key.0, blob_ref.0)
+            .map_err(anyhow::Error::new)
+            .map_err(PutError::Other);
 
         self.num_keys += 1;
 
-        (val, res.map_err(|e| anyhow::anyhow!(e)))
+        (val, res)
     }
 
     fn size(&self) -> u64 {
@@ -512,33 +549,26 @@ impl DeltaLayerWriterInner {
         key_end: Key,
         ctx: &RequestContext,
     ) -> anyhow::Result<(PersistentLayerDesc, Utf8PathBuf)> {
-        let temp_path = self.path.clone();
-        let result = self.finish0(key_end, ctx).await;
-        if let Err(ref e) = result {
-            tracing::info!(%temp_path, "cleaning up temporary file after error during writing: {e}");
-            if let Err(e) = std::fs::remove_file(&temp_path) {
-                tracing::warn!(error=%e, %temp_path, "error cleaning up temporary layer file after error during writing");
-            }
-        }
-        result
-    }
-
-    async fn finish0(
-        self,
-        key_end: Key,
-        ctx: &RequestContext,
-    ) -> anyhow::Result<(PersistentLayerDesc, Utf8PathBuf)> {
         let index_start_blk = self.blob_writer.size().div_ceil(PAGE_SZ as u64) as u32;
 
-        let mut file = self.blob_writer.into_inner(ctx).await?;
+        let file = self
+            .blob_writer
+            .shutdown(
+                BufferedWriterShutdownMode::ZeroPadToNextMultiple(PAGE_SZ),
+                ctx,
+            )
+            .await?;
 
         // Write out the index
         let (index_root_blk, block_buf) = self.tree.finish()?;
-        file.seek(SeekFrom::Start(index_start_blk as u64 * PAGE_SZ as u64))
-            .await?;
+        let mut offset = index_start_blk as u64 * PAGE_SZ as u64;
+
+        // TODO(yuchen): https://github.com/neondatabase/neon/issues/10092
+        // Should we just replace BlockBuf::blocks with one big buffer
         for buf in block_buf.blocks {
-            let (_buf, res) = file.write_all(buf.slice_len(), ctx).await;
+            let (_buf, res) = file.write_all_at(buf.slice_len(), offset, ctx).await;
             res?;
+            offset += PAGE_SZ as u64;
         }
         assert!(self.lsn_range.start < self.lsn_range.end);
         // Fill in the summary on blk 0
@@ -553,11 +583,9 @@ impl DeltaLayerWriterInner {
             index_root_blk,
         };
 
-        let mut buf = Vec::with_capacity(PAGE_SZ);
-        // TODO: could use smallvec here but it's a pain with Slice<T>
-        Summary::ser_into(&summary, &mut buf)?;
-        file.seek(SeekFrom::Start(0)).await?;
-        let (_buf, res) = file.write_all(buf.slice_len(), ctx).await;
+        // Writes summary at the first block (offset 0).
+        let buf = summary.ser_into_page()?;
+        let (_buf, res) = file.write_all_at(buf.slice_len(), 0, ctx).await;
         res?;
 
         let metadata = file
@@ -594,6 +622,10 @@ impl DeltaLayerWriterInner {
 
         trace!("created delta layer {}", self.path);
 
+        // The gate guard stored in `destination_file` is dropped. Callers (e.g.. flush loop or compaction)
+        // keep the gate open also, so that it's safe for them to rename the file to its final destination.
+        file.disarm_into_inner();
+
         Ok((desc, self.path))
     }
 }
@@ -628,12 +660,15 @@ impl DeltaLayerWriter {
     ///
     /// Start building a new delta layer.
     ///
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         conf: &'static PageServerConf,
         timeline_id: TimelineId,
         tenant_shard_id: TenantShardId,
         key_start: Key,
         lsn_range: Range<Lsn>,
+        gate: &utils::sync::gate::Gate,
+        cancel: CancellationToken,
         ctx: &RequestContext,
     ) -> anyhow::Result<Self> {
         Ok(Self {
@@ -644,6 +679,8 @@ impl DeltaLayerWriter {
                     tenant_shard_id,
                     key_start,
                     lsn_range,
+                    gate,
+                    cancel,
                     ctx,
                 )
                 .await?,
@@ -666,7 +703,7 @@ impl DeltaLayerWriter {
         lsn: Lsn,
         val: Value,
         ctx: &RequestContext,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), PutError> {
         self.inner
             .as_mut()
             .unwrap()
@@ -681,7 +718,7 @@ impl DeltaLayerWriter {
         val: FullSlice<Buf>,
         will_init: bool,
         ctx: &RequestContext,
-    ) -> (FullSlice<Buf>, anyhow::Result<()>)
+    ) -> (FullSlice<Buf>, Result<(), PutError>)
     where
         Buf: IoBuf + Send,
     {
@@ -717,17 +754,6 @@ impl DeltaLayerWriter {
     }
 }
 
-impl Drop for DeltaLayerWriter {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            // We want to remove the virtual file here, so it's fine to not
-            // having completely flushed unwritten data.
-            let vfile = inner.blob_writer.into_inner_no_flush();
-            vfile.remove();
-        }
-    }
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum RewriteSummaryError {
     #[error("magic mismatch")]
@@ -751,13 +777,13 @@ impl DeltaLayer {
     where
         F: Fn(Summary) -> Summary,
     {
-        let mut file = VirtualFile::open_with_options(
+        let file = VirtualFile::open_with_options_v2(
             path,
             virtual_file::OpenOptions::new().read(true).write(true),
             ctx,
         )
         .await
-        .with_context(|| format!("Failed to open file '{}'", path))?;
+        .with_context(|| format!("Failed to open file '{path}'"))?;
         let file_id = page_cache::next_file_id();
         let block_reader = FileBlockReader::new(&file, file_id);
         let summary_blk = block_reader.read_blk(0, ctx).await?;
@@ -768,11 +794,8 @@ impl DeltaLayer {
 
         let new_summary = rewrite(actual_summary);
 
-        let mut buf = Vec::with_capacity(PAGE_SZ);
-        // TODO: could use smallvec here, but it's a pain with Slice<T>
-        Summary::ser_into(&new_summary, &mut buf).context("serialize")?;
-        file.seek(SeekFrom::Start(0)).await?;
-        let (_buf, res) = file.write_all(buf.slice_len(), ctx).await;
+        let buf = new_summary.ser_into_page().context("serialize")?;
+        let (_buf, res) = file.write_all_at(buf.slice_len(), 0, ctx).await;
         res?;
         Ok(())
     }
@@ -896,9 +919,9 @@ impl DeltaLayerInner {
     where
         Reader: BlockReader + Clone,
     {
-        let ctx = RequestContextBuilder::extend(ctx)
+        let ctx = RequestContextBuilder::from(ctx)
             .page_content_kind(PageContentKind::DeltaLayerBtreeNode)
-            .build();
+            .attached_child();
 
         for range in keyspace.ranges.iter() {
             let mut range_end_handled = false;
@@ -1105,9 +1128,9 @@ impl DeltaLayerInner {
                     all_keys.push(entry);
                     true
                 },
-                &RequestContextBuilder::extend(ctx)
+                &RequestContextBuilder::from(ctx)
                     .page_content_kind(PageContentKind::DeltaLayerBtreeNode)
-                    .build(),
+                    .attached_child(),
             )
             .await?;
         if let Some(last) = all_keys.last_mut() {
@@ -1283,7 +1306,7 @@ impl DeltaLayerInner {
                     // is it an image or will_init walrecord?
                     // FIXME: this could be handled by threading the BlobRef to the
                     // VectoredReadBuilder
-                    let will_init = pageserver_api::value::ValueBytes::will_init(&data)
+                    let will_init = wal_decoder::models::value::ValueBytes::will_init(&data)
                         .inspect_err(|_e| {
                             #[cfg(feature = "testing")]
                             tracing::error!(data=?utils::Hex(&data), err=?_e, %key, %lsn, "failed to parse will_init out of serialized value");
@@ -1346,7 +1369,7 @@ impl DeltaLayerInner {
                     format!(" img {} bytes", img.len())
                 }
                 Value::WalRecord(rec) => {
-                    let wal_desc = pageserver_api::record::describe_wal_record(&rec)?;
+                    let wal_desc = wal_decoder::models::record::describe_wal_record(&rec)?;
                     format!(
                         " rec {} bytes will_init: {} {}",
                         buf.len(),
@@ -1378,7 +1401,7 @@ impl DeltaLayerInner {
                 match val {
                     Value::Image(img) => {
                         let checkpoint = CheckPoint::decode(&img)?;
-                        println!("   CHECKPOINT: {:?}", checkpoint);
+                        println!("   CHECKPOINT: {checkpoint:?}");
                     }
                     Value::WalRecord(_rec) => {
                         println!("   unexpected walrecord value for checkpoint key");
@@ -1427,7 +1450,12 @@ impl DeltaLayerInner {
         offset
     }
 
-    pub fn iter<'a>(&'a self, ctx: &'a RequestContext) -> DeltaLayerIterator<'a> {
+    pub fn iter_with_options<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        max_read_size: u64,
+        max_batch_size: usize,
+    ) -> DeltaLayerIterator<'a> {
         let block_reader = FileBlockReader::new(&self.file, self.file_id);
         let tree_reader =
             DiskBtreeReader::new(self.index_start_blk, self.index_root_blk, block_reader);
@@ -1437,10 +1465,7 @@ impl DeltaLayerInner {
             index_iter: tree_reader.iter(&[0; DELTA_KEY_SIZE], ctx),
             key_values_batch: std::collections::VecDeque::new(),
             is_end: false,
-            planner: StreamingVectoredReadPlanner::new(
-                1024 * 8192, // The default value. Unit tests might use a different value. 1024 * 8K = 8MB buffer.
-                1024,        // The default value. Unit tests might use a different value
-            ),
+            planner: StreamingVectoredReadPlanner::new(max_read_size, max_batch_size),
         }
     }
 
@@ -1597,12 +1622,6 @@ impl DeltaLayerIterator<'_> {
 pub(crate) mod test {
     use std::collections::BTreeMap;
 
-    use bytes::Bytes;
-    use itertools::MinMaxResult;
-    use pageserver_api::value::Value;
-    use rand::RngCore;
-    use rand::prelude::{SeedableRng, SliceRandom, StdRng};
-
     use super::*;
     use crate::DEFAULT_PG_VERSION;
     use crate::context::DownloadBehavior;
@@ -1610,8 +1629,13 @@ pub(crate) mod test {
     use crate::tenant::disk_btree::tests::TestDisk;
     use crate::tenant::harness::{TIMELINE_ID, TenantHarness};
     use crate::tenant::storage_layer::{Layer, ResidentLayer};
-    use crate::tenant::vectored_blob_io::StreamingVectoredReadPlanner;
-    use crate::tenant::{Tenant, Timeline};
+    use crate::tenant::timeline::layer_manager::LayerManagerLockHolder;
+    use crate::tenant::{TenantShard, Timeline};
+    use bytes::Bytes;
+    use itertools::MinMaxResult;
+    use postgres_ffi::PgMajorVersion;
+    use rand::prelude::{SeedableRng, SliceRandom, StdRng};
+    use rand::{Rng, RngCore};
 
     /// Construct an index for a fictional delta layer and and then
     /// traverse in order to plan vectored reads for a query. Finally,
@@ -1885,6 +1909,8 @@ pub(crate) mod test {
             harness.tenant_shard_id,
             entries_meta.key_range.start,
             entries_meta.lsn_range.clone(),
+            &timeline.gate,
+            timeline.cancel.clone(),
             &ctx,
         )
         .await?;
@@ -1961,7 +1987,7 @@ pub(crate) mod test {
     #[tokio::test]
     async fn copy_delta_prefix_smoke() {
         use bytes::Bytes;
-        use pageserver_api::record::NeonWalRecord;
+        use wal_decoder::models::record::NeonWalRecord;
 
         let h = crate::tenant::harness::TenantHarness::create("truncate_delta_smoke")
             .await
@@ -1969,14 +1995,14 @@ pub(crate) mod test {
         let (tenant, ctx) = h.load().await;
         let ctx = &ctx;
         let timeline = tenant
-            .create_test_timeline(TimelineId::generate(), Lsn(0x10), 14, ctx)
+            .create_test_timeline(TimelineId::generate(), Lsn(0x10), PgMajorVersion::PG14, ctx)
             .await
             .unwrap();
         let ctx = &ctx.with_scope_timeline(&timeline);
 
         let initdb_layer = timeline
             .layers
-            .read()
+            .read(crate::tenant::timeline::layer_manager::LayerManagerLockHolder::Testing)
             .await
             .likely_resident_layers()
             .next()
@@ -2052,7 +2078,7 @@ pub(crate) mod test {
 
         let new_layer = timeline
             .layers
-            .read()
+            .read(LayerManagerLockHolder::Testing)
             .await
             .likely_resident_layers()
             .find(|&x| x != &initdb_layer)
@@ -2079,6 +2105,8 @@ pub(crate) mod test {
                 tenant.tenant_shard_id,
                 Key::MIN,
                 Lsn(0x11)..truncate_at,
+                &branch.gate,
+                branch.cancel.clone(),
                 ctx,
             )
             .await
@@ -2196,7 +2224,7 @@ pub(crate) mod test {
     }
 
     pub(crate) async fn produce_delta_layer(
-        tenant: &Tenant,
+        tenant: &TenantShard,
         tline: &Arc<Timeline>,
         mut deltas: Vec<(Key, Lsn, Value)>,
         ctx: &RequestContext,
@@ -2213,6 +2241,8 @@ pub(crate) mod test {
             tenant.tenant_shard_id,
             *key_start,
             (*lsn_min)..lsn_end,
+            &tline.gate,
+            tline.cancel.clone(),
             ctx,
         )
         .await?;
@@ -2281,8 +2311,7 @@ pub(crate) mod test {
             for batch_size in [1, 2, 4, 8, 3, 7, 13] {
                 println!("running with batch_size={batch_size} max_read_size={max_read_size}");
                 // Test if the batch size is correctly determined
-                let mut iter = delta_layer.iter(&ctx);
-                iter.planner = StreamingVectoredReadPlanner::new(max_read_size, batch_size);
+                let mut iter = delta_layer.iter_with_options(&ctx, max_read_size, batch_size);
                 let mut num_items = 0;
                 for _ in 0..3 {
                     iter.next_batch().await.unwrap();
@@ -2299,8 +2328,7 @@ pub(crate) mod test {
                     iter.key_values_batch.clear();
                 }
                 // Test if the result is correct
-                let mut iter = delta_layer.iter(&ctx);
-                iter.planner = StreamingVectoredReadPlanner::new(max_read_size, batch_size);
+                let mut iter = delta_layer.iter_with_options(&ctx, max_read_size, batch_size);
                 assert_delta_iter_equal(&mut iter, &test_deltas).await;
             }
         }

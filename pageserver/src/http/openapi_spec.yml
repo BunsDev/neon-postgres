@@ -212,6 +212,12 @@ paths:
               schema:
                 type: string
                 format: date-time
+        "412":
+          description: No timestamp is found for given LSN, e.g. if there had been no commits till LSN
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreconditionFailedError"
 
   /v1/tenant/{tenant_id}/timeline/{timeline_id}/get_lsn_by_timestamp:
     parameters:
@@ -343,6 +349,33 @@ paths:
           format: hex
     post:
       description: Persistently remove a tenant level gc blocking for this timeline
+      responses:
+        "200":
+          description: OK
+
+  /v1/tenant/{tenant_shard_id}/timeline/{timeline_id}/mark_invisible:
+    parameters:
+      - name: tenant_shard_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: timeline_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: hex
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                is_visible:
+                  type: boolean
+                  default: false
       responses:
         "200":
           description: OK
@@ -620,6 +653,8 @@ paths:
                   format: hex
                 pg_version:
                   type: integer
+                read_only:
+                  type: boolean
                 existing_initdb_timeline_id:
                   type: string
                   format: hex
@@ -669,6 +704,13 @@ paths:
         Detach a timeline from its ancestor and reparent all ancestors timelines with lower `ancestor_lsn`.
         Current implementation might not be retryable across failure cases, but will be enhanced in future.
         Detaching should be expected to be expensive operation. Timeouts should be retried.
+      parameters:
+        - name: detach_behavior
+          in: query
+          required: false
+          schema:
+            description: Currently valid values are `v1`, `v2`
+            type: string
       responses:
         "200":
           description: |
@@ -1079,6 +1121,7 @@ components:
         - last_record_lsn
         - disk_consistent_lsn
         - state
+        - min_readable_lsn
       properties:
         timeline_id:
           type: string
@@ -1125,6 +1168,40 @@ components:
         applied_gc_cutoff_lsn:
           type: string
           format: hex
+        safekeepers:
+          $ref: "#/components/schemas/TimelineSafekeepersInfo"
+
+    TimelineSafekeepersInfo:
+      type: object
+      required:
+        - tenant_id
+        - timeline_id
+        - generation
+        - safekeepers
+      properties:
+        tenant_id:
+          type: string
+          format: hex
+        timeline_id:
+          type: string
+          format: hex
+        generation:
+          type: integer
+        safekeepers:
+          type: array
+          items:
+            $ref: "#/components/schemas/TimelineSafekeeperInfo"
+
+    TimelineSafekeeperInfo:
+      type: object
+      required:
+        - id
+        - hostname
+      properties:
+        id:
+          type: integer
+        hostname:
+          type: string
 
     SyntheticSizeResponse:
       type: object

@@ -131,7 +131,8 @@ async fn get_holes(path: &Utf8Path, max_holes: usize, ctx: &RequestContext) -> R
 pub(crate) async fn main(cmd: &AnalyzeLayerMapCmd) -> Result<()> {
     let storage_path = &cmd.path;
     let max_holes = cmd.max_holes.unwrap_or(DEFAULT_MAX_HOLES);
-    let ctx = RequestContext::new(TaskKind::DebugTool, DownloadBehavior::Error);
+    let ctx =
+        RequestContext::new(TaskKind::DebugTool, DownloadBehavior::Error).with_scope_debug_tools();
 
     // Initialize virtual_file (file desriptor cache) and page cache which are needed to access layer persistent B-Tree.
     pageserver::virtual_file::init(
@@ -223,8 +224,7 @@ pub(crate) async fn main(cmd: &AnalyzeLayerMapCmd) -> Result<()> {
         }
     }
     println!(
-        "Total delta layers {} image layers {} excess layers {}",
-        total_delta_layers, total_image_layers, total_excess_layers
+        "Total delta layers {total_delta_layers} image layers {total_image_layers} excess layers {total_excess_layers}"
     );
     Ok(())
 }

@@ -73,6 +73,7 @@ pub mod error;
 /// async timeout helper
 pub mod timeout;
 
+pub mod span;
 pub mod sync;
 
 pub mod failpoint_support;
@@ -92,6 +93,8 @@ pub mod circuit_breaker;
 pub mod try_rcu;
 
 pub mod guard_arc_swap;
+
+pub mod elapsed_accum;
 
 #[cfg(target_os = "linux")]
 pub mod linux_socket_ioctl;

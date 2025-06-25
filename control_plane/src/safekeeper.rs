@@ -6,7 +6,6 @@
 //!   .neon/safekeepers/<safekeeper id>
 //! ```
 use std::error::Error as _;
-use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,9 +13,9 @@ use std::{io, result};
 
 use anyhow::Context;
 use camino::Utf8PathBuf;
-use http_utils::error::HttpErrorBody;
 use postgres_connection::PgConnectionConfig;
-use reqwest::{IntoUrl, Method};
+use safekeeper_api::models::TimelineCreateRequest;
+use safekeeper_client::mgmt_api;
 use thiserror::Error;
 use utils::auth::{Claims, Scope};
 use utils::id::NodeId;
@@ -35,25 +34,14 @@ pub enum SafekeeperHttpError {
 
 type Result<T> = result::Result<T, SafekeeperHttpError>;
 
-pub(crate) trait ResponseErrorMessageExt: Sized {
-    fn error_from_body(self) -> impl Future<Output = Result<Self>> + Send;
-}
-
-impl ResponseErrorMessageExt for reqwest::Response {
-    async fn error_from_body(self) -> Result<Self> {
-        let status = self.status();
-        if !(status.is_client_error() || status.is_server_error()) {
-            return Ok(self);
-        }
-
-        // reqwest does not export its error construction utility functions, so let's craft the message ourselves
-        let url = self.url().to_owned();
-        Err(SafekeeperHttpError::Response(
-            match self.json::<HttpErrorBody>().await {
-                Ok(err_body) => format!("Error: {}", err_body.msg),
-                Err(_) => format!("Http error ({}) at {}.", status.as_u16(), url),
-            },
-        ))
+fn err_from_client_err(err: mgmt_api::Error) -> SafekeeperHttpError {
+    use mgmt_api::Error::*;
+    match err {
+        ApiError(_, str) => SafekeeperHttpError::Response(str),
+        Cancelled => SafekeeperHttpError::Response("Cancelled".to_owned()),
+        ReceiveBody(err) => SafekeeperHttpError::Transport(err),
+        ReceiveErrorBody(err) => SafekeeperHttpError::Response(err),
+        Timeout(str) => SafekeeperHttpError::Response(format!("timeout: {str}")),
     }
 }
 
@@ -70,9 +58,8 @@ pub struct SafekeeperNode {
 
     pub pg_connection_config: PgConnectionConfig,
     pub env: LocalEnv,
-    pub http_client: reqwest::Client,
+    pub http_client: mgmt_api::Client,
     pub listen_addr: String,
-    pub http_base_url: String,
 }
 
 impl SafekeeperNode {
@@ -82,13 +69,14 @@ impl SafekeeperNode {
         } else {
             "127.0.0.1".to_string()
         };
+        let jwt = None;
+        let http_base_url = format!("http://{}:{}", listen_addr, conf.http_port);
         SafekeeperNode {
             id: conf.id,
             conf: conf.clone(),
             pg_connection_config: Self::safekeeper_connection_config(&listen_addr, conf.pg_port),
             env: env.clone(),
-            http_client: reqwest::Client::new(),
-            http_base_url: format!("http://{}:{}/v1", listen_addr, conf.http_port),
+            http_client: mgmt_api::Client::new(env.create_http_client(), http_base_url, jwt),
             listen_addr,
         }
     }
@@ -112,7 +100,7 @@ impl SafekeeperNode {
     }
 
     /// Initializes a safekeeper node by creating all necessary files,
-    /// e.g. SSL certificates.
+    /// e.g. SSL certificates and JWT token file.
     pub fn initialize(&self) -> anyhow::Result<()> {
         if self.env.generate_local_ssl_certs {
             self.env.generate_ssl_cert(
@@ -120,6 +108,17 @@ impl SafekeeperNode {
                 &self.datadir_path().join("server.key"),
             )?;
         }
+
+        // Generate a token file for authentication with other safekeepers
+        if self.conf.auth_enabled {
+            let token = self
+                .env
+                .generate_auth_token(&Claims::new(None, Scope::SafekeeperData))?;
+
+            let token_path = self.datadir_path().join("peer_jwt_token");
+            std::fs::write(token_path, token)?;
+        }
+
         Ok(())
     }
 
@@ -144,7 +143,7 @@ impl SafekeeperNode {
         let id_string = id.to_string();
         // TODO: add availability_zone to the config.
         // Right now we just specify any value here and use it to check metrics in tests.
-        let availability_zone = format!("sk-{}", id_string);
+        let availability_zone = format!("sk-{id_string}");
 
         let mut args = vec![
             "-D".to_owned(),
@@ -218,14 +217,26 @@ impl SafekeeperNode {
             args.push(format!("--ssl-ca-file={}", ssl_ca_file.to_str().unwrap()));
         }
 
+        if self.conf.auth_enabled {
+            let token_path = self.datadir_path().join("peer_jwt_token");
+            let token_path_str = token_path
+                .to_str()
+                .with_context(|| {
+                    format!("Token path {token_path:?} cannot be represented as a unicode string")
+                })?
+                .to_owned();
+            args.extend(["--auth-token-path".to_owned(), token_path_str]);
+        }
+
         args.extend_from_slice(extra_opts);
 
+        let env_variables = Vec::new();
         background_process::start_process(
             &format!("safekeeper-{id}"),
             &datadir,
             &self.env.safekeeper_bin(),
             &args,
-            self.safekeeper_env_variables()?,
+            env_variables,
             background_process::InitialPidFile::Expect(self.pid_file()),
             retry_timeout,
             || async {
@@ -237,18 +248,6 @@ impl SafekeeperNode {
             },
         )
         .await
-    }
-
-    fn safekeeper_env_variables(&self) -> anyhow::Result<Vec<(String, String)>> {
-        // Generate a token to connect from safekeeper to peers
-        if self.conf.auth_enabled {
-            let token = self
-                .env
-                .generate_auth_token(&Claims::new(None, Scope::SafekeeperData))?;
-            Ok(vec![("SAFEKEEPER_AUTH_TOKEN".to_owned(), token)])
-        } else {
-            Ok(Vec::new())
-        }
     }
 
     ///
@@ -267,20 +266,19 @@ impl SafekeeperNode {
         )
     }
 
-    fn http_request<U: IntoUrl>(&self, method: Method, url: U) -> reqwest::RequestBuilder {
-        // TODO: authentication
-        //if self.env.auth_type == AuthType::NeonJWT {
-        //    builder = builder.bearer_auth(&self.env.safekeeper_auth_token)
-        //}
-        self.http_client.request(method, url)
+    pub async fn check_status(&self) -> Result<()> {
+        self.http_client
+            .status()
+            .await
+            .map_err(err_from_client_err)?;
+        Ok(())
     }
 
-    pub async fn check_status(&self) -> Result<()> {
-        self.http_request(Method::GET, format!("{}/{}", self.http_base_url, "status"))
-            .send()
-            .await?
-            .error_from_body()
-            .await?;
+    pub async fn create_timeline(&self, req: &TimelineCreateRequest) -> Result<()> {
+        self.http_client
+            .create_timeline(req)
+            .await
+            .map_err(err_from_client_err)?;
         Ok(())
     }
 }

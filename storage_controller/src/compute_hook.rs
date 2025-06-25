@@ -4,10 +4,12 @@ use std::error::Error as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use control_plane::endpoint::{ComputeControlPlane, EndpointStatus};
+use anyhow::Context;
+use control_plane::endpoint::{ComputeControlPlane, EndpointStatus, PageserverProtocol};
 use control_plane::local_env::LocalEnv;
 use futures::StreamExt;
 use hyper::StatusCode;
+use pageserver_api::config::DEFAULT_GRPC_LISTEN_PORT;
 use pageserver_api::controller_api::AvailabilityZone;
 use pageserver_api::shard::{ShardCount, ShardNumber, ShardStripeSize, TenantShardId};
 use postgres_connection::parse_host_port;
@@ -364,25 +366,28 @@ pub(crate) struct ShardUpdate<'a> {
 }
 
 impl ComputeHook {
-    pub(super) fn new(config: Config) -> Self {
+    pub(super) fn new(config: Config) -> anyhow::Result<Self> {
         let authorization_header = config
             .control_plane_jwt_token
             .clone()
-            .map(|jwt| format!("Bearer {}", jwt));
+            .map(|jwt| format!("Bearer {jwt}"));
 
-        let client = reqwest::ClientBuilder::new()
-            .timeout(NOTIFY_REQUEST_TIMEOUT)
+        let mut client = reqwest::ClientBuilder::new().timeout(NOTIFY_REQUEST_TIMEOUT);
+        for cert in &config.ssl_ca_certs {
+            client = client.add_root_certificate(cert.clone());
+        }
+        let client = client
             .build()
-            .expect("Failed to construct HTTP client");
+            .context("Failed to build http client for compute hook")?;
 
-        Self {
+        Ok(Self {
             state: Default::default(),
             config,
             authorization_header,
             neon_local_lock: Default::default(),
             api_concurrency: tokio::sync::Semaphore::new(API_CONCURRENCY),
             client,
-        }
+        })
     }
 
     /// For test environments: use neon_local's LocalEnv to update compute
@@ -416,23 +421,31 @@ impl ComputeHook {
             preferred_az: _preferred_az,
         } = reconfigure_request;
 
-        let compute_pageservers = shards
-            .iter()
-            .map(|shard| {
-                let ps_conf = env
-                    .get_pageserver_conf(shard.node_id)
-                    .expect("Unknown pageserver");
-                let (pg_host, pg_port) = parse_host_port(&ps_conf.listen_pg_addr)
-                    .expect("Unable to parse listen_pg_addr");
-                (pg_host, pg_port.unwrap_or(5432))
-            })
-            .collect::<Vec<_>>();
-
         for (endpoint_name, endpoint) in &cplane.endpoints {
             if endpoint.tenant_id == *tenant_id && endpoint.status() == EndpointStatus::Running {
-                tracing::info!("Reconfiguring endpoint {}", endpoint_name,);
+                tracing::info!("Reconfiguring endpoint {endpoint_name}");
+
+                let pageservers = shards
+                    .iter()
+                    .map(|shard| {
+                        let ps_conf = env
+                            .get_pageserver_conf(shard.node_id)
+                            .expect("Unknown pageserver");
+                        if endpoint.grpc {
+                            let addr = ps_conf.listen_grpc_addr.as_ref().expect("no gRPC address");
+                            let (host, port) = parse_host_port(addr).expect("invalid gRPC address");
+                            let port = port.unwrap_or(DEFAULT_GRPC_LISTEN_PORT);
+                            (PageserverProtocol::Grpc, host, port)
+                        } else {
+                            let (host, port) = parse_host_port(&ps_conf.listen_pg_addr)
+                                .expect("Unable to parse listen_pg_addr");
+                            (PageserverProtocol::Libpq, host, port.unwrap_or(5432))
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
                 endpoint
-                    .reconfigure(compute_pageservers.clone(), *stripe_size, None)
+                    .reconfigure(pageservers, *stripe_size, None)
                     .await
                     .map_err(NotifyError::NeonLocal)?;
             }
@@ -624,16 +637,17 @@ impl ComputeHook {
             MaybeSendResult::Transmit((request, lock)) => (request, lock),
         };
 
-        let compute_hook_url = if let Some(control_plane_url) = &self.config.control_plane_url {
-            Some(if control_plane_url.ends_with('/') {
-                format!("{control_plane_url}notify-attach")
-            } else {
-                format!("{control_plane_url}/notify-attach")
-            })
-        } else {
-            self.config.compute_hook_url.clone()
-        };
-        let result = if let Some(notify_url) = &compute_hook_url {
+        let result = if !self.config.use_local_compute_notifications {
+            let compute_hook_url =
+                self.config
+                    .control_plane_url
+                    .as_ref()
+                    .map(|control_plane_url| {
+                        format!("{}/notify-attach", control_plane_url.trim_end_matches('/'))
+                    });
+
+            // We validate this at startup
+            let notify_url = compute_hook_url.as_ref().unwrap();
             self.do_notify(notify_url, &request, cancel).await
         } else {
             self.do_notify_local(&request).await.map_err(|e| {
@@ -793,7 +807,7 @@ impl ComputeHook {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use pageserver_api::shard::{ShardCount, ShardNumber};
+    use pageserver_api::shard::{DEFAULT_STRIPE_SIZE, ShardCount, ShardNumber};
     use utils::id::TenantId;
 
     use super::*;
@@ -801,6 +815,7 @@ pub(crate) mod tests {
     #[test]
     fn tenant_updates() -> anyhow::Result<()> {
         let tenant_id = TenantId::generate();
+        let stripe_size = DEFAULT_STRIPE_SIZE;
         let mut tenant_state = ComputeHookTenant::new(
             TenantShardId {
                 tenant_id,
@@ -841,7 +856,7 @@ pub(crate) mod tests {
                 shard_count: ShardCount::new(2),
                 shard_number: ShardNumber(1),
             },
-            stripe_size: ShardStripeSize(32768),
+            stripe_size,
             preferred_az: None,
             node_id: NodeId(1),
         });
@@ -857,7 +872,7 @@ pub(crate) mod tests {
                 shard_count: ShardCount::new(2),
                 shard_number: ShardNumber(0),
             },
-            stripe_size: ShardStripeSize(32768),
+            stripe_size,
             preferred_az: None,
             node_id: NodeId(1),
         });
@@ -867,7 +882,7 @@ pub(crate) mod tests {
             anyhow::bail!("Wrong send result");
         };
         assert_eq!(request.shards.len(), 2);
-        assert_eq!(request.stripe_size, Some(ShardStripeSize(32768)));
+        assert_eq!(request.stripe_size, Some(stripe_size));
 
         // Simulate successful send
         *guard = Some(ComputeRemoteState {

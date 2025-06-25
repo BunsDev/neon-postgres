@@ -14,11 +14,12 @@ use http_utils::json::{json_request, json_response};
 use http_utils::request::{ensure_no_body, parse_query_param, parse_request_param};
 use http_utils::{RequestExt, RouterBuilder};
 use hyper::{Body, Request, Response, StatusCode};
+use pem::Pem;
 use postgres_ffi::WAL_SEGMENT_SIZE;
 use safekeeper_api::models::{
-    AcceptorStateStatus, PullTimelineRequest, SafekeeperStatus, SkTimelineInfo, TermSwitchApiEntry,
-    TimelineCopyRequest, TimelineCreateRequest, TimelineDeleteResult, TimelineStatus,
-    TimelineTermBumpRequest,
+    AcceptorStateStatus, PullTimelineRequest, SafekeeperStatus, SkTimelineInfo, TenantDeleteResult,
+    TermSwitchApiEntry, TimelineCopyRequest, TimelineCreateRequest, TimelineDeleteResult,
+    TimelineStatus, TimelineTermBumpRequest,
 };
 use safekeeper_api::{ServerInfo, membership, models};
 use storage_broker::proto::{SafekeeperTimelineInfo, TenantTimelineId as ProtoTenantTimelineId};
@@ -83,13 +84,11 @@ async fn tenant_delete_handler(mut request: Request<Body>) -> Result<Response<Bo
         .delete_all_for_tenant(&tenant_id, action)
         .await
         .map_err(ApiError::InternalServerError)?;
-    json_response(
-        StatusCode::OK,
-        delete_info
-            .iter()
-            .map(|(ttid, resp)| (format!("{}", ttid.timeline_id), *resp))
-            .collect::<HashMap<String, TimelineDeleteResult>>(),
-    )
+    let response_body: TenantDeleteResult = delete_info
+        .iter()
+        .map(|(ttid, resp)| (format!("{}", ttid.timeline_id), *resp))
+        .collect::<HashMap<String, TimelineDeleteResult>>();
+    json_response(StatusCode::OK, response_body)
 }
 
 async fn timeline_create_handler(mut request: Request<Body>) -> Result<Response<Body>, ApiError> {
@@ -232,14 +231,19 @@ async fn timeline_pull_handler(mut request: Request<Body>) -> Result<Response<Bo
     let conf = get_conf(&request);
     let global_timelines = get_global_timelines(&request);
 
-    let resp = pull_timeline::handle_request(
-        data,
-        conf.sk_auth_token.clone(),
-        conf.ssl_ca_cert.clone(),
-        global_timelines,
-    )
-    .await
-    .map_err(ApiError::InternalServerError)?;
+    let ca_certs = conf
+        .ssl_ca_certs
+        .iter()
+        .map(Pem::contents)
+        .map(reqwest::Certificate::from_der)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            ApiError::InternalServerError(anyhow::anyhow!("failed to parse CA certs: {e}"))
+        })?;
+
+    let resp =
+        pull_timeline::handle_request(data, conf.sk_auth_token.clone(), ca_certs, global_timelines)
+            .await?;
     json_response(StatusCode::OK, resp)
 }
 
@@ -254,6 +258,7 @@ async fn timeline_snapshot_handler(request: Request<Body>) -> Result<Response<Bo
 
     let global_timelines = get_global_timelines(&request);
     let tli = global_timelines.get(ttid).map_err(ApiError::from)?;
+    let storage = global_timelines.get_wal_backup().get_storage();
 
     // To stream the body use wrap_stream which wants Stream of Result<Bytes>,
     // so create the chan and write to it in another task.
@@ -265,6 +270,7 @@ async fn timeline_snapshot_handler(request: Request<Body>) -> Result<Response<Bo
         conf.my_id,
         destination,
         tx,
+        storage,
     ));
 
     let rx_stream = ReceiverStream::new(rx);
@@ -386,12 +392,18 @@ async fn timeline_copy_handler(mut request: Request<Body>) -> Result<Response<Bo
     );
 
     let global_timelines = get_global_timelines(&request);
+    let wal_backup = global_timelines.get_wal_backup();
+    let storage = wal_backup
+        .get_storage()
+        .ok_or(ApiError::BadRequest(anyhow::anyhow!(
+            "Remote Storage is not configured"
+        )))?;
 
     copy_timeline::handle_request(copy_timeline::Request{
         source_ttid,
         until_lsn: request_data.until_lsn,
         destination_ttid: TenantTimelineId::new(source_ttid.tenant_id, request_data.target_timeline_id),
-    }, global_timelines)
+    }, global_timelines, storage)
         .instrument(info_span!("copy_timeline", from=%source_ttid, to=%request_data.target_timeline_id, until_lsn=%request_data.until_lsn))
         .await
         .map_err(ApiError::InternalServerError)?;
@@ -538,6 +550,7 @@ async fn record_safekeeper_info(mut request: Request<Body>) -> Result<Response<B
         peer_horizon_lsn: sk_info.peer_horizon_lsn.0,
         safekeeper_connstr: sk_info.safekeeper_connstr.unwrap_or_else(|| "".to_owned()),
         http_connstr: sk_info.http_connstr.unwrap_or_else(|| "".to_owned()),
+        https_connstr: sk_info.https_connstr,
         backup_lsn: sk_info.backup_lsn.0,
         local_start_lsn: sk_info.local_start_lsn.0,
         availability_zone: None,

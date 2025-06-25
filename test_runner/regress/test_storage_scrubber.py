@@ -6,18 +6,21 @@ import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING
 
 import pytest
 from fixtures.common_types import TenantId, TenantShardId, TimelineId
 from fixtures.log_helper import log
-from fixtures.neon_fixtures import (
-    NeonEnv,
-    NeonEnvBuilder,
-)
 from fixtures.pg_version import PgVersion
 from fixtures.remote_storage import S3Storage, s3_storage
 from fixtures.utils import wait_until
 from fixtures.workload import Workload
+
+if TYPE_CHECKING:
+    from fixtures.neon_fixtures import (
+        NeonEnv,
+        NeonEnvBuilder,
+    )
 
 
 @pytest.mark.parametrize("shard_count", [None, 4])
@@ -72,7 +75,7 @@ def test_scrubber_tenant_snapshot(neon_env_builder: NeonEnvBuilder, shard_count:
         tenant_shard_ids = [TenantShardId(tenant_id, 0, 0)]
 
     # Let shards finish rescheduling to other pageservers: this makes the rest of the test more stable
-    # is it won't overlap with migrations
+    # as it won't overlap with migrations
     env.storage_controller.reconcile_until_idle(max_interval=0.1, timeout_secs=120)
 
     output_path = neon_env_builder.test_output_dir / "snapshot"
@@ -83,6 +86,13 @@ def test_scrubber_tenant_snapshot(neon_env_builder: NeonEnvBuilder, shard_count:
     assert len(os.listdir(output_path)) > 0
 
     workload.stop()
+
+    # Disable scheduling, so the storage controller doesn't migrate shards around
+    # while we are stopping pageservers
+    env.storage_controller.tenant_policy_update(tenant_id, {"scheduling": "Stop"})
+    env.storage_controller.allowed_errors.extend(
+        [".*Scheduling is disabled by policy Stop.*", ".*Skipping reconcile for policy Stop.*"]
+    )
 
     # Stop pageservers
     for pageserver in env.pageservers:
@@ -124,8 +134,15 @@ def test_scrubber_tenant_snapshot(neon_env_builder: NeonEnvBuilder, shard_count:
     for pageserver in env.pageservers:
         pageserver.start()
 
+    # Turn scheduling back on.
+    # We don't care about optimizations, so enable only essential scheduling
+    env.storage_controller.tenant_policy_update(tenant_id, {"scheduling": "Essential"})
+
     # Check we can read everything
     workload.validate()
+
+    # Reconcile to avoid a race between test shutdown and background reconciliation (#11278)
+    env.storage_controller.reconcile_until_idle()
 
 
 def drop_local_state(env: NeonEnv, tenant_id: TenantId):
@@ -323,6 +340,11 @@ def test_scrubber_physical_gc_timeline_deletion(neon_env_builder: NeonEnvBuilder
 
     env = neon_env_builder.init_configs()
     env.start()
+
+    for ps in env.pageservers:
+        ps.allowed_errors.extend(
+            [".*Timeline.* has been deleted.*", ".*Timeline.*was cancelled and cannot be used"]
+        )
 
     tenant_id = TenantId.generate()
     timeline_id = TimelineId.generate()

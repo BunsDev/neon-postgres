@@ -4,12 +4,14 @@
 MODULE_big = neon
 OBJS = \
 	$(WIN32RES) \
+	communicator.o \
 	extension_server.o \
 	file_cache.o \
 	hll.o \
 	libpagestore.o \
 	logical_replication_monitor.o \
 	neon.o \
+	neon_lwlsncache.o \
 	neon_pgversioncompat.o \
 	neon_perf_counters.o \
 	neon_utils.o \
@@ -19,7 +21,7 @@ OBJS = \
 	unstable_extensions.o \
 	walproposer.o \
 	walproposer_pg.o \
-	control_plane_connector.o \
+	neon_ddl_handler.o \
 	walsender_hooks.o
 
 PG_CPPFLAGS = -I$(libpq_srcdir)
@@ -34,6 +36,8 @@ DATA = \
 	neon--1.2--1.3.sql \
 	neon--1.3--1.4.sql \
 	neon--1.4--1.5.sql \
+	neon--1.5--1.6.sql \
+	neon--1.6--1.5.sql \
 	neon--1.5--1.4.sql \
 	neon--1.4--1.3.sql \
 	neon--1.3--1.2.sql \

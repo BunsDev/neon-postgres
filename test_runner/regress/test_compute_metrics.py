@@ -13,21 +13,21 @@ import _jsonnet
 import pytest
 import requests
 import yaml
-from fixtures.endpoint.http import EndpointHttpClient
 from fixtures.log_helper import log
 from fixtures.metrics import parse_metrics
 from fixtures.paths import BASE_DIR, COMPUTE_CONFIG_DIR
 from fixtures.utils import wait_until
-from prometheus_client.samples import Sample
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from types import TracebackType
     from typing import Self, TypedDict
 
+    from fixtures.endpoint.http import EndpointHttpClient
     from fixtures.neon_fixtures import NeonEnv
     from fixtures.pg_version import PgVersion
     from fixtures.port_distributor import PortDistributor
+    from prometheus_client.samples import Sample
 
     class Metric(TypedDict):
         metric_name: str
@@ -217,11 +217,11 @@ if SQL_EXPORTER is None:
             self, logs_dir: Path, config_file: Path, collector_file: Path, port: int
         ) -> None:
             # NOTE: Keep the version the same as in
-            # compute/Dockerfile.compute-node and Dockerfile.build-tools.
+            # compute/compute-node.Dockerfile and build-tools.Dockerfile.
             #
             # The "host" network mode allows sql_exporter to talk to the
             # endpoint which is running on the host.
-            super().__init__("docker.io/burningalchemist/sql_exporter:0.17.0", network_mode="host")
+            super().__init__("docker.io/burningalchemist/sql_exporter:0.17.3", network_mode="host")
 
             self.__logs_dir = logs_dir
             self.__port = port
@@ -418,7 +418,7 @@ def test_sql_exporter_metrics_e2e(
     pg_user = conn_options["user"]
     pg_dbname = conn_options["dbname"]
     pg_application_name = f"sql_exporter{stem_suffix}"
-    connstr = f"postgresql://{pg_user}@{pg_host}:{pg_port}/{pg_dbname}?sslmode=disable&application_name={pg_application_name}"
+    connstr = f"postgresql://{pg_user}@{pg_host}:{pg_port}/{pg_dbname}?sslmode=disable&application_name={pg_application_name}&pgaudit.log=none"
 
     def escape_go_filepath_match_characters(s: str) -> str:
         """
@@ -466,8 +466,13 @@ def test_perf_counters(neon_simple_env: NeonEnv):
     #
     # 1.5 is the minimum version to contain these views.
     cur.execute("CREATE EXTENSION neon VERSION '1.5'")
+    cur.execute("set neon.monitor_query_exec_time = on")
     cur.execute("SELECT * FROM neon_perf_counters")
     cur.execute("SELECT * FROM neon_backend_perf_counters")
+    cur.execute(
+        "select value from neon_backend_perf_counters where metric='query_time_seconds_count' and pid=pg_backend_pid()"
+    )
+    assert cur.fetchall()[0][0] == 2
 
 
 def collect_metric(

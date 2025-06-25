@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use camino::Utf8PathBuf;
 use once_cell::sync::Lazy;
+use pem::Pem;
 use remote_storage::RemoteStorageConfig;
-use reqwest::Certificate;
 use storage_broker::Uri;
 use tokio::runtime::Runtime;
 use utils::auth::SwappableJwtAuth;
@@ -73,6 +73,7 @@ pub mod defaults {
 
     pub const DEFAULT_SSL_KEY_FILE: &str = "server.key";
     pub const DEFAULT_SSL_CERT_FILE: &str = "server.crt";
+    pub const DEFAULT_SSL_CERT_RELOAD_PERIOD: &str = "60s";
 }
 
 #[derive(Debug, Clone)]
@@ -118,13 +119,10 @@ pub struct SafeKeeperConf {
     pub max_delta_for_fanout: Option<u64>,
     pub ssl_key_file: Utf8PathBuf,
     pub ssl_cert_file: Utf8PathBuf,
-    pub ssl_ca_cert: Option<Certificate>,
-}
-
-impl SafeKeeperConf {
-    pub fn is_wal_backup_enabled(&self) -> bool {
-        self.remote_storage.is_some() && self.wal_backup_enabled
-    }
+    pub ssl_cert_reload_period: Duration,
+    pub ssl_ca_certs: Vec<Pem>,
+    pub use_https_safekeeper_api: bool,
+    pub enable_tls_wal_service_api: bool,
 }
 
 impl SafeKeeperConf {
@@ -166,7 +164,10 @@ impl SafeKeeperConf {
             max_delta_for_fanout: None,
             ssl_key_file: Utf8PathBuf::from(defaults::DEFAULT_SSL_KEY_FILE),
             ssl_cert_file: Utf8PathBuf::from(defaults::DEFAULT_SSL_CERT_FILE),
-            ssl_ca_cert: None,
+            ssl_cert_reload_period: Duration::from_secs(60),
+            ssl_ca_certs: Vec::new(),
+            use_https_safekeeper_api: false,
+            enable_tls_wal_service_api: false,
         }
     }
 }
@@ -203,4 +204,13 @@ pub static WAL_BACKUP_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .enable_all()
         .build()
         .expect("Failed to create WAL backup runtime")
+});
+
+pub static BACKGROUND_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_name("background worker")
+        .worker_threads(1) // there is only one task now (ssl certificate reloading), having more threads doesn't make sense
+        .enable_all()
+        .build()
+        .expect("Failed to create background runtime")
 });

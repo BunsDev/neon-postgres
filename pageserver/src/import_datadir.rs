@@ -27,7 +27,7 @@ use crate::context::RequestContext;
 use crate::metrics::WAL_INGEST;
 use crate::pgdatadir_mapping::*;
 use crate::tenant::Timeline;
-use crate::walingest::WalIngest;
+use crate::walingest::{WalIngest, WalIngestErrorKind};
 
 // Returns checkpoint LSN from controlfile
 pub fn get_lsn_from_controlfile(path: &Utf8Path) -> Result<Lsn> {
@@ -157,9 +157,9 @@ async fn import_rel(
         .put_rel_creation(rel, nblocks as u32, ctx)
         .await
     {
-        match e {
-            RelationError::AlreadyExists => {
-                debug!("Relation {} already exist. We must be extending it.", rel)
+        match e.kind {
+            WalIngestErrorKind::RelationAlreadyExists(rel) => {
+                debug!("Relation {rel} already exists. We must be extending it.")
             }
             _ => return Err(e.into()),
         }
@@ -520,7 +520,7 @@ async fn import_file(
     }
 
     if file_path.starts_with("global") {
-        let spcnode = postgres_ffi::pg_constants::GLOBALTABLESPACE_OID;
+        let spcnode = postgres_ffi_types::constants::GLOBALTABLESPACE_OID;
         let dbnode = 0;
 
         match file_name.as_ref() {
@@ -553,7 +553,7 @@ async fn import_file(
             }
         }
     } else if file_path.starts_with("base") {
-        let spcnode = pg_constants::DEFAULTTABLESPACE_OID;
+        let spcnode = postgres_ffi_types::constants::DEFAULTTABLESPACE_OID;
         let dbnode: u32 = file_path
             .iter()
             .nth(1)

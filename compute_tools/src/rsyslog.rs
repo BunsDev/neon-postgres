@@ -27,6 +27,40 @@ fn get_rsyslog_pid() -> Option<String> {
     }
 }
 
+fn wait_for_rsyslog_pid() -> Result<String, anyhow::Error> {
+    const MAX_WAIT: Duration = Duration::from_secs(5);
+    const INITIAL_SLEEP: Duration = Duration::from_millis(2);
+
+    let mut sleep_duration = INITIAL_SLEEP;
+    let start = std::time::Instant::now();
+    let mut attempts = 1;
+
+    for attempt in 1.. {
+        attempts = attempt;
+        match get_rsyslog_pid() {
+            Some(pid) => return Ok(pid),
+            None => {
+                if start.elapsed() >= MAX_WAIT {
+                    break;
+                }
+                info!(
+                    "rsyslogd is not running, attempt {}. Sleeping for {} ms",
+                    attempt,
+                    sleep_duration.as_millis()
+                );
+                std::thread::sleep(sleep_duration);
+                sleep_duration *= 2;
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "rsyslogd is not running after waiting for {} seconds and {} attempts",
+        attempts,
+        start.elapsed().as_secs()
+    ))
+}
+
 // Restart rsyslogd to apply the new configuration.
 // This is necessary, because there is no other way to reload the rsyslog configuration.
 //
@@ -36,27 +70,29 @@ fn get_rsyslog_pid() -> Option<String> {
 // TODO: test it properly
 //
 fn restart_rsyslog() -> Result<()> {
-    let old_pid = get_rsyslog_pid().context("rsyslogd is not running")?;
-    info!("rsyslogd is running with pid: {}, restart it", old_pid);
-
     // kill it to restart
     let _ = Command::new("pkill")
         .arg("rsyslogd")
         .output()
-        .context("Failed to stop rsyslogd")?;
+        .context("Failed to restart rsyslogd")?;
+
+    // ensure rsyslogd is running
+    wait_for_rsyslog_pid()?;
 
     Ok(())
 }
 
 pub fn configure_audit_rsyslog(
     log_directory: String,
-    tag: &str,
+    endpoint_id: &str,
+    project_id: &str,
     remote_endpoint: &str,
 ) -> Result<()> {
     let config_content: String = format!(
         include_str!("config_template/compute_audit_rsyslog_template.conf"),
         log_directory = log_directory,
-        tag = tag,
+        endpoint_id = endpoint_id,
+        project_id = project_id,
         remote_endpoint = remote_endpoint
     );
 
@@ -119,16 +155,9 @@ impl<'a> PostgresLogsRsyslogConfig<'a> {
         };
         Ok(config_content)
     }
-
-    /// Returns the default host for otel collector that receives Postgres logs
-    pub fn default_host(project_id: &str) -> String {
-        format!(
-            "config-{}-collector.neon-telemetry.svc.cluster.local:10514",
-            project_id
-        )
-    }
 }
 
+/// Writes rsyslogd configuration for Postgres logs export and restarts rsyslog.
 pub fn configure_postgres_logs_export(conf: PostgresLogsRsyslogConfig) -> Result<()> {
     let new_config = conf.build()?;
     let current_config = PostgresLogsRsyslogConfig::current_config()?;
@@ -138,15 +167,11 @@ pub fn configure_postgres_logs_export(conf: PostgresLogsRsyslogConfig) -> Result
         return Ok(());
     }
 
-    // When new config is empty we can simply remove the configuration file.
+    // Nothing to configure
     if new_config.is_empty() {
-        info!("removing rsyslog config file: {}", POSTGRES_LOGS_CONF_PATH);
-        match std::fs::remove_file(POSTGRES_LOGS_CONF_PATH) {
-            Ok(_) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-        restart_rsyslog()?;
+        // When the configuration is removed, PostgreSQL will stop sending data
+        // to the files watched by rsyslog, so restarting rsyslog is more effort
+        // than just ignoring this change.
         return Ok(());
     }
 
@@ -260,17 +285,6 @@ mod tests {
             let conf = PostgresLogsRsyslogConfig::new(Some("invalid"));
             let res = conf.build();
             assert!(res.is_err());
-        }
-
-        {
-            // Verify config with default host
-            let host = PostgresLogsRsyslogConfig::default_host("shy-breeze-123");
-            let conf = PostgresLogsRsyslogConfig::new(Some(&host));
-            let res = conf.build();
-            assert!(res.is_ok());
-            let conf_str = res.unwrap();
-            assert!(conf_str.contains(r#"shy-breeze-123"#));
-            assert!(conf_str.contains(r#"port="10514""#));
         }
     }
 }

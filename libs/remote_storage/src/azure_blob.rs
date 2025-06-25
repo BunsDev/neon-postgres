@@ -10,12 +10,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{env, io};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use azure_core::request_options::{IfMatchCondition, MaxResults, Metadata, Range};
 use azure_core::{Continuable, HttpClient, RetryOptions, TransportOptions};
 use azure_storage::StorageCredentials;
-use azure_storage_blobs::blob::CopyStatus;
 use azure_storage_blobs::blob::operations::GetBlobBuilder;
+use azure_storage_blobs::blob::{Blob, CopyStatus};
+use azure_storage_blobs::container::operations::ListBlobsBuilder;
 use azure_storage_blobs::prelude::{ClientBuilder, ContainerClient};
 use bytes::Bytes;
 use futures::FutureExt;
@@ -36,6 +37,7 @@ use crate::metrics::{AttemptOutcome, RequestKind, start_measuring_requests};
 use crate::{
     ConcurrencyLimiter, Download, DownloadError, DownloadKind, DownloadOpts, Listing, ListingMode,
     ListingObject, RemotePath, RemoteStorage, StorageMetadata, TimeTravelError, TimeoutOrCancel,
+    Version, VersionKind,
 };
 
 pub struct AzureBlobStorage {
@@ -253,53 +255,15 @@ impl AzureBlobStorage {
         download
     }
 
-    async fn permit(
-        &self,
-        kind: RequestKind,
-        cancel: &CancellationToken,
-    ) -> Result<tokio::sync::SemaphorePermit<'_>, Cancelled> {
-        let acquire = self.concurrency_limiter.acquire(kind);
-
-        tokio::select! {
-            permit = acquire => Ok(permit.expect("never closed")),
-            _ = cancel.cancelled() => Err(Cancelled),
-        }
-    }
-
-    pub fn container_name(&self) -> &str {
-        &self.container_name
-    }
-}
-
-fn to_azure_metadata(metadata: StorageMetadata) -> Metadata {
-    let mut res = Metadata::new();
-    for (k, v) in metadata.0.into_iter() {
-        res.insert(k, v);
-    }
-    res
-}
-
-fn to_download_error(error: azure_core::Error) -> DownloadError {
-    if let Some(http_err) = error.as_http_error() {
-        match http_err.status() {
-            StatusCode::NotFound => DownloadError::NotFound,
-            StatusCode::NotModified => DownloadError::Unmodified,
-            StatusCode::BadRequest => DownloadError::BadInput(anyhow::Error::new(error)),
-            _ => DownloadError::Other(anyhow::Error::new(error)),
-        }
-    } else {
-        DownloadError::Other(error.into())
-    }
-}
-
-impl RemoteStorage for AzureBlobStorage {
-    fn list_streaming(
+    fn list_streaming_for_fn<T: Default + ListingCollector>(
         &self,
         prefix: Option<&RemotePath>,
         mode: ListingMode,
         max_keys: Option<NonZeroU32>,
         cancel: &CancellationToken,
-    ) -> impl Stream<Item = Result<Listing, DownloadError>> {
+        request_kind: RequestKind,
+        customize_builder: impl Fn(ListBlobsBuilder) -> ListBlobsBuilder,
+    ) -> impl Stream<Item = Result<T, DownloadError>> {
         // get the passed prefix or if it is not set use prefix_in_bucket value
         let list_prefix = prefix.map(|p| self.relative_path_to_name(p)).or_else(|| {
             self.prefix_in_container.clone().map(|mut s| {
@@ -311,7 +275,7 @@ impl RemoteStorage for AzureBlobStorage {
         });
 
         async_stream::stream! {
-            let _permit = self.permit(RequestKind::List, cancel).await?;
+            let _permit = self.permit(request_kind, cancel).await?;
 
             let mut builder = self.client.list_blobs();
 
@@ -326,6 +290,8 @@ impl RemoteStorage for AzureBlobStorage {
             if let Some(limit) = self.max_keys_per_list_response {
                 builder = builder.max_results(MaxResults::new(limit));
             }
+
+            builder = customize_builder(builder);
 
             let mut next_marker = None;
 
@@ -365,11 +331,18 @@ impl RemoteStorage for AzureBlobStorage {
                 if let Err(DownloadError::Timeout) = &next_item {
                     timeout_try_cnt += 1;
                     if timeout_try_cnt <= 5 {
-                        continue;
+                        continue 'outer;
                     }
                 }
 
-                let next_item = next_item?;
+                let next_item = match next_item {
+                    Ok(next_item) => next_item,
+                    Err(e) => {
+                        // The error is potentially retryable, so we must rewind the loop after yielding.
+                        yield Err(e);
+                        continue 'outer;
+                    },
+                };
 
                 // Log a warning if we saw two timeouts in a row before a successful request
                 if timeout_try_cnt > 2 {
@@ -382,26 +355,20 @@ impl RemoteStorage for AzureBlobStorage {
                     break;
                 };
 
-                let mut res = Listing::default();
+                let mut res = T::default();
                 next_marker = entry.continuation();
                 let prefix_iter = entry
                     .blobs
                     .prefixes()
                     .map(|prefix| self.name_to_relative_path(&prefix.name));
-                res.prefixes.extend(prefix_iter);
+                res.add_prefixes(self, prefix_iter);
 
                 let blob_iter = entry
                     .blobs
-                    .blobs()
-                    .map(|k| ListingObject{
-                        key: self.name_to_relative_path(&k.name),
-                        last_modified: k.properties.last_modified.into(),
-                        size: k.properties.content_length,
-                    }
-                );
+                    .blobs();
 
                 for key in blob_iter {
-                    res.keys.push(key);
+                    res.add_blob(self, key);
 
                     if let Some(mut mk) = max_keys {
                         assert!(mk > 0);
@@ -421,6 +388,144 @@ impl RemoteStorage for AzureBlobStorage {
                 }
             }
         }
+    }
+
+    async fn permit(
+        &self,
+        kind: RequestKind,
+        cancel: &CancellationToken,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, Cancelled> {
+        let acquire = self.concurrency_limiter.acquire(kind);
+
+        tokio::select! {
+            permit = acquire => Ok(permit.expect("never closed")),
+            _ = cancel.cancelled() => Err(Cancelled),
+        }
+    }
+
+    pub fn container_name(&self) -> &str {
+        &self.container_name
+    }
+
+    async fn list_versions_with_permit(
+        &self,
+        _permit: &tokio::sync::SemaphorePermit<'_>,
+        prefix: Option<&RemotePath>,
+        mode: ListingMode,
+        max_keys: Option<NonZeroU32>,
+        cancel: &CancellationToken,
+    ) -> Result<crate::VersionListing, DownloadError> {
+        let customize_builder = |mut builder: ListBlobsBuilder| {
+            builder = builder.include_versions(true);
+            // We do not return this info back to `VersionListing` yet.
+            builder = builder.include_deleted(true);
+            builder
+        };
+        let kind = RequestKind::ListVersions;
+
+        let mut stream = std::pin::pin!(self.list_streaming_for_fn(
+            prefix,
+            mode,
+            max_keys,
+            cancel,
+            kind,
+            customize_builder
+        ));
+        let mut combined: crate::VersionListing =
+            stream.next().await.expect("At least one item required")?;
+        while let Some(list) = stream.next().await {
+            let list = list?;
+            combined.versions.extend(list.versions.into_iter());
+        }
+        Ok(combined)
+    }
+}
+
+trait ListingCollector {
+    fn add_prefixes(&mut self, abs: &AzureBlobStorage, prefix_it: impl Iterator<Item = RemotePath>);
+    fn add_blob(&mut self, abs: &AzureBlobStorage, blob: &Blob);
+}
+
+impl ListingCollector for Listing {
+    fn add_prefixes(
+        &mut self,
+        _abs: &AzureBlobStorage,
+        prefix_it: impl Iterator<Item = RemotePath>,
+    ) {
+        self.prefixes.extend(prefix_it);
+    }
+    fn add_blob(&mut self, abs: &AzureBlobStorage, blob: &Blob) {
+        self.keys.push(ListingObject {
+            key: abs.name_to_relative_path(&blob.name),
+            last_modified: blob.properties.last_modified.into(),
+            size: blob.properties.content_length,
+        });
+    }
+}
+
+impl ListingCollector for crate::VersionListing {
+    fn add_prefixes(
+        &mut self,
+        _abs: &AzureBlobStorage,
+        _prefix_it: impl Iterator<Item = RemotePath>,
+    ) {
+        // nothing
+    }
+    fn add_blob(&mut self, abs: &AzureBlobStorage, blob: &Blob) {
+        let id = crate::VersionId(blob.version_id.clone().expect("didn't find version ID"));
+        self.versions.push(crate::Version {
+            key: abs.name_to_relative_path(&blob.name),
+            last_modified: blob.properties.last_modified.into(),
+            kind: crate::VersionKind::Version(id),
+        });
+    }
+}
+
+fn to_azure_metadata(metadata: StorageMetadata) -> Metadata {
+    let mut res = Metadata::new();
+    for (k, v) in metadata.0.into_iter() {
+        res.insert(k, v);
+    }
+    res
+}
+
+fn to_download_error(error: azure_core::Error) -> DownloadError {
+    if let Some(http_err) = error.as_http_error() {
+        match http_err.status() {
+            StatusCode::NotFound => DownloadError::NotFound,
+            StatusCode::NotModified => DownloadError::Unmodified,
+            StatusCode::BadRequest => DownloadError::BadInput(anyhow::Error::new(error)),
+            _ => DownloadError::Other(anyhow::Error::new(error)),
+        }
+    } else {
+        DownloadError::Other(error.into())
+    }
+}
+
+impl RemoteStorage for AzureBlobStorage {
+    fn list_streaming(
+        &self,
+        prefix: Option<&RemotePath>,
+        mode: ListingMode,
+        max_keys: Option<NonZeroU32>,
+        cancel: &CancellationToken,
+    ) -> impl Stream<Item = Result<Listing, DownloadError>> {
+        let customize_builder = |builder| builder;
+        let kind = RequestKind::ListVersions;
+        self.list_streaming_for_fn(prefix, mode, max_keys, cancel, kind, customize_builder)
+    }
+
+    async fn list_versions(
+        &self,
+        prefix: Option<&RemotePath>,
+        mode: ListingMode,
+        max_keys: Option<NonZeroU32>,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<crate::VersionListing, DownloadError> {
+        let kind = RequestKind::ListVersions;
+        let permit = self.permit(kind, cancel).await?;
+        self.list_versions_with_permit(&permit, prefix, mode, max_keys, cancel)
+            .await
     }
 
     async fn head_object(
@@ -532,7 +637,12 @@ impl RemoteStorage for AzureBlobStorage {
         let mut builder = blob_client.get();
 
         if let Some(ref etag) = opts.etag {
-            builder = builder.if_match(IfMatchCondition::NotMatch(etag.to_string()))
+            builder = builder.if_match(IfMatchCondition::NotMatch(etag.to_string()));
+        }
+
+        if let Some(ref version_id) = opts.version_id {
+            let version_id = azure_storage_blobs::prelude::VersionId::new(version_id.0.clone());
+            builder = builder.blob_versioning(version_id);
         }
 
         if let Some((start, end)) = opts.byte_range() {
@@ -710,14 +820,159 @@ impl RemoteStorage for AzureBlobStorage {
 
     async fn time_travel_recover(
         &self,
-        _prefix: Option<&RemotePath>,
-        _timestamp: SystemTime,
-        _done_if_after: SystemTime,
-        _cancel: &CancellationToken,
+        prefix: Option<&RemotePath>,
+        timestamp: SystemTime,
+        done_if_after: SystemTime,
+        cancel: &CancellationToken,
+        _complexity_limit: Option<NonZeroU32>,
     ) -> Result<(), TimeTravelError> {
-        // TODO use Azure point in time recovery feature for this
-        // https://learn.microsoft.com/en-us/azure/storage/blobs/point-in-time-restore-overview
-        Err(TimeTravelError::Unimplemented)
+        let msg = "PLEASE NOTE: Azure Blob storage time-travel recovery may not work as expected "
+            .to_string()
+            + "for some specific files. If a file gets deleted but then overwritten and we want to recover "
+            + "to the time during the file was not present, this functionality will recover the file. Only "
+            + "use the functionality for services that can tolerate this. For example, recovering a state of the "
+            + "pageserver tenants.";
+        tracing::error!("{}", msg);
+
+        let kind = RequestKind::TimeTravel;
+        let permit = self.permit(kind, cancel).await?;
+
+        let mode = ListingMode::NoDelimiter;
+        let version_listing = self
+            .list_versions_with_permit(&permit, prefix, mode, None, cancel)
+            .await
+            .map_err(|err| match err {
+                DownloadError::Other(e) => TimeTravelError::Other(e),
+                DownloadError::Cancelled => TimeTravelError::Cancelled,
+                other => TimeTravelError::Other(other.into()),
+            })?;
+        let versions_and_deletes = version_listing.versions;
+
+        tracing::info!(
+            "Built list for time travel with {} versions and deletions",
+            versions_and_deletes.len()
+        );
+
+        // Work on the list of references instead of the objects directly,
+        // otherwise we get lifetime errors in the sort_by_key call below.
+        let mut versions_and_deletes = versions_and_deletes.iter().collect::<Vec<_>>();
+
+        versions_and_deletes.sort_by_key(|vd| (&vd.key, &vd.last_modified));
+
+        let mut vds_for_key = HashMap::<_, Vec<_>>::new();
+
+        for vd in &versions_and_deletes {
+            let Version { key, .. } = &vd;
+            let version_id = vd.version_id().map(|v| v.0.as_str());
+            if version_id == Some("null") {
+                return Err(TimeTravelError::Other(anyhow!(
+                    "Received ListVersions response for key={key} with version_id='null', \
+                        indicating either disabled versioning, or legacy objects with null version id values"
+                )));
+            }
+            tracing::trace!("Parsing version key={key} kind={:?}", vd.kind);
+
+            vds_for_key.entry(key).or_default().push(vd);
+        }
+
+        let warn_threshold = 3;
+        let max_retries = 10;
+        let is_permanent = |e: &_| matches!(e, TimeTravelError::Cancelled);
+
+        for (key, versions) in vds_for_key {
+            let last_vd = versions.last().unwrap();
+            let key = self.relative_path_to_name(key);
+            if last_vd.last_modified > done_if_after {
+                tracing::debug!("Key {key} has version later than done_if_after, skipping");
+                continue;
+            }
+            // the version we want to restore to.
+            let version_to_restore_to =
+                match versions.binary_search_by_key(&timestamp, |tpl| tpl.last_modified) {
+                    Ok(v) => v,
+                    Err(e) => e,
+                };
+            if version_to_restore_to == versions.len() {
+                tracing::debug!("Key {key} has no changes since timestamp, skipping");
+                continue;
+            }
+            let mut do_delete = false;
+            if version_to_restore_to == 0 {
+                // All versions more recent, so the key didn't exist at the specified time point.
+                tracing::debug!(
+                    "All {} versions more recent for {key}, deleting",
+                    versions.len()
+                );
+                do_delete = true;
+            } else {
+                match &versions[version_to_restore_to - 1] {
+                    Version {
+                        kind: VersionKind::Version(version_id),
+                        ..
+                    } => {
+                        let source_url = format!(
+                            "{}/{}?versionid={}",
+                            self.client
+                                .url()
+                                .map_err(|e| TimeTravelError::Other(anyhow!("{e}")))?,
+                            key,
+                            version_id.0
+                        );
+                        tracing::debug!(
+                            "Promoting old version {} for {key} at {}...",
+                            version_id.0,
+                            source_url
+                        );
+                        backoff::retry(
+                            || async {
+                                let blob_client = self.client.blob_client(key.clone());
+                                let op = blob_client.copy(Url::from_str(&source_url).unwrap());
+                                tokio::select! {
+                                    res = op => res.map_err(|e| TimeTravelError::Other(e.into())),
+                                    _ = cancel.cancelled() => Err(TimeTravelError::Cancelled),
+                                }
+                            },
+                            is_permanent,
+                            warn_threshold,
+                            max_retries,
+                            "copying object version for time_travel_recover",
+                            cancel,
+                        )
+                        .await
+                        .ok_or_else(|| TimeTravelError::Cancelled)
+                        .and_then(|x| x)?;
+                        tracing::info!(?version_id, %key, "Copied old version in Azure blob storage");
+                    }
+                    Version {
+                        kind: VersionKind::DeletionMarker,
+                        ..
+                    } => {
+                        do_delete = true;
+                    }
+                }
+            };
+            if do_delete {
+                if matches!(last_vd.kind, VersionKind::DeletionMarker) {
+                    // Key has since been deleted (but there was some history), no need to do anything
+                    tracing::debug!("Key {key} already deleted, skipping.");
+                } else {
+                    tracing::debug!("Deleting {key}...");
+
+                    self.delete(&RemotePath::from_string(&key).unwrap(), cancel)
+                        .await
+                        .map_err(|e| {
+                            // delete_oid0 will use TimeoutOrCancel
+                            if TimeoutOrCancel::caused_by_cancel(&e) {
+                                TimeTravelError::Cancelled
+                            } else {
+                                TimeTravelError::Other(e)
+                            }
+                        })?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -801,8 +1056,7 @@ where
             // that support needs to be hacked in.
             //
             // including {self:?} into the message would be useful, but unsure how to unproject.
-            _ => std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            _ => std::task::Poll::Ready(Err(std::io::Error::other(
                 "cloned or initial values cannot be read",
             ))),
         }
@@ -855,7 +1109,7 @@ where
         };
         Err(azure_core::error::Error::new(
             azure_core::error::ErrorKind::Io,
-            std::io::Error::new(std::io::ErrorKind::Other, msg),
+            std::io::Error::other(msg),
         ))
     }
 

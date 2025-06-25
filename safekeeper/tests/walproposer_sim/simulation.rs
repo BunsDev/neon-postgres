@@ -87,6 +87,7 @@ impl WalProposer {
         let config = Config {
             ttid,
             safekeepers_list: addrs,
+            safekeeper_conninfo_options: String::new(),
             safekeeper_reconnect_timeout: 1000,
             safekeeper_connection_timeout: 5000,
             sync_safekeepers,
@@ -216,7 +217,7 @@ impl TestConfig {
         ];
 
         let server_ids = [servers[0].id, servers[1].id, servers[2].id];
-        let safekeepers_addrs = server_ids.map(|id| format!("node:{}", id)).to_vec();
+        let safekeepers_addrs = server_ids.map(|id| format!("node:{id}")).to_vec();
 
         let ttid = TenantTimelineId::generate();
 

@@ -44,6 +44,15 @@ pub(crate) struct StorageControllerMetricGroup {
     /// Size of the in-memory map of pageserver_nodes
     pub(crate) storage_controller_pageserver_nodes: measured::Gauge,
 
+    /// Count of how many pageserver nodes from in-memory map have https configured
+    pub(crate) storage_controller_https_pageserver_nodes: measured::Gauge,
+
+    /// Size of the in-memory map of safekeeper_nodes
+    pub(crate) storage_controller_safekeeper_nodes: measured::Gauge,
+
+    /// Count of how many safekeeper nodes from in-memory map have https configured
+    pub(crate) storage_controller_https_safekeeper_nodes: measured::Gauge,
+
     /// Reconciler tasks completed, broken down by success/failure/cancelled
     pub(crate) storage_controller_reconcile_complete:
         measured::CounterVec<ReconcileCompleteLabelGroupSet>,
@@ -88,7 +97,7 @@ pub(crate) struct StorageControllerMetricGroup {
     /// Count of HTTP requests to the safekeeper that resulted in an error,
     /// broken down by the safekeeper node id, request name and method
     pub(crate) storage_controller_safekeeper_request_error:
-        measured::CounterVec<PageserverRequestLabelGroupSet>,
+        measured::CounterVec<SafekeeperRequestLabelGroupSet>,
 
     /// Latency of HTTP requests to the pageserver, broken down by pageserver
     /// node id, request name and method. This include both successful and unsuccessful
@@ -102,7 +111,7 @@ pub(crate) struct StorageControllerMetricGroup {
     /// requests.
     #[metric(metadata = histogram::Thresholds::exponential_buckets(0.1, 2.0))]
     pub(crate) storage_controller_safekeeper_request_latency:
-        measured::HistogramVec<PageserverRequestLabelGroupSet, 5>,
+        measured::HistogramVec<SafekeeperRequestLabelGroupSet, 5>,
 
     /// Count of pass-through HTTP requests to the pageserver that resulted in an error,
     /// broken down by the pageserver node id, request name and method
@@ -127,9 +136,18 @@ pub(crate) struct StorageControllerMetricGroup {
 
     pub(crate) storage_controller_leadership_status: measured::GaugeVec<LeadershipStatusGroupSet>,
 
-    /// HTTP request status counters for handled requests
+    /// Indicator of stucked (long-running) reconciles, broken down by tenant, shard and sequence.
+    /// The metric is automatically removed once the reconciliation completes.
     pub(crate) storage_controller_reconcile_long_running:
         measured::CounterVec<ReconcileLongRunningLabelGroupSet>,
+
+    /// Indicator of safekeeper reconciler queue depth, broken down by safekeeper, excluding ongoing reconciles.
+    pub(crate) storage_controller_safekeeper_reconciles_queued:
+        measured::GaugeVec<SafekeeperReconcilerLabelGroupSet>,
+
+    /// Indicator of completed safekeeper reconciles, broken down by safekeeper.
+    pub(crate) storage_controller_safekeeper_reconciles_complete:
+        measured::CounterVec<SafekeeperReconcilerLabelGroupSet>,
 }
 
 impl StorageControllerMetrics {
@@ -201,6 +219,16 @@ pub(crate) struct PageserverRequestLabelGroup<'a> {
     pub(crate) method: Method,
 }
 
+#[derive(measured::LabelGroup, Clone)]
+#[label(set = SafekeeperRequestLabelGroupSet)]
+pub(crate) struct SafekeeperRequestLabelGroup<'a> {
+    #[label(dynamic_with = lasso::ThreadedRodeo, default)]
+    pub(crate) safekeeper_id: &'a str,
+    #[label(dynamic_with = lasso::ThreadedRodeo, default)]
+    pub(crate) path: &'a str,
+    pub(crate) method: Method,
+}
+
 #[derive(measured::LabelGroup)]
 #[label(set = DatabaseQueryErrorLabelGroupSet)]
 pub(crate) struct DatabaseQueryErrorLabelGroup {
@@ -246,6 +274,17 @@ pub(crate) enum Method {
     Post,
     Delete,
     Other,
+}
+
+#[derive(measured::LabelGroup, Clone)]
+#[label(set = SafekeeperReconcilerLabelGroupSet)]
+pub(crate) struct SafekeeperReconcilerLabelGroup<'a> {
+    #[label(dynamic_with = lasso::ThreadedRodeo, default)]
+    pub(crate) sk_az: &'a str,
+    #[label(dynamic_with = lasso::ThreadedRodeo, default)]
+    pub(crate) sk_node_id: &'a str,
+    #[label(dynamic_with = lasso::ThreadedRodeo, default)]
+    pub(crate) sk_hostname: &'a str,
 }
 
 impl From<hyper::Method> for Method {

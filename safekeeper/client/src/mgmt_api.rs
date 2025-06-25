@@ -8,8 +8,8 @@ use std::error::Error as _;
 use http_utils::error::HttpErrorBody;
 use reqwest::{IntoUrl, Method, StatusCode};
 use safekeeper_api::models::{
-    self, PullTimelineRequest, PullTimelineResponse, SafekeeperUtilization, TimelineCreateRequest,
-    TimelineStatus,
+    self, PullTimelineRequest, PullTimelineResponse, SafekeeperStatus, SafekeeperUtilization,
+    TimelineCreateRequest, TimelineStatus,
 };
 use utils::id::{NodeId, TenantId, TimelineId};
 use utils::logging::SecretString;
@@ -38,9 +38,8 @@ pub enum Error {
     #[error("Cancelled")]
     Cancelled,
 
-    /// Failed to create client.
-    #[error("create client: {0}{}", .0.source().map(|e| format!(": {e}")).unwrap_or_default())]
-    CreateClient(reqwest::Error),
+    #[error("request timed out: {0}")]
+    Timeout(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -81,13 +80,10 @@ impl Client {
         }
     }
 
-    pub async fn create_timeline(&self, req: &TimelineCreateRequest) -> Result<TimelineStatus> {
-        let uri = format!(
-            "{}/v1/tenant/{}/timeline/{}",
-            self.mgmt_api_endpoint, req.tenant_id, req.timeline_id
-        );
+    pub async fn create_timeline(&self, req: &TimelineCreateRequest) -> Result<reqwest::Response> {
+        let uri = format!("{}/v1/tenant/timeline", self.mgmt_api_endpoint);
         let resp = self.post(&uri, req).await?;
-        resp.json().await.map_err(Error::ReceiveBody)
+        Ok(resp)
     }
 
     pub async fn pull_timeline(&self, req: &PullTimelineRequest) -> Result<PullTimelineResponse> {
@@ -119,7 +115,31 @@ impl Client {
             "{}/v1/tenant/{}/timeline/{}",
             self.mgmt_api_endpoint, tenant_id, timeline_id
         );
-        let resp = self.request(Method::DELETE, &uri, ()).await?;
+        let resp = self
+            .request_maybe_body(Method::DELETE, &uri, None::<()>)
+            .await?;
+        resp.json().await.map_err(Error::ReceiveBody)
+    }
+
+    pub async fn switch_timeline_membership(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+        req: &models::TimelineMembershipSwitchRequest,
+    ) -> Result<models::TimelineMembershipSwitchResponse> {
+        let uri = format!(
+            "{}/v1/tenant/{}/timeline/{}/membership",
+            self.mgmt_api_endpoint, tenant_id, timeline_id
+        );
+        let resp = self.put(&uri, req).await?;
+        resp.json().await.map_err(Error::ReceiveBody)
+    }
+
+    pub async fn delete_tenant(&self, tenant_id: TenantId) -> Result<models::TenantDeleteResult> {
+        let uri = format!("{}/v1/tenant/{}", self.mgmt_api_endpoint, tenant_id);
+        let resp = self
+            .request_maybe_body(Method::DELETE, &uri, None::<()>)
+            .await?;
         resp.json().await.map_err(Error::ReceiveBody)
     }
 
@@ -163,6 +183,12 @@ impl Client {
         self.get(&uri).await
     }
 
+    pub async fn status(&self) -> Result<SafekeeperStatus> {
+        let uri = format!("{}/v1/status", self.mgmt_api_endpoint);
+        let resp = self.get(&uri).await?;
+        resp.json().await.map_err(Error::ReceiveBody)
+    }
+
     pub async fn utilization(&self) -> Result<SafekeeperUtilization> {
         let uri = format!("{}/v1/utilization", self.mgmt_api_endpoint);
         let resp = self.get(&uri).await?;
@@ -196,6 +222,16 @@ impl Client {
         uri: U,
         body: B,
     ) -> Result<reqwest::Response> {
+        self.request_maybe_body(method, uri, Some(body)).await
+    }
+
+    /// Send the request and check that the status code is good, with an optional body.
+    async fn request_maybe_body<B: serde::Serialize, U: reqwest::IntoUrl>(
+        &self,
+        method: Method,
+        uri: U,
+        body: Option<B>,
+    ) -> Result<reqwest::Response> {
         let res = self.request_noerror(method, uri, body).await?;
         let response = res.error_from_body().await?;
         Ok(response)
@@ -206,12 +242,15 @@ impl Client {
         &self,
         method: Method,
         uri: U,
-        body: B,
+        body: Option<B>,
     ) -> Result<reqwest::Response> {
         let mut req = self.client.request(method, uri);
         if let Some(value) = &self.authorization_header {
             req = req.header(reqwest::header::AUTHORIZATION, value.get_contents())
         }
-        req.json(&body).send().await.map_err(Error::ReceiveBody)
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        req.send().await.map_err(Error::ReceiveBody)
     }
 }

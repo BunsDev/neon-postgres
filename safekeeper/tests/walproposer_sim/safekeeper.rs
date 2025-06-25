@@ -182,7 +182,10 @@ pub fn run_server(os: NodeOs, disk: Arc<SafekeeperDisk>) -> Result<()> {
         max_delta_for_fanout: None,
         ssl_key_file: Utf8PathBuf::from(""),
         ssl_cert_file: Utf8PathBuf::from(""),
-        ssl_ca_cert: None,
+        ssl_cert_reload_period: Duration::ZERO,
+        ssl_ca_certs: Vec::new(),
+        use_https_safekeeper_api: false,
+        enable_tls_wal_service_api: false,
     };
 
     let mut global = GlobalMap::new(disk, conf.clone())?;
@@ -254,7 +257,7 @@ pub fn run_server(os: NodeOs, disk: Arc<SafekeeperDisk>) -> Result<()> {
                         let estr = e.to_string();
                         if !estr.contains("finished processing START_REPLICATION") {
                             warn!("conn {:?} error: {:?}", connection_id, e);
-                            panic!("unexpected error at safekeeper: {:#}", e);
+                            panic!("unexpected error at safekeeper: {e:#}");
                         }
                         conns.remove(&connection_id);
                         break;

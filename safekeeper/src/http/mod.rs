@@ -27,16 +27,10 @@ pub async fn task_main_http(
 pub async fn task_main_https(
     conf: Arc<SafeKeeperConf>,
     https_listener: std::net::TcpListener,
+    tls_config: Arc<rustls::ServerConfig>,
     global_timelines: Arc<GlobalTimelines>,
 ) -> anyhow::Result<()> {
-    let certs = http_utils::tls_certs::load_cert_chain(&conf.ssl_cert_file)?;
-    let key = http_utils::tls_certs::load_private_key(&conf.ssl_key_file)?;
-
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-
-    let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     let router = make_router(conf, global_timelines)
         .build()

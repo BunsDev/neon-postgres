@@ -5,11 +5,14 @@ import re
 import subprocess
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 from fixtures.log_helper import log
-from fixtures.neon_fixtures import NeonEnv, PgBin
 from fixtures.utils import USE_LFC
+
+if TYPE_CHECKING:
+    from fixtures.neon_fixtures import NeonEnv, PgBin
 
 
 @pytest.mark.timeout(600)
@@ -45,6 +48,8 @@ def test_lfc_resize(neon_simple_env: NeonEnv, pg_bin: PgBin):
 
     conn = endpoint.connect()
     cur = conn.cursor()
+
+    cur.execute("create extension neon")
 
     def get_lfc_size() -> tuple[int, int]:
         lfc_file_path = endpoint.lfc_path()
@@ -100,3 +105,23 @@ def test_lfc_resize(neon_simple_env: NeonEnv, pg_bin: PgBin):
         time.sleep(1)
 
     assert int(lfc_file_blocks) <= 128 * 1024
+
+    # Now test that number of rows returned by local_cache is the same as file_cache_used_pages.
+    # Perform several iterations to make cache cache content stabilized.
+    nretries = 10
+    while True:
+        cur.execute("select count(*) from local_cache")
+        local_cache_size = cur.fetchall()[0][0]
+
+        cur.execute(
+            "select lfc_value::bigint FROM neon_lfc_stats where lfc_key='file_cache_used_pages'"
+        )
+        used_pages = cur.fetchall()[0][0]
+
+        if local_cache_size == used_pages or nretries == 0:
+            break
+
+        nretries = nretries - 1
+        time.sleep(1)
+
+    assert local_cache_size == used_pages

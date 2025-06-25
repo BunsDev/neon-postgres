@@ -198,7 +198,7 @@ impl fmt::Display for CancelKeyData {
 
         // This format is more compact and might work better for logs.
         f.debug_tuple("CancelKeyData")
-            .field(&format_args!("{:x}", id))
+            .field(&format_args!("{id:x}"))
             .finish()
     }
 }
@@ -257,7 +257,7 @@ pub enum ProtocolError {
 impl ProtocolError {
     /// Proxy stream.rs uses only io::Error; provide it.
     pub fn into_io_error(self) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, self.to_string())
+        io::Error::other(self.to_string())
     }
 }
 
@@ -291,8 +291,7 @@ impl FeMessage {
         let len = (&buf[1..5]).read_u32::<BigEndian>().unwrap();
         if len < 4 {
             return Err(ProtocolError::Protocol(format!(
-                "invalid message length {}",
-                len
+                "invalid message length {len}"
             )));
         }
 
@@ -367,8 +366,7 @@ impl FeStartupPacket {
         #[allow(clippy::manual_range_contains)]
         if len < 8 || len > MAX_STARTUP_PACKET_LENGTH {
             return Err(ProtocolError::Protocol(format!(
-                "invalid startup packet message length {}",
-                len
+                "invalid startup packet message length {len}"
             )));
         }
 

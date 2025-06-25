@@ -20,7 +20,7 @@ use pageserver_api::models::{
 };
 use pageserver_api::shard::{ShardStripeSize, TenantShardId};
 use pageserver_client::mgmt_api::{self};
-use reqwest::{Method, StatusCode, Url};
+use reqwest::{Certificate, Method, StatusCode, Url};
 use storage_controller_client::control_api::Client;
 use utils::id::{NodeId, TenantId, TimelineId};
 
@@ -36,6 +36,10 @@ enum Command {
         listen_pg_addr: String,
         #[arg(long)]
         listen_pg_port: u16,
+        #[arg(long)]
+        listen_grpc_addr: Option<String>,
+        #[arg(long)]
+        listen_grpc_port: Option<u16>,
 
         #[arg(long)]
         listen_http_addr: String,
@@ -61,7 +65,13 @@ enum Command {
         #[arg(long)]
         scheduling: Option<NodeSchedulingPolicy>,
     },
+    // Set a node status as deleted.
     NodeDelete {
+        #[arg(long)]
+        node_id: NodeId,
+    },
+    /// Delete a tombstone of node from the storage controller.
+    NodeDeleteTombstone {
         #[arg(long)]
         node_id: NodeId,
     },
@@ -82,6 +92,8 @@ enum Command {
     },
     /// List nodes known to the storage controller
     Nodes {},
+    /// List soft deleted nodes known to the storage controller
+    NodeTombstones {},
     /// List tenants known to the storage controller
     Tenants {
         /// If this field is set, it will list the tenants on a specific node
@@ -274,7 +286,7 @@ struct Cli {
     jwt: Option<String>,
 
     #[arg(long)]
-    /// Trusted root CA certificate to use in https APIs.
+    /// Trusted root CA certificates to use in https APIs.
     ssl_ca_file: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -385,25 +397,33 @@ where
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let storcon_client = Client::new(cli.api.clone(), cli.jwt.clone());
-
-    let ssl_ca_cert = match &cli.ssl_ca_file {
+    let ssl_ca_certs = match &cli.ssl_ca_file {
         Some(ssl_ca_file) => {
             let buf = tokio::fs::read(ssl_ca_file).await?;
-            Some(reqwest::Certificate::from_pem(&buf)?)
+            Certificate::from_pem_bundle(&buf)?
         }
-        None => None,
+        None => Vec::new(),
     };
+
+    let mut http_client = reqwest::Client::builder();
+    for ssl_ca_cert in ssl_ca_certs {
+        http_client = http_client.add_root_certificate(ssl_ca_cert);
+    }
+    let http_client = http_client.build()?;
+
+    let storcon_client = Client::new(http_client.clone(), cli.api.clone(), cli.jwt.clone());
 
     let mut trimmed = cli.api.to_string();
     trimmed.pop();
-    let vps_client = mgmt_api::Client::new(trimmed, cli.jwt.as_deref(), ssl_ca_cert)?;
+    let vps_client = mgmt_api::Client::new(http_client.clone(), trimmed, cli.jwt.as_deref());
 
     match cli.command {
         Command::NodeRegister {
             node_id,
             listen_pg_addr,
             listen_pg_port,
+            listen_grpc_addr,
+            listen_grpc_port,
             listen_http_addr,
             listen_http_port,
             listen_https_port,
@@ -417,6 +437,8 @@ async fn main() -> anyhow::Result<()> {
                         node_id,
                         listen_pg_addr,
                         listen_pg_port,
+                        listen_grpc_addr,
+                        listen_grpc_port,
                         listen_http_addr,
                         listen_http_port,
                         listen_https_port,
@@ -627,7 +649,7 @@ async fn main() -> anyhow::Result<()> {
                 response
                     .new_shards
                     .iter()
-                    .map(|s| format!("{:?}", s))
+                    .map(|s| format!("{s:?}"))
                     .collect::<Vec<_>>()
                     .join(",")
             );
@@ -749,8 +771,8 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Tenant {tenant_id}");
             let mut table = comfy_table::Table::new();
-            table.add_row(["Policy", &format!("{:?}", policy)]);
-            table.add_row(["Stripe size", &format!("{:?}", stripe_size)]);
+            table.add_row(["Policy", &format!("{policy:?}")]);
+            table.add_row(["Stripe size", &format!("{stripe_size:?}")]);
             table.add_row(["Config", &serde_json::to_string_pretty(&config).unwrap()]);
             println!("{table}");
             println!("Shards:");
@@ -767,7 +789,7 @@ async fn main() -> anyhow::Result<()> {
                 let secondary = shard
                     .node_secondary
                     .iter()
-                    .map(|n| format!("{}", n))
+                    .map(|n| format!("{n}"))
                     .collect::<Vec<_>>()
                     .join(",");
 
@@ -841,7 +863,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             } else {
                 // Make it obvious to the user that since they've omitted an AZ, we're clearing it
-                eprintln!("Clearing preferred AZ for tenant {}", tenant_id);
+                eprintln!("Clearing preferred AZ for tenant {tenant_id}");
             }
 
             // Construct a request that modifies all the tenant's shards
@@ -894,6 +916,39 @@ async fn main() -> anyhow::Result<()> {
                 .dispatch::<(), ()>(Method::DELETE, format!("control/v1/node/{node_id}"), None)
                 .await?;
         }
+        Command::NodeDeleteTombstone { node_id } => {
+            storcon_client
+                .dispatch::<(), ()>(
+                    Method::DELETE,
+                    format!("debug/v1/tombstone/{node_id}"),
+                    None,
+                )
+                .await?;
+        }
+        Command::NodeTombstones {} => {
+            let mut resp = storcon_client
+                .dispatch::<(), Vec<NodeDescribeResponse>>(
+                    Method::GET,
+                    "debug/v1/tombstone".to_string(),
+                    None,
+                )
+                .await?;
+
+            resp.sort_by(|a, b| a.listen_http_addr.cmp(&b.listen_http_addr));
+
+            let mut table = comfy_table::Table::new();
+            table.set_header(["Id", "Hostname", "AZ", "Scheduling", "Availability"]);
+            for node in resp {
+                table.add_row([
+                    format!("{}", node.id),
+                    node.listen_http_addr,
+                    node.availability_zone_id,
+                    format!("{:?}", node.scheduling),
+                    format!("{:?}", node.availability),
+                ]);
+            }
+            println!("{table}");
+        }
         Command::TenantSetTimeBasedEviction {
             tenant_id,
             period,
@@ -935,7 +990,7 @@ async fn main() -> anyhow::Result<()> {
             let mut node_to_fill_descs = Vec::new();
 
             for desc in node_descs {
-                let to_drain = nodes.iter().any(|id| *id == desc.id);
+                let to_drain = nodes.contains(&desc.id);
                 if to_drain {
                     node_to_drain_descs.push(desc);
                 } else {
@@ -1050,7 +1105,7 @@ async fn main() -> anyhow::Result<()> {
             const DEFAULT_MIGRATE_CONCURRENCY: usize = 8;
             let mut stream = futures::stream::iter(moves)
                 .map(|mv| {
-                    let client = Client::new(cli.api.clone(), cli.jwt.clone());
+                    let client = Client::new(http_client.clone(), cli.api.clone(), cli.jwt.clone());
                     async move {
                         client
                             .dispatch::<TenantShardMigrateRequest, TenantShardMigrateResponse>(
@@ -1079,8 +1134,7 @@ async fn main() -> anyhow::Result<()> {
                     Err((tenant_shard_id, from, to, error)) => {
                         failure += 1;
                         println!(
-                            "Failed to migrate {} from node {} to node {}: {}",
-                            tenant_shard_id, from, to, error
+                            "Failed to migrate {tenant_shard_id} from node {from} to node {to}: {error}"
                         );
                     }
                 }
@@ -1222,8 +1276,7 @@ async fn main() -> anyhow::Result<()> {
             concurrency,
         } => {
             let mut path = format!(
-                "/v1/tenant/{}/timeline/{}/download_heatmap_layers",
-                tenant_shard_id, timeline_id,
+                "/v1/tenant/{tenant_shard_id}/timeline/{timeline_id}/download_heatmap_layers",
             );
 
             if let Some(c) = concurrency {
@@ -1248,8 +1301,7 @@ async fn watch_tenant_shard(
 ) -> anyhow::Result<()> {
     if let Some(until_migrated_to) = until_migrated_to {
         println!(
-            "Waiting for tenant shard {} to be migrated to node {}",
-            tenant_shard_id, until_migrated_to
+            "Waiting for tenant shard {tenant_shard_id} to be migrated to node {until_migrated_to}"
         );
     }
 
@@ -1272,7 +1324,7 @@ async fn watch_tenant_shard(
             "attached: {} secondary: {} {}",
             shard
                 .node_attached
-                .map(|n| format!("{}", n))
+                .map(|n| format!("{n}"))
                 .unwrap_or("none".to_string()),
             shard
                 .node_secondary
@@ -1286,15 +1338,12 @@ async fn watch_tenant_shard(
                 "(reconciler idle)"
             }
         );
-        println!("{}", summary);
+        println!("{summary}");
 
         // Maybe drop out if we finished migration
         if let Some(until_migrated_to) = until_migrated_to {
             if shard.node_attached == Some(until_migrated_to) && !shard.is_reconciling {
-                println!(
-                    "Tenant shard {} is now on node {}",
-                    tenant_shard_id, until_migrated_to
-                );
+                println!("Tenant shard {tenant_shard_id} is now on node {until_migrated_to}");
                 break;
             }
         }

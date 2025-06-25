@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 
 use pageserver_api::shard::ShardIdentity;
 use postgres_ffi::TimestampTz;
+use postgres_versioninfo::PgVersionId;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use utils::id::{NodeId, TenantId, TenantTimelineId, TimelineId};
@@ -13,7 +14,7 @@ use utils::pageserver_feedback::PageserverFeedback;
 use crate::membership::Configuration;
 use crate::{ServerInfo, Term};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SafekeeperStatus {
     pub id: NodeId,
 }
@@ -23,7 +24,7 @@ pub struct TimelineCreateRequest {
     pub tenant_id: TenantId,
     pub timeline_id: TimelineId,
     pub mconf: Configuration,
-    pub pg_version: u32,
+    pub pg_version: PgVersionId,
     pub system_id: Option<u64>,
     // By default WAL_SEGMENT_SIZE
     pub wal_seg_size: Option<u32>,
@@ -70,6 +71,7 @@ pub struct PeerInfo {
     pub ts: Instant,
     pub pg_connstr: String,
     pub http_connstr: String,
+    pub https_connstr: Option<String>,
 }
 
 pub type FullTransactionId = u64;
@@ -226,6 +228,8 @@ pub struct TimelineDeleteResult {
     pub dir_existed: bool,
 }
 
+pub type TenantDeleteResult = std::collections::HashMap<String, TimelineDeleteResult>;
+
 fn lsn_invalid() -> Lsn {
     Lsn::INVALID
 }
@@ -258,6 +262,8 @@ pub struct SkTimelineInfo {
     pub safekeeper_connstr: Option<String>,
     #[serde(default)]
     pub http_connstr: Option<String>,
+    #[serde(default)]
+    pub https_connstr: Option<String>,
     // Minimum of all active RO replicas flush LSN
     #[serde(default = "lsn_invalid")]
     pub standby_horizon: Lsn,
@@ -293,11 +299,13 @@ pub struct PullTimelineRequest {
     pub tenant_id: TenantId,
     pub timeline_id: TimelineId,
     pub http_hosts: Vec<String>,
+    pub ignore_tombstone: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PullTimelineResponse {
-    // Donor safekeeper host
-    pub safekeeper_host: String,
+    /// Donor safekeeper host.
+    /// None if no pull happened because the timeline already exists.
+    pub safekeeper_host: Option<String>,
     // TODO: add more fields?
 }

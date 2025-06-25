@@ -1,24 +1,30 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::background_process;
+use crate::local_env::{LocalEnv, NeonStorageControllerConf};
 use camino::{Utf8Path, Utf8PathBuf};
 use hyper0::Uri;
 use nix::unistd::Pid;
 use pageserver_api::controller_api::{
-    NodeConfigureRequest, NodeDescribeResponse, NodeRegisterRequest, TenantCreateRequest,
+    NodeConfigureRequest, NodeDescribeResponse, NodeRegisterRequest,
+    SafekeeperSchedulingPolicyRequest, SkSchedulingPolicy, TenantCreateRequest,
     TenantCreateResponse, TenantLocateResponse,
 };
-use pageserver_api::models::{TenantConfigRequest, TimelineCreateRequest, TimelineInfo};
+use pageserver_api::models::{
+    TenantConfig, TenantConfigRequest, TimelineCreateRequest, TimelineInfo,
+};
 use pageserver_api::shard::TenantShardId;
 use pageserver_client::mgmt_api::ResponseErrorMessageExt;
+use pem::Pem;
 use postgres_backend::AuthType;
-use reqwest::Method;
+use reqwest::{Method, Response};
+use safekeeper_api::PgMajorVersion;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -28,24 +34,21 @@ use utils::auth::{Claims, Scope, encode_from_key_file};
 use utils::id::{NodeId, TenantId};
 use whoami::username;
 
-use crate::background_process;
-use crate::local_env::{LocalEnv, NeonStorageControllerConf};
-
 pub struct StorageController {
     env: LocalEnv,
-    private_key: Option<Vec<u8>>,
-    public_key: Option<String>,
+    private_key: Option<Pem>,
+    public_key: Option<Pem>,
     client: reqwest::Client,
     config: NeonStorageControllerConf,
 
-    // The listen addresses is learned when starting the storage controller,
+    // The listen port is learned when starting the storage controller,
     // hence the use of OnceLock to init it at the right time.
-    listen: OnceLock<SocketAddr>,
+    listen_port: OnceLock<u16>,
 }
 
 const COMMAND: &str = "storage_controller";
 
-const STORAGE_CONTROLLER_POSTGRES_VERSION: u32 = 16;
+const STORAGE_CONTROLLER_POSTGRES_VERSION: PgMajorVersion = PgMajorVersion::PG16;
 
 const DB_NAME: &str = "storage_controller";
 
@@ -83,7 +86,8 @@ impl NeonStorageControllerStopArgs {
 pub struct AttachHookRequest {
     pub tenant_shard_id: TenantShardId,
     pub node_id: Option<NodeId>,
-    pub generation_override: Option<i32>,
+    pub generation_override: Option<i32>, // only new tenants
+    pub config: Option<TenantConfig>,     // only new tenants
 }
 
 #[derive(Serialize, Deserialize)]
@@ -114,7 +118,9 @@ impl StorageController {
             AuthType::Trust => (None, None),
             AuthType::NeonJWT => {
                 let private_key_path = env.get_private_key_path();
-                let private_key = fs::read(private_key_path).expect("failed to read private key");
+                let private_key =
+                    pem::parse(fs::read(private_key_path).expect("failed to read private key"))
+                        .expect("failed to parse PEM file");
 
                 // If pageserver auth is enabled, this implicitly enables auth for this service,
                 // using the same credentials.
@@ -136,9 +142,13 @@ impl StorageController {
                         .expect("Empty key dir")
                         .expect("Error reading key dir");
 
-                    std::fs::read_to_string(dent.path()).expect("Can't read public key")
+                    pem::parse(std::fs::read_to_string(dent.path()).expect("Can't read public key"))
+                        .expect("Failed to parse PEM file")
                 } else {
-                    std::fs::read_to_string(&public_key_path).expect("Can't read public key")
+                    pem::parse(
+                        std::fs::read_to_string(&public_key_path).expect("Can't read public key"),
+                    )
+                    .expect("Failed to parse PEM file")
                 };
                 (Some(private_key), Some(public_key))
             }
@@ -148,18 +158,16 @@ impl StorageController {
             env: env.clone(),
             private_key,
             public_key,
-            client: reqwest::ClientBuilder::new()
-                .build()
-                .expect("Failed to construct http client"),
+            client: env.create_http_client(),
             config: env.storage_controller.clone(),
-            listen: OnceLock::default(),
+            listen_port: OnceLock::default(),
         }
     }
 
     fn storage_controller_instance_dir(&self, instance_id: u8) -> PathBuf {
         self.env
             .base_data_dir
-            .join(format!("storage_controller_{}", instance_id))
+            .join(format!("storage_controller_{instance_id}"))
     }
 
     fn pid_file(&self, instance_id: u8) -> Utf8PathBuf {
@@ -176,9 +184,15 @@ impl StorageController {
     /// to other versions if that one isn't found.  Some automated tests create circumstances
     /// where only one version is available in pg_distrib_dir, such as `test_remote_extensions`.
     async fn get_pg_dir(&self, dir_name: &str) -> anyhow::Result<Utf8PathBuf> {
-        let prefer_versions = [STORAGE_CONTROLLER_POSTGRES_VERSION, 16, 15, 14];
+        const PREFER_VERSIONS: [PgMajorVersion; 5] = [
+            STORAGE_CONTROLLER_POSTGRES_VERSION,
+            PgMajorVersion::PG16,
+            PgMajorVersion::PG15,
+            PgMajorVersion::PG14,
+            PgMajorVersion::PG17,
+        ];
 
-        for v in prefer_versions {
+        for v in PREFER_VERSIONS {
             let path = Utf8PathBuf::from_path_buf(self.env.pg_dir(v, dir_name)?).unwrap();
             if tokio::fs::try_exists(&path).await? {
                 return Ok(path);
@@ -212,7 +226,7 @@ impl StorageController {
             "-d",
             DB_NAME,
             "-p",
-            &format!("{}", postgres_port),
+            &format!("{postgres_port}"),
         ];
         let pg_lib_dir = self.get_pg_lib_dir().await.unwrap();
         let envs = [
@@ -255,7 +269,7 @@ impl StorageController {
                 "-h",
                 "localhost",
                 "-p",
-                &format!("{}", postgres_port),
+                &format!("{postgres_port}"),
                 "-U",
                 &username(),
                 "-O",
@@ -337,34 +351,34 @@ impl StorageController {
             }
         }
 
-        let (listen, postgres_port) = {
-            if let Some(base_port) = start_args.base_port {
-                (
-                    format!("127.0.0.1:{base_port}"),
-                    self.config
-                        .database_url
-                        .expect("--base-port requires NeonStorageControllerConf::database_url")
-                        .port(),
-                )
-            } else {
-                let listen_url = self.env.control_plane_api.clone();
+        if self.env.generate_local_ssl_certs {
+            self.env.generate_ssl_cert(
+                &instance_dir.join("server.crt"),
+                &instance_dir.join("server.key"),
+            )?;
+        }
 
-                let listen = format!(
-                    "{}:{}",
-                    listen_url.host_str().unwrap(),
-                    listen_url.port().unwrap()
-                );
+        let listen_url = &self.env.control_plane_api;
 
-                (listen, listen_url.port().unwrap() + 1)
-            }
+        let scheme = listen_url.scheme();
+        let host = listen_url.host_str().unwrap();
+
+        let (listen_port, postgres_port) = if let Some(base_port) = start_args.base_port {
+            (
+                base_port,
+                self.config
+                    .database_url
+                    .expect("--base-port requires NeonStorageControllerConf::database_url")
+                    .port(),
+            )
+        } else {
+            let port = listen_url.port().unwrap();
+            (port, port + 1)
         };
 
-        let socket_addr = listen
-            .parse()
-            .expect("listen address is a valid socket address");
-        self.listen
-            .set(socket_addr)
-            .expect("StorageController::listen is only set here");
+        self.listen_port
+            .set(listen_port)
+            .expect("StorageController::listen_port is only set here");
 
         // Do we remove the pid file on stop?
         let pg_started = self.is_postgres_running().await?;
@@ -417,7 +431,7 @@ impl StorageController {
             // from `LocalEnv`'s config file (`.neon/config`).
             tokio::fs::write(
                 &pg_data_path.join("postgresql.conf"),
-                format!("port = {}\nfsync=off\n", postgres_port),
+                format!("port = {postgres_port}\nfsync=off\n"),
             )
             .await?;
 
@@ -469,7 +483,7 @@ impl StorageController {
             self.setup_database(postgres_port).await?;
         }
 
-        let database_url = format!("postgresql://localhost:{}/{DB_NAME}", postgres_port);
+        let database_url = format!("postgresql://localhost:{postgres_port}/{DB_NAME}");
 
         // We support running a startup SQL script to fiddle with the database before we launch storcon.
         // This is used by the test suite.
@@ -500,20 +514,15 @@ impl StorageController {
         drop(client);
         conn.await??;
 
-        let listen = self
-            .listen
-            .get()
-            .expect("cell is set earlier in this function");
+        let addr = format!("{host}:{listen_port}");
         let address_for_peers = Uri::builder()
-            .scheme("http")
-            .authority(format!("{}:{}", listen.ip(), listen.port()))
+            .scheme(scheme)
+            .authority(addr.clone())
             .path_and_query("")
             .build()
             .unwrap();
 
         let mut args = vec![
-            "-l",
-            &listen.to_string(),
             "--dev",
             "--database-url",
             &database_url,
@@ -530,6 +539,14 @@ impl StorageController {
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
 
+        match scheme {
+            "http" => args.extend(["--listen".to_string(), addr]),
+            "https" => args.extend(["--listen-https".to_string(), addr]),
+            _ => {
+                panic!("Unexpected url scheme in control_plane_api: {scheme}");
+            }
+        }
+
         if self.config.start_as_candidate {
             args.push("--start-as-candidate".to_string());
         }
@@ -540,6 +557,14 @@ impl StorageController {
 
         if self.config.use_https_safekeeper_api {
             args.push("--use-https-safekeeper-api".to_string());
+        }
+
+        if self.config.use_local_compute_notifications {
+            args.push("--use-local-compute-notifications".to_string());
+        }
+
+        if let Some(value) = self.config.kick_secondary_downloads {
+            args.push(format!("--kick-secondary-downloads={value}"));
         }
 
         if let Some(ssl_ca_file) = self.env.ssl_ca_cert_path() {
@@ -556,6 +581,11 @@ impl StorageController {
             let peer_jwt_token = encode_from_key_file(&peer_claims, private_key)
                 .expect("failed to generate jwt token");
             args.push(format!("--peer-jwt-token={peer_jwt_token}"));
+
+            let claims = Claims::new(None, Scope::SafekeeperData);
+            let jwt_token =
+                encode_from_key_file(&claims, private_key).expect("failed to generate jwt token");
+            args.push(format!("--safekeeper-jwt-token={jwt_token}"));
         }
 
         if let Some(public_key) = &self.public_key {
@@ -568,6 +598,20 @@ impl StorageController {
 
         if let Some(split_threshold) = self.config.split_threshold.as_ref() {
             args.push(format!("--split-threshold={split_threshold}"))
+        }
+
+        if let Some(max_split_shards) = self.config.max_split_shards.as_ref() {
+            args.push(format!("--max-split-shards={max_split_shards}"))
+        }
+
+        if let Some(initial_split_threshold) = self.config.initial_split_threshold.as_ref() {
+            args.push(format!(
+                "--initial-split-threshold={initial_split_threshold}"
+            ))
+        }
+
+        if let Some(initial_split_shards) = self.config.initial_split_shards.as_ref() {
+            args.push(format!("--initial-split-shards={initial_split_shards}"))
         }
 
         if let Some(lag) = self.config.max_secondary_lag_bytes.as_ref() {
@@ -586,19 +630,38 @@ impl StorageController {
             self.env.base_data_dir.display()
         ));
 
+        if self.env.safekeepers.iter().any(|sk| sk.auth_enabled) && self.private_key.is_none() {
+            anyhow::bail!("Safekeeper set up for auth but no private key specified");
+        }
+
         if self.config.timelines_onto_safekeepers {
             args.push("--timelines-onto-safekeepers".to_string());
         }
+
+        if let Some(sk_cnt) = self.config.timeline_safekeeper_count {
+            args.push(format!("--timeline-safekeeper-count={sk_cnt}"));
+        }
+
+        let mut envs = vec![
+            ("LD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
+            ("DYLD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
+        ];
+
+        if let Some(posthog_config) = &self.config.posthog_config {
+            envs.push((
+                "POSTHOG_CONFIG".to_string(),
+                serde_json::to_string(posthog_config)?,
+            ));
+        }
+
+        println!("Starting storage controller");
 
         background_process::start_process(
             COMMAND,
             &instance_dir,
             &self.env.storage_controller_bin(),
             args,
-            vec![
-                ("LD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
-                ("DYLD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
-            ],
+            envs,
             background_process::InitialPidFile::Create(self.pid_file(start_args.instance_id)),
             &start_args.start_timeout,
             || async {
@@ -609,6 +672,10 @@ impl StorageController {
             },
         )
         .await?;
+
+        if self.config.timelines_onto_safekeepers {
+            self.register_safekeepers().await?;
+        }
 
         Ok(())
     }
@@ -714,40 +781,53 @@ impl StorageController {
         RQ: Serialize + Sized,
         RS: DeserializeOwned + Sized,
     {
+        let response = self.dispatch_inner(method, path, body).await?;
+        Ok(response
+            .json()
+            .await
+            .map_err(pageserver_client::mgmt_api::Error::ReceiveBody)?)
+    }
+
+    /// Simple HTTP request wrapper for calling into storage controller
+    async fn dispatch_inner<RQ>(
+        &self,
+        method: reqwest::Method,
+        path: String,
+        body: Option<RQ>,
+    ) -> anyhow::Result<Response>
+    where
+        RQ: Serialize + Sized,
+    {
         // In the special case of the `storage_controller start` subcommand, we wish
         // to use the API endpoint of the newly started storage controller in order
-        // to pass the readiness check. In this scenario [`Self::listen`] will be set
-        // (see [`Self::start`]).
+        // to pass the readiness check. In this scenario [`Self::listen_port`] will
+        // be set (see [`Self::start`]).
         //
         // Otherwise, we infer the storage controller api endpoint from the configured
         // control plane API.
-        let url = if let Some(socket_addr) = self.listen.get() {
-            Url::from_str(&format!(
-                "http://{}:{}/{path}",
-                socket_addr.ip().to_canonical(),
-                socket_addr.port()
-            ))
-            .unwrap()
+        let port = if let Some(port) = self.listen_port.get() {
+            *port
         } else {
-            // The configured URL has the /upcall path prefix for pageservers to use: we will strip that out
-            // for general purpose API access.
-            let listen_url = self.env.control_plane_api.clone();
-            Url::from_str(&format!(
-                "http://{}:{}/{path}",
-                listen_url.host_str().unwrap(),
-                listen_url.port().unwrap()
-            ))
-            .unwrap()
+            self.env.control_plane_api.port().unwrap()
         };
+
+        // The configured URL has the /upcall path prefix for pageservers to use: we will strip that out
+        // for general purpose API access.
+        let url = Url::from_str(&format!(
+            "{}://{}:{port}/{path}",
+            self.env.control_plane_api.scheme(),
+            self.env.control_plane_api.host_str().unwrap(),
+        ))
+        .unwrap();
 
         let mut builder = self.client.request(method, url);
         if let Some(body) = body {
             builder = builder.json(&body)
         }
         if let Some(private_key) = &self.private_key {
-            println!("Getting claims for path {}", path);
+            println!("Getting claims for path {path}");
             if let Some(required_claims) = Self::get_claims_for_path(&path)? {
-                println!("Got claims {:?} for path {}", required_claims, path);
+                println!("Got claims {required_claims:?} for path {path}");
                 let jwt_token = encode_from_key_file(&required_claims, private_key)?;
                 builder = builder.header(
                     reqwest::header::AUTHORIZATION,
@@ -759,10 +839,31 @@ impl StorageController {
         let response = builder.send().await?;
         let response = response.error_from_body().await?;
 
-        Ok(response
-            .json()
-            .await
-            .map_err(pageserver_client::mgmt_api::Error::ReceiveBody)?)
+        Ok(response)
+    }
+
+    /// Register the safekeepers in the storage controller
+    #[instrument(skip(self))]
+    async fn register_safekeepers(&self) -> anyhow::Result<()> {
+        for sk in self.env.safekeepers.iter() {
+            let sk_id = sk.id;
+            let body = serde_json::json!({
+                "id": sk_id,
+                "created_at": "2023-10-25T09:11:25Z",
+                "updated_at": "2024-08-28T11:32:43Z",
+                "region_id": "aws-us-east-2",
+                "host": "127.0.0.1",
+                "port": sk.pg_port,
+                "http_port": sk.http_port,
+                "https_port": sk.https_port,
+                "version": 5957,
+                "availability_zone_id": format!("us-east-2b-{sk_id}"),
+            });
+            self.upsert_safekeeper(sk_id, body).await?;
+            self.safekeeper_scheduling_policy(sk_id, SkSchedulingPolicy::Active)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Call into the attach_hook API, for use before handing out attachments to pageservers
@@ -776,6 +877,7 @@ impl StorageController {
             tenant_shard_id,
             node_id: Some(pageserver_id),
             generation_override: None,
+            config: None,
         };
 
         let response = self
@@ -787,6 +889,42 @@ impl StorageController {
             .await?;
 
         Ok(response.generation)
+    }
+
+    #[instrument(skip(self))]
+    pub async fn upsert_safekeeper(
+        &self,
+        node_id: NodeId,
+        request: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let resp = self
+            .dispatch_inner::<serde_json::Value>(
+                Method::POST,
+                format!("control/v1/safekeeper/{node_id}"),
+                Some(request),
+            )
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "setting scheduling policy unsuccessful for safekeeper {node_id}: {}",
+                resp.status()
+            );
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    pub async fn safekeeper_scheduling_policy(
+        &self,
+        node_id: NodeId,
+        scheduling_policy: SkSchedulingPolicy,
+    ) -> anyhow::Result<()> {
+        self.dispatch::<SafekeeperSchedulingPolicyRequest, ()>(
+            Method::POST,
+            format!("control/v1/safekeeper/{node_id}/scheduling_policy"),
+            Some(SafekeeperSchedulingPolicyRequest { scheduling_policy }),
+        )
+        .await
     }
 
     #[instrument(skip(self))]

@@ -29,23 +29,23 @@
 //! ```sh
 //! compute_ctl -D /var/db/postgres/compute \
 //!             -C 'postgresql://cloud_admin@localhost/postgres' \
-//!             -S /var/db/postgres/specs/current.json \
+//!             -c /var/db/postgres/configs/config.json \
 //!             -b /usr/local/bin/postgres \
 //!             -r http://pg-ext-s3-gateway \
 //! ```
 use std::ffi::OsString;
 use std::fs::File;
-use std::path::Path;
 use std::process::exit;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use compute_api::responses::ComputeCtlConfig;
-use compute_api::spec::ComputeSpec;
-use compute_tools::compute::{ComputeNode, ComputeNodeParams, forward_termination_signal};
+use compute_api::responses::ComputeConfig;
+use compute_tools::compute::{
+    BUILD_TAG, ComputeNode, ComputeNodeParams, forward_termination_signal,
+};
 use compute_tools::extension_server::get_pg_version_string;
 use compute_tools::logger::*;
 use compute_tools::params::*;
@@ -57,29 +57,15 @@ use tracing::{error, info};
 use url::Url;
 use utils::failpoint_support;
 
-// this is an arbitrary build tag. Fine as a default / for testing purposes
-// in-case of not-set environment var
-const BUILD_TAG_DEFAULT: &str = "latest";
-
-// Compatibility hack: if the control plane specified any remote-ext-config
-// use the default value for extension storage proxy gateway.
-// Remove this once the control plane is updated to pass the gateway URL
-fn parse_remote_ext_config(arg: &str) -> Result<String> {
-    if arg.starts_with("http") {
-        Ok(arg.trim_end_matches('/').to_string())
-    } else {
-        Ok("http://pg-ext-s3-gateway".to_string())
-    }
-}
-
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(rename_all = "kebab-case")]
 struct Cli {
     #[arg(short = 'b', long, default_value = "postgres", env = "POSTGRES_PATH")]
     pub pgbin: String,
 
-    #[arg(short = 'r', long, value_parser = parse_remote_ext_config)]
-    pub remote_ext_config: Option<String>,
+    /// The base URL for the remote extension storage proxy gateway.
+    #[arg(short = 'r', long, value_parser = Self::parse_remote_ext_base_url)]
+    pub remote_ext_base_url: Option<Url>,
 
     /// The port to bind the external listening HTTP server to. Clients running
     /// outside the compute will talk to the compute through this port. Keep
@@ -120,17 +106,47 @@ struct Cli {
     #[arg(long)]
     pub set_disk_quota_for_fs: Option<String>,
 
-    #[arg(short = 's', long = "spec", group = "spec")]
-    pub spec_json: Option<String>,
-
-    #[arg(short = 'S', long, group = "spec-path")]
-    pub spec_path: Option<OsString>,
+    #[arg(short = 'c', long)]
+    pub config: Option<OsString>,
 
     #[arg(short = 'i', long, group = "compute-id")]
     pub compute_id: String,
 
-    #[arg(short = 'p', long, conflicts_with_all = ["spec", "spec-path"], value_name = "CONTROL_PLANE_API_BASE_URL")]
+    #[arg(
+        short = 'p',
+        long,
+        conflicts_with = "config",
+        value_name = "CONTROL_PLANE_API_BASE_URL",
+        requires = "compute-id"
+    )]
     pub control_plane_uri: Option<String>,
+
+    /// Interval in seconds for collecting installed extensions statistics
+    #[arg(long, default_value = "3600")]
+    pub installed_extensions_collection_interval: u64,
+
+    /// Run in development mode, skipping VM-specific operations like process termination
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub dev: bool,
+}
+
+impl Cli {
+    /// Parse a URL from an argument. By default, this isn't necessary, but we
+    /// want to do some sanity checking.
+    fn parse_remote_ext_base_url(value: &str) -> Result<Url> {
+        // Remove extra trailing slashes, and add one. We use Url::join() later
+        // when downloading remote extensions. If the base URL is something like
+        // http://example.com/pg-ext-s3-gateway, and join() is called with
+        // something like "xyz", the resulting URL is http://example.com/xyz.
+        let value = value.trim_end_matches('/').to_owned() + "/";
+        let url = Url::parse(&value)?;
+
+        if url.query_pairs().count() != 0 {
+            bail!("parameters detected in remote extensions base URL")
+        }
+
+        Ok(url)
+    }
 }
 
 fn main() -> Result<()> {
@@ -138,7 +154,7 @@ fn main() -> Result<()> {
 
     let scenario = failpoint_support::init();
 
-    // For historical reasons, the main thread that processes the spec and launches postgres
+    // For historical reasons, the main thread that processes the config and launches postgres
     // is synchronous, but we always have this tokio runtime available and we "enter" it so
     // that you can use tokio::spawn() and tokio::runtime::Handle::current().block_on(...)
     // from all parts of compute_ctl.
@@ -147,14 +163,14 @@ fn main() -> Result<()> {
         .build()?;
     let _rt_guard = runtime.enter();
 
-    let build_tag = runtime.block_on(init())?;
+    runtime.block_on(init(cli.dev))?;
 
     // enable core dumping for all child processes
     setrlimit(Resource::CORE, rlimit::INFINITY, rlimit::INFINITY)?;
 
     let connstr = Url::parse(&cli.connstr).context("cannot parse connstr as a URL")?;
 
-    let cli_spec = try_spec_from_cli(&cli)?;
+    let config = get_config(&cli)?;
 
     let compute_node = ComputeNode::new(
         ComputeNodeParams {
@@ -165,7 +181,7 @@ fn main() -> Result<()> {
             pgversion: get_pg_version_string(&cli.pgbin),
             external_http_port: cli.external_http_port,
             internal_http_port: cli.internal_http_port,
-            ext_remote_storage: cli.remote_ext_config.clone(),
+            remote_ext_base_url: cli.remote_ext_base_url.clone(),
             resize_swap_on_bind: cli.resize_swap_on_bind,
             set_disk_quota_for_fs: cli.set_disk_quota_for_fs,
             #[cfg(target_os = "linux")]
@@ -174,12 +190,9 @@ fn main() -> Result<()> {
             cgroup: cli.cgroup,
             #[cfg(target_os = "linux")]
             vm_monitor_addr: cli.vm_monitor_addr,
-            build_tag,
-
-            live_config_allowed: cli_spec.live_config_allowed,
+            installed_extensions_collection_interval: cli.installed_extensions_collection_interval,
         },
-        cli_spec.spec,
-        cli_spec.compute_ctl_config,
+        config,
     )?;
 
     let exit_code = compute_node.run()?;
@@ -189,55 +202,32 @@ fn main() -> Result<()> {
     deinit_and_exit(exit_code);
 }
 
-async fn init() -> Result<String> {
+async fn init(dev_mode: bool) -> Result<()> {
     init_tracing_and_logging(DEFAULT_LOG_LEVEL).await?;
 
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGQUIT])?;
     thread::spawn(move || {
         for sig in signals.forever() {
-            handle_exit_signal(sig);
+            handle_exit_signal(sig, dev_mode);
         }
     });
 
-    let build_tag = option_env!("BUILD_TAG")
-        .unwrap_or(BUILD_TAG_DEFAULT)
-        .to_string();
-    info!("build_tag: {build_tag}");
+    info!("compute build_tag: {}", &BUILD_TAG.to_string());
 
-    Ok(build_tag)
+    Ok(())
 }
 
-fn try_spec_from_cli(cli: &Cli) -> Result<CliSpecParams> {
-    // First, try to get cluster spec from the cli argument
-    if let Some(ref spec_json) = cli.spec_json {
-        info!("got spec from cli argument {}", spec_json);
-        return Ok(CliSpecParams {
-            spec: Some(serde_json::from_str(spec_json)?),
-            compute_ctl_config: ComputeCtlConfig::default(),
-            live_config_allowed: false,
-        });
+fn get_config(cli: &Cli) -> Result<ComputeConfig> {
+    // First, read the config from the path if provided
+    if let Some(ref config) = cli.config {
+        let file = File::open(config)?;
+        return Ok(serde_json::from_reader(&file)?);
     }
 
-    // Second, try to read it from the file if path is provided
-    if let Some(ref spec_path) = cli.spec_path {
-        let file = File::open(Path::new(spec_path))?;
-        return Ok(CliSpecParams {
-            spec: Some(serde_json::from_reader(file)?),
-            compute_ctl_config: ComputeCtlConfig::default(),
-            live_config_allowed: true,
-        });
-    }
-
-    if cli.control_plane_uri.is_none() {
-        panic!("must specify --control-plane-uri");
-    };
-
-    match get_spec_from_control_plane(cli.control_plane_uri.as_ref().unwrap(), &cli.compute_id) {
-        Ok(resp) => Ok(CliSpecParams {
-            spec: resp.0,
-            compute_ctl_config: resp.1,
-            live_config_allowed: true,
-        }),
+    // If the config wasn't provided in the CLI arguments, then retrieve it from
+    // the control plane
+    match get_config_from_control_plane(cli.control_plane_uri.as_ref().unwrap(), &cli.compute_id) {
+        Ok(config) => Ok(config),
         Err(e) => {
             error!(
                 "cannot get response from control plane: {}\n\
@@ -247,14 +237,6 @@ fn try_spec_from_cli(cli: &Cli) -> Result<CliSpecParams> {
             Err(e)
         }
     }
-}
-
-struct CliSpecParams {
-    /// If a spec was provided via CLI or file, the [`ComputeSpec`]
-    spec: Option<ComputeSpec>,
-    #[allow(dead_code)]
-    compute_ctl_config: ComputeCtlConfig,
-    live_config_allowed: bool,
 }
 
 fn deinit_and_exit(exit_code: Option<i32>) -> ! {
@@ -285,20 +267,60 @@ fn deinit_and_exit(exit_code: Option<i32>) -> ! {
 /// When compute_ctl is killed, send also termination signal to sync-safekeepers
 /// to prevent leakage. TODO: it is better to convert compute_ctl to async and
 /// wait for termination which would be easy then.
-fn handle_exit_signal(sig: i32) {
+fn handle_exit_signal(sig: i32, dev_mode: bool) {
     info!("received {sig} termination signal");
-    forward_termination_signal();
+    forward_termination_signal(dev_mode);
     exit(1);
 }
 
 #[cfg(test)]
 mod test {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
+    use url::Url;
 
     use super::Cli;
 
     #[test]
     fn verify_cli() {
         Cli::command().debug_assert()
+    }
+
+    #[test]
+    fn verify_remote_ext_base_url() {
+        let cli = Cli::parse_from([
+            "compute_ctl",
+            "--pgdata=test",
+            "--connstr=test",
+            "--compute-id=test",
+            "--remote-ext-base-url",
+            "https://example.com/subpath",
+        ]);
+        assert_eq!(
+            cli.remote_ext_base_url.unwrap(),
+            Url::parse("https://example.com/subpath/").unwrap()
+        );
+
+        let cli = Cli::parse_from([
+            "compute_ctl",
+            "--pgdata=test",
+            "--connstr=test",
+            "--compute-id=test",
+            "--remote-ext-base-url",
+            "https://example.com//",
+        ]);
+        assert_eq!(
+            cli.remote_ext_base_url.unwrap(),
+            Url::parse("https://example.com").unwrap()
+        );
+
+        Cli::try_parse_from([
+            "compute_ctl",
+            "--pgdata=test",
+            "--connstr=test",
+            "--compute-id=test",
+            "--remote-ext-base-url",
+            "https://example.com?hello=world",
+        ])
+        .expect_err("URL parameters are not allowed");
     }
 }

@@ -19,10 +19,10 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use itertools::Itertools;
 use pageserver_api::controller_api::{
-    AvailabilityZone, MetadataHealthRecord, NodeSchedulingPolicy, PlacementPolicy,
+    AvailabilityZone, MetadataHealthRecord, NodeLifecycle, NodeSchedulingPolicy, PlacementPolicy,
     SafekeeperDescribeResponse, ShardSchedulingPolicy, SkSchedulingPolicy,
 };
-use pageserver_api::models::TenantConfig;
+use pageserver_api::models::{ShardImportStatus, TenantConfig};
 use pageserver_api::shard::{
     ShardConfigError, ShardCount, ShardIdentity, ShardNumber, ShardStripeSize, TenantShardId,
 };
@@ -40,6 +40,9 @@ use crate::metrics::{
     DatabaseQueryErrorLabelGroup, DatabaseQueryLatencyLabelGroup, METRICS_REGISTRY,
 };
 use crate::node::Node;
+use crate::timeline_import::{
+    TimelineImport, TimelineImportUpdateError, TimelineImportUpdateFollowUp,
+};
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
 /// ## What do we store?
@@ -99,6 +102,7 @@ pub(crate) enum DatabaseOperation {
     UpdateNode,
     DeleteNode,
     ListNodes,
+    ListTombstones,
     BeginShardSplit,
     CompleteShardSplit,
     AbortShardSplit,
@@ -126,6 +130,12 @@ pub(crate) enum DatabaseOperation {
     InsertTimelineReconcile,
     RemoveTimelineReconcile,
     ListTimelineReconcile,
+    ListTimelineReconcileStartup,
+    InsertTimelineImport,
+    UpdateTimelineImport,
+    DeleteTimelineImport,
+    ListTimelineImports,
+    IsTenantImportingTimeline,
 }
 
 #[must_use]
@@ -348,6 +358,8 @@ impl Persistence {
     }
 
     /// When a node is first registered, persist it before using it for anything
+    /// If the provided node_id already exists, it will be error.
+    /// The common case is when a node marked for deletion wants to register.
     pub(crate) async fn insert_node(&self, node: &Node) -> DatabaseResult<()> {
         let np = &node.to_persistent();
         self.with_measured_conn(DatabaseOperation::InsertNode, move |conn| {
@@ -364,19 +376,41 @@ impl Persistence {
 
     /// At startup, populate the list of nodes which our shards may be placed on
     pub(crate) async fn list_nodes(&self) -> DatabaseResult<Vec<NodePersistence>> {
-        let nodes: Vec<NodePersistence> = self
+        use crate::schema::nodes::dsl::*;
+
+        let result: Vec<NodePersistence> = self
             .with_measured_conn(DatabaseOperation::ListNodes, move |conn| {
                 Box::pin(async move {
                     Ok(crate::schema::nodes::table
+                        .filter(lifecycle.ne(String::from(NodeLifecycle::Deleted)))
                         .load::<NodePersistence>(conn)
                         .await?)
                 })
             })
             .await?;
 
-        tracing::info!("list_nodes: loaded {} nodes", nodes.len());
+        tracing::info!("list_nodes: loaded {} nodes", result.len());
 
-        Ok(nodes)
+        Ok(result)
+    }
+
+    pub(crate) async fn list_tombstones(&self) -> DatabaseResult<Vec<NodePersistence>> {
+        use crate::schema::nodes::dsl::*;
+
+        let result: Vec<NodePersistence> = self
+            .with_measured_conn(DatabaseOperation::ListTombstones, move |conn| {
+                Box::pin(async move {
+                    Ok(crate::schema::nodes::table
+                        .filter(lifecycle.eq(String::from(NodeLifecycle::Deleted)))
+                        .load::<NodePersistence>(conn)
+                        .await?)
+                })
+            })
+            .await?;
+
+        tracing::info!("list_tombstones: loaded {} nodes", result.len());
+
+        Ok(result)
     }
 
     pub(crate) async fn update_node<V>(
@@ -395,6 +429,7 @@ impl Persistence {
                 Box::pin(async move {
                     let updated = diesel::update(nodes)
                         .filter(node_id.eq(input_node_id.0 as i64))
+                        .filter(lifecycle.ne(String::from(NodeLifecycle::Deleted)))
                         .set(values)
                         .execute(conn)
                         .await?;
@@ -435,6 +470,55 @@ impl Persistence {
             input_node_id,
             listen_https_port.eq(input_https_port.map(|x| x as i32)),
         )
+        .await
+    }
+
+    /// Tombstone is a special state where the node is not deleted from the database,
+    /// but it is not available for usage.
+    /// The main reason for it is to prevent the flaky node to register.
+    pub(crate) async fn set_tombstone(&self, del_node_id: NodeId) -> DatabaseResult<()> {
+        use crate::schema::nodes::dsl::*;
+        self.update_node(
+            del_node_id,
+            lifecycle.eq(String::from(NodeLifecycle::Deleted)),
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_node(&self, del_node_id: NodeId) -> DatabaseResult<()> {
+        use crate::schema::nodes::dsl::*;
+        self.with_measured_conn(DatabaseOperation::DeleteNode, move |conn| {
+            Box::pin(async move {
+                // You can hard delete a node only if it has a tombstone.
+                // So we need to check if the node has lifecycle set to deleted.
+                let node_to_delete = nodes
+                    .filter(node_id.eq(del_node_id.0 as i64))
+                    .first::<NodePersistence>(conn)
+                    .await
+                    .optional()?;
+
+                if let Some(np) = node_to_delete {
+                    let lc = NodeLifecycle::from_str(&np.lifecycle).map_err(|e| {
+                        DatabaseError::Logical(format!(
+                            "Node {del_node_id} has invalid lifecycle: {e}"
+                        ))
+                    })?;
+
+                    if lc != NodeLifecycle::Deleted {
+                        return Err(DatabaseError::Logical(format!(
+                            "Node {del_node_id} was not soft deleted before, cannot hard delete it"
+                        )));
+                    }
+
+                    diesel::delete(nodes)
+                        .filter(node_id.eq(del_node_id.0 as i64))
+                        .execute(conn)
+                        .await?;
+                }
+
+                Ok(())
+            })
+        })
         .await
     }
 
@@ -534,21 +618,6 @@ impl Persistence {
         .await
     }
 
-    pub(crate) async fn delete_node(&self, del_node_id: NodeId) -> DatabaseResult<()> {
-        use crate::schema::nodes::dsl::*;
-        self.with_measured_conn(DatabaseOperation::DeleteNode, move |conn| {
-            Box::pin(async move {
-                diesel::delete(nodes)
-                    .filter(node_id.eq(del_node_id.0 as i64))
-                    .execute(conn)
-                    .await?;
-
-                Ok(())
-            })
-        })
-        .await
-    }
-
     /// When a tenant invokes the /re-attach API, this function is responsible for doing an efficient
     /// batched increment of the generations of all tenants whose generation_pageserver is equal to
     /// the node that called /re-attach.
@@ -562,6 +631,19 @@ impl Persistence {
         let updated = self
             .with_measured_conn(DatabaseOperation::ReAttach, move |conn| {
                 Box::pin(async move {
+                    // Check if the node is not marked as deleted
+                    let deleted_node: i64 = nodes
+                        .filter(node_id.eq(input_node_id.0 as i64))
+                        .filter(lifecycle.eq(String::from(NodeLifecycle::Deleted)))
+                        .count()
+                        .get_result(conn)
+                        .await?;
+                    if deleted_node > 0 {
+                        return Err(DatabaseError::Logical(format!(
+                            "Node {input_node_id} is marked as deleted, re-attach is not allowed"
+                        )));
+                    }
+
                     let rows_updated = diesel::update(tenant_shards)
                         .filter(generation_pageserver.eq(input_node_id.0 as i64))
                         .set(generation.eq(generation + 1))
@@ -918,7 +1000,7 @@ impl Persistence {
                 .execute(conn).await?;
             if u8::try_from(updated)
                 .map_err(|_| DatabaseError::Logical(
-                    format!("Overflow existing shard count {} while splitting", updated))
+                    format!("Overflow existing shard count {updated} while splitting"))
                 )? != old_shard_count.count() {
                 // Perhaps a deletion or another split raced with this attempt to split, mutating
                 // the parent shards that we intend to split. In this case the split request should fail.
@@ -997,10 +1079,11 @@ impl Persistence {
                 // Clear sharding flag
                 let updated = diesel::update(tenant_shards)
                     .filter(tenant_id.eq(split_tenant_id.to_string()))
+                    .filter(shard_count.eq(new_shard_count.literal() as i32))
                     .set((splitting.eq(0),))
                     .execute(conn)
                     .await?;
-                debug_assert!(updated > 0);
+                assert!(updated == new_shard_count.count() as usize);
 
                 Ok(())
             })
@@ -1257,8 +1340,7 @@ impl Persistence {
 
                 if inserted_updated != 1 {
                     return Err(DatabaseError::Logical(format!(
-                        "unexpected number of rows ({})",
-                        inserted_updated
+                        "unexpected number of rows ({inserted_updated})"
                     )));
                 }
 
@@ -1320,8 +1402,7 @@ impl Persistence {
                     0 => Ok(false),
                     1 => Ok(true),
                     _ => Err(DatabaseError::Logical(format!(
-                        "unexpected number of rows ({})",
-                        inserted_updated
+                        "unexpected number of rows ({inserted_updated})"
                     ))),
                 }
             })
@@ -1367,6 +1448,92 @@ impl Persistence {
 
         Ok(timeline_from_db)
     }
+
+    /// Set `delete_at` for the given timeline
+    pub(crate) async fn timeline_set_deleted_at(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+    ) -> DatabaseResult<()> {
+        use crate::schema::timelines;
+
+        let deletion_time = chrono::Local::now().to_utc();
+        self.with_measured_conn(DatabaseOperation::InsertTimeline, move |conn| {
+            Box::pin(async move {
+                let updated = diesel::update(timelines::table)
+                    .filter(timelines::tenant_id.eq(tenant_id.to_string()))
+                    .filter(timelines::timeline_id.eq(timeline_id.to_string()))
+                    .set(timelines::deleted_at.eq(Some(deletion_time)))
+                    .execute(conn)
+                    .await?;
+
+                match updated {
+                    0 => Ok(()),
+                    1 => Ok(()),
+                    _ => Err(DatabaseError::Logical(format!(
+                        "unexpected number of rows ({updated})"
+                    ))),
+                }
+            })
+        })
+        .await
+    }
+
+    /// Load timeline from db. Returns `None` if not present.
+    ///
+    /// Only works if `deleted_at` is set, so you should call [`Self::timeline_set_deleted_at`] before.
+    pub(crate) async fn delete_timeline(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+    ) -> DatabaseResult<()> {
+        use crate::schema::timelines::dsl;
+
+        let tenant_id = &tenant_id;
+        let timeline_id = &timeline_id;
+        self.with_measured_conn(DatabaseOperation::GetTimeline, move |conn| {
+            Box::pin(async move {
+                diesel::delete(dsl::timelines)
+                    .filter(dsl::tenant_id.eq(&tenant_id.to_string()))
+                    .filter(dsl::timeline_id.eq(&timeline_id.to_string()))
+                    .filter(dsl::deleted_at.is_not_null())
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Loads a list of all timelines from database.
+    pub(crate) async fn list_timelines_for_tenant(
+        &self,
+        tenant_id: TenantId,
+    ) -> DatabaseResult<Vec<TimelinePersistence>> {
+        use crate::schema::timelines::dsl;
+
+        let tenant_id = &tenant_id;
+        let timelines = self
+            .with_measured_conn(DatabaseOperation::GetTimeline, move |conn| {
+                Box::pin(async move {
+                    let timelines: Vec<TimelineFromDb> = dsl::timelines
+                        .filter(dsl::tenant_id.eq(&tenant_id.to_string()))
+                        .load(conn)
+                        .await?;
+                    Ok(timelines)
+                })
+            })
+            .await?;
+
+        let timelines = timelines
+            .into_iter()
+            .map(TimelineFromDb::into_persistence)
+            .collect();
+        Ok(timelines)
+    }
+
     /// Persist pending op. Returns if it was newly inserted. If it wasn't, we haven't done any writes.
     pub(crate) async fn insert_pending_op(
         &self,
@@ -1397,8 +1564,7 @@ impl Persistence {
                     0 => Ok(false),
                     1 => Ok(true),
                     _ => Err(DatabaseError::Logical(format!(
-                        "unexpected number of rows ({})",
-                        inserted_updated
+                        "unexpected number of rows ({inserted_updated})"
                     ))),
                 }
             })
@@ -1409,7 +1575,7 @@ impl Persistence {
     pub(crate) async fn remove_pending_op(
         &self,
         tenant_id: TenantId,
-        timeline_id: TimelineId,
+        timeline_id: Option<TimelineId>,
         sk_id: NodeId,
         generation: u32,
     ) -> DatabaseResult<()> {
@@ -1418,10 +1584,11 @@ impl Persistence {
         let tenant_id = &tenant_id;
         let timeline_id = &timeline_id;
         self.with_measured_conn(DatabaseOperation::RemoveTimelineReconcile, move |conn| {
+            let timeline_id_str = timeline_id.map(|tid| tid.to_string()).unwrap_or_default();
             Box::pin(async move {
                 diesel::delete(dsl::safekeeper_timeline_pending_ops)
                     .filter(dsl::tenant_id.eq(tenant_id.to_string()))
-                    .filter(dsl::timeline_id.eq(timeline_id.to_string()))
+                    .filter(dsl::timeline_id.eq(timeline_id_str))
                     .filter(dsl::sk_id.eq(sk_id.0 as i64))
                     .filter(dsl::generation.eq(generation as i32))
                     .execute(conn)
@@ -1432,25 +1599,60 @@ impl Persistence {
         .await
     }
 
-    /// Load pending operations from db.
-    pub(crate) async fn list_pending_ops(
+    /// Load pending operations from db, joined together with timeline data.
+    pub(crate) async fn list_pending_ops_with_timelines(
         &self,
-        filter_for_sk: Option<NodeId>,
+    ) -> DatabaseResult<Vec<(TimelinePendingOpPersistence, Option<TimelinePersistence>)>> {
+        use crate::schema::safekeeper_timeline_pending_ops::dsl;
+        use crate::schema::timelines;
+
+        let timeline_from_db = self
+            .with_measured_conn(
+                DatabaseOperation::ListTimelineReconcileStartup,
+                move |conn| {
+                    Box::pin(async move {
+                        let from_db: Vec<(TimelinePendingOpPersistence, Option<TimelineFromDb>)> =
+                            dsl::safekeeper_timeline_pending_ops
+                                .left_join(
+                                    timelines::table.on(timelines::tenant_id
+                                        .eq(dsl::tenant_id)
+                                        .and(timelines::timeline_id.eq(dsl::timeline_id))),
+                                )
+                                .select((
+                                    TimelinePendingOpPersistence::as_select(),
+                                    Option::<TimelineFromDb>::as_select(),
+                                ))
+                                .load(conn)
+                                .await?;
+                        Ok(from_db)
+                    })
+                },
+            )
+            .await?;
+
+        Ok(timeline_from_db
+            .into_iter()
+            .map(|(op, tl_opt)| (op, tl_opt.map(|tl_opt| tl_opt.into_persistence())))
+            .collect())
+    }
+    /// List pending operations for a given timeline (including tenant-global ones)
+    pub(crate) async fn list_pending_ops_for_timeline(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
     ) -> DatabaseResult<Vec<TimelinePendingOpPersistence>> {
         use crate::schema::safekeeper_timeline_pending_ops::dsl;
 
-        const FILTER_VAL_1: i64 = 1;
-        const FILTER_VAL_2: i64 = 2;
-        let filter_opt = filter_for_sk.map(|id| id.0 as i64);
-        let timeline_from_db = self
+        let timelines_from_db = self
             .with_measured_conn(DatabaseOperation::ListTimelineReconcile, move |conn| {
                 Box::pin(async move {
                     let from_db: Vec<TimelinePendingOpPersistence> =
                         dsl::safekeeper_timeline_pending_ops
+                            .filter(dsl::tenant_id.eq(tenant_id.to_string()))
                             .filter(
-                                dsl::sk_id
-                                    .eq(filter_opt.unwrap_or(FILTER_VAL_1))
-                                    .and(dsl::sk_id.eq(filter_opt.unwrap_or(FILTER_VAL_2))),
+                                dsl::timeline_id
+                                    .eq(timeline_id.to_string())
+                                    .or(dsl::timeline_id.eq("")),
                             )
                             .load(conn)
                             .await?;
@@ -1459,7 +1661,234 @@ impl Persistence {
             })
             .await?;
 
-        Ok(timeline_from_db)
+        Ok(timelines_from_db)
+    }
+
+    /// Delete all pending ops for the given timeline.
+    ///
+    /// Use this only at timeline deletion, otherwise use generation based APIs
+    pub(crate) async fn remove_pending_ops_for_timeline(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: Option<TimelineId>,
+    ) -> DatabaseResult<()> {
+        use crate::schema::safekeeper_timeline_pending_ops::dsl;
+
+        let tenant_id = &tenant_id;
+        let timeline_id = &timeline_id;
+        self.with_measured_conn(DatabaseOperation::RemoveTimelineReconcile, move |conn| {
+            let timeline_id_str = timeline_id.map(|tid| tid.to_string()).unwrap_or_default();
+            Box::pin(async move {
+                diesel::delete(dsl::safekeeper_timeline_pending_ops)
+                    .filter(dsl::tenant_id.eq(tenant_id.to_string()))
+                    .filter(dsl::timeline_id.eq(timeline_id_str))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn insert_timeline_import(
+        &self,
+        import: TimelineImportPersistence,
+    ) -> DatabaseResult<bool> {
+        self.with_measured_conn(DatabaseOperation::InsertTimelineImport, move |conn| {
+            Box::pin({
+                let import = import.clone();
+                async move {
+                    let inserted = diesel::insert_into(crate::schema::timeline_imports::table)
+                        .values(import)
+                        .execute(conn)
+                        .await?;
+                    Ok(inserted == 1)
+                }
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn list_timeline_imports(&self) -> DatabaseResult<Vec<TimelineImport>> {
+        use crate::schema::timeline_imports::dsl;
+        let persistent = self
+            .with_measured_conn(DatabaseOperation::ListTimelineImports, move |conn| {
+                Box::pin(async move {
+                    let from_db: Vec<TimelineImportPersistence> =
+                        dsl::timeline_imports.load(conn).await?;
+                    Ok(from_db)
+                })
+            })
+            .await?;
+
+        let imports: Result<Vec<TimelineImport>, _> = persistent
+            .into_iter()
+            .map(TimelineImport::from_persistent)
+            .collect();
+        match imports {
+            Ok(ok) => Ok(ok.into_iter().collect()),
+            Err(err) => Err(DatabaseError::Logical(format!(
+                "failed to deserialize import: {err}"
+            ))),
+        }
+    }
+
+    pub(crate) async fn get_timeline_import(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+    ) -> DatabaseResult<Option<TimelineImport>> {
+        use crate::schema::timeline_imports::dsl;
+        let persistent_import = self
+            .with_measured_conn(DatabaseOperation::ListTimelineImports, move |conn| {
+                Box::pin(async move {
+                    let mut from_db: Vec<TimelineImportPersistence> = dsl::timeline_imports
+                        .filter(dsl::tenant_id.eq(tenant_id.to_string()))
+                        .filter(dsl::timeline_id.eq(timeline_id.to_string()))
+                        .load(conn)
+                        .await?;
+
+                    if from_db.len() > 1 {
+                        return Err(DatabaseError::Logical(format!(
+                            "unexpected number of rows ({})",
+                            from_db.len()
+                        )));
+                    }
+
+                    Ok(from_db.pop())
+                })
+            })
+            .await?;
+
+        persistent_import
+            .map(TimelineImport::from_persistent)
+            .transpose()
+            .map_err(|err| DatabaseError::Logical(format!("failed to deserialize import: {err}")))
+    }
+
+    pub(crate) async fn delete_timeline_import(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+    ) -> DatabaseResult<()> {
+        use crate::schema::timeline_imports::dsl;
+
+        self.with_measured_conn(DatabaseOperation::DeleteTimelineImport, move |conn| {
+            Box::pin(async move {
+                diesel::delete(crate::schema::timeline_imports::table)
+                    .filter(
+                        dsl::tenant_id
+                            .eq(tenant_id.to_string())
+                            .and(dsl::timeline_id.eq(timeline_id.to_string())),
+                    )
+                    .execute(conn)
+                    .await?;
+
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    /// Idempotently update the status of one shard for an ongoing timeline import
+    ///
+    /// If the update was persisted to the database, then the current state of the
+    /// import is returned to the caller. In case of logical errors a bespoke
+    /// [`TimelineImportUpdateError`] instance is returned. Other database errors
+    /// are covered by the outer [`DatabaseError`].
+    pub(crate) async fn update_timeline_import(
+        &self,
+        tenant_shard_id: TenantShardId,
+        timeline_id: TimelineId,
+        shard_status: ShardImportStatus,
+    ) -> DatabaseResult<Result<Option<TimelineImport>, TimelineImportUpdateError>> {
+        use crate::schema::timeline_imports::dsl;
+
+        self.with_measured_conn(DatabaseOperation::UpdateTimelineImport, move |conn| {
+            Box::pin({
+                let shard_status = shard_status.clone();
+                async move {
+                    // Load the current state from the database
+                    let mut from_db: Vec<TimelineImportPersistence> = dsl::timeline_imports
+                        .filter(
+                            dsl::tenant_id
+                                .eq(tenant_shard_id.tenant_id.to_string())
+                                .and(dsl::timeline_id.eq(timeline_id.to_string())),
+                        )
+                        .load(conn)
+                        .await?;
+
+                    assert!(from_db.len() <= 1);
+
+                    let mut status = match from_db.pop() {
+                        Some(some) => TimelineImport::from_persistent(some).unwrap(),
+                        None => {
+                            return Ok(Err(TimelineImportUpdateError::ImportNotFound {
+                                tenant_id: tenant_shard_id.tenant_id,
+                                timeline_id,
+                            }));
+                        }
+                    };
+
+                    // Perform the update in-memory
+                    let follow_up = match status.update(tenant_shard_id.to_index(), shard_status) {
+                        Ok(ok) => ok,
+                        Err(err) => {
+                            return Ok(Err(err));
+                        }
+                    };
+
+                    let new_persistent = status.to_persistent();
+
+                    // Write back if required (in the same transaction)
+                    match follow_up {
+                        TimelineImportUpdateFollowUp::Persist => {
+                            let updated = diesel::update(dsl::timeline_imports)
+                                .filter(
+                                    dsl::tenant_id
+                                        .eq(tenant_shard_id.tenant_id.to_string())
+                                        .and(dsl::timeline_id.eq(timeline_id.to_string())),
+                                )
+                                .set(dsl::shard_statuses.eq(new_persistent.shard_statuses))
+                                .execute(conn)
+                                .await?;
+
+                            if updated != 1 {
+                                return Ok(Err(TimelineImportUpdateError::ImportNotFound {
+                                    tenant_id: tenant_shard_id.tenant_id,
+                                    timeline_id,
+                                }));
+                            }
+
+                            Ok(Ok(Some(status)))
+                        }
+                        TimelineImportUpdateFollowUp::None => Ok(Ok(None)),
+                    }
+                }
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn is_tenant_importing_timeline(
+        &self,
+        tenant_id: TenantId,
+    ) -> DatabaseResult<bool> {
+        use crate::schema::timeline_imports::dsl;
+        self.with_measured_conn(DatabaseOperation::IsTenantImportingTimeline, move |conn| {
+            Box::pin(async move {
+                let imports: i64 = dsl::timeline_imports
+                    .filter(dsl::tenant_id.eq(tenant_id.to_string()))
+                    .count()
+                    .get_result(conn)
+                    .await?;
+
+                Ok(imports > 0)
+            })
+        })
+        .await
     }
 }
 
@@ -1688,6 +2117,9 @@ pub(crate) struct NodePersistence {
     pub(crate) listen_pg_port: i32,
     pub(crate) availability_zone_id: String,
     pub(crate) listen_https_port: Option<i32>,
+    pub(crate) lifecycle: String,
+    pub(crate) listen_grpc_addr: Option<String>,
+    pub(crate) listen_grpc_port: Option<i32>,
 }
 
 /// Tenant metadata health status that are stored durably.
@@ -1916,7 +2348,7 @@ impl ToSql<crate::schema::sql_types::PgLsn, Pg> for LsnWrapper {
     }
 }
 
-#[derive(Insertable, AsChangeset, Queryable, Selectable, Clone)]
+#[derive(Insertable, AsChangeset, Clone)]
 #[diesel(table_name = crate::schema::timelines)]
 pub(crate) struct TimelinePersistence {
     pub(crate) tenant_id: String,
@@ -2017,4 +2449,12 @@ impl ToSql<diesel::sql_types::VarChar, Pg> for SafekeeperTimelineOpKind {
             .map(|_| IsNull::No)
             .map_err(Into::into)
     }
+}
+
+#[derive(Serialize, Deserialize, Queryable, Selectable, Insertable, Eq, PartialEq, Clone)]
+#[diesel(table_name = crate::schema::timeline_imports)]
+pub(crate) struct TimelineImportPersistence {
+    pub(crate) tenant_id: String,
+    pub(crate) timeline_id: String,
+    pub(crate) shard_statuses: serde_json::Value,
 }

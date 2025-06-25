@@ -6,6 +6,7 @@ use std::str::{self, FromStr};
 use std::sync::Arc;
 
 use anyhow::Context;
+use jsonwebtoken::TokenData;
 use pageserver_api::models::ShardParameters;
 use pageserver_api::shard::{ShardIdentity, ShardStripeSize};
 use postgres_backend::{PostgresBackend, QueryError};
@@ -72,7 +73,7 @@ fn parse_cmd(cmd: &str) -> anyhow::Result<SafekeeperPostgresCommand> {
         let re = Regex::new(r"START_WAL_PUSH(\s+?\((.*)\))?").unwrap();
         let caps = re
             .captures(cmd)
-            .context(format!("failed to parse START_WAL_PUSH command {}", cmd))?;
+            .context(format!("failed to parse START_WAL_PUSH command {cmd}"))?;
         // capture () content
         let options = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         // default values
@@ -84,24 +85,20 @@ fn parse_cmd(cmd: &str) -> anyhow::Result<SafekeeperPostgresCommand> {
             }
             let mut kvit = kvstr.split_whitespace();
             let key = kvit.next().context(format!(
-                "failed to parse key in kv {} in command {}",
-                kvstr, cmd
+                "failed to parse key in kv {kvstr} in command {cmd}"
             ))?;
             let value = kvit.next().context(format!(
-                "failed to parse value in kv {} in command {}",
-                kvstr, cmd
+                "failed to parse value in kv {kvstr} in command {cmd}"
             ))?;
             let value_trimmed = value.trim_matches('\'');
             if key == "proto_version" {
                 proto_version = value_trimmed.parse::<u32>().context(format!(
-                    "failed to parse proto_version value {} in command {}",
-                    value, cmd
+                    "failed to parse proto_version value {value} in command {cmd}"
                 ))?;
             }
             if key == "allow_timeline_creation" {
                 allow_timeline_creation = value_trimmed.parse::<bool>().context(format!(
-                    "failed to parse allow_timeline_creation value {} in command {}",
-                    value, cmd
+                    "failed to parse allow_timeline_creation value {value} in command {cmd}"
                 ))?;
             }
         }
@@ -117,7 +114,7 @@ fn parse_cmd(cmd: &str) -> anyhow::Result<SafekeeperPostgresCommand> {
         .unwrap();
         let caps = re
             .captures(cmd)
-            .context(format!("failed to parse START_REPLICATION command {}", cmd))?;
+            .context(format!("failed to parse START_REPLICATION command {cmd}"))?;
         let start_lsn =
             Lsn::from_str(&caps[1]).context("parse start LSN from START_REPLICATION command")?;
         let term = if let Some(m) = caps.get(2) {
@@ -278,7 +275,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send> postgres_backend::Handler<IO>
             .auth
             .as_ref()
             .expect("auth_type is configured but .auth of handler is missing");
-        let data = auth
+        let data: TokenData<Claims> = auth
             .decode(str::from_utf8(jwt_response).context("jwt response is not UTF-8")?)
             .map_err(|e| QueryError::Unauthorized(e.0))?;
 

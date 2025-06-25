@@ -6,7 +6,7 @@ use std::task::{Poll, ready};
 use futures::Future;
 use futures::future::poll_fn;
 use postgres_client::AsyncMessage;
-use postgres_client::tls::NoTlsStream;
+use postgres_client::tls::MakeTlsConnect;
 use smallvec::SmallVec;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
@@ -23,9 +23,12 @@ use super::conn_pool_lib::{
     Client, ClientDataEnum, ClientInnerCommon, ClientInnerExt, ConnInfo, EndpointConnPool,
     GlobalConnPool,
 };
+use crate::config::ComputeConfig;
 use crate::context::RequestContext;
 use crate::control_plane::messages::MetricsAuxInfo;
 use crate::metrics::Metrics;
+
+type TlsStream = <ComputeConfig as MakeTlsConnect<TcpStream>>::Stream;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ConnInfoWithAuth {
@@ -58,7 +61,7 @@ pub(crate) fn poll_client<C: ClientInnerExt>(
     ctx: &RequestContext,
     conn_info: ConnInfo,
     client: C,
-    mut connection: postgres_client::Connection<TcpStream, NoTlsStream>,
+    mut connection: postgres_client::Connection<TcpStream, TlsStream>,
     conn_id: uuid::Uuid,
     aux: MetricsAuxInfo,
 ) -> Client<C> {
@@ -186,7 +189,6 @@ impl ClientDataRemote {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used)]
 mod tests {
     use std::sync::atomic::AtomicBool;
 

@@ -20,6 +20,9 @@ from fixtures.remote_storage import LocalFsStorage, RemoteStorageKind
 from fixtures.utils import query_scalar, wait_until
 
 
+@pytest.mark.skip(
+    reason="We won't create future layers any more after https://github.com/neondatabase/neon/pull/10548"
+)
 @pytest.mark.parametrize(
     "attach_mode",
     ["default_generation", "same_generation"],
@@ -127,9 +130,9 @@ def test_issue_5878(neon_env_builder: NeonEnvBuilder, attach_mode: str):
 
     ip = get_index_part()
     assert len(ip.layer_metadata.keys())
-    assert (
-        ip.disk_consistent_lsn < last_record_lsn
-    ), "sanity check for what above loop is supposed to do"
+    assert ip.disk_consistent_lsn < last_record_lsn, (
+        "sanity check for what above loop is supposed to do"
+    )
 
     # create the image layer from the future
     env.storage_controller.pageserver_api().update_tenant_config(
@@ -233,9 +236,9 @@ def test_issue_5878(neon_env_builder: NeonEnvBuilder, attach_mode: str):
     start = time.monotonic()
     while True:
         post_stat = future_layer_path.stat()
-        assert (
-            pre_stat.st_mtime == post_stat.st_mtime
-        ), "observed PUT overtake the stucked DELETE => bug isn't fixed yet"
+        assert pre_stat.st_mtime == post_stat.st_mtime, (
+            "observed PUT overtake the stucked DELETE => bug isn't fixed yet"
+        )
         if time.monotonic() - start > max_race_opportunity_window:
             log.info(
                 "a correct implementation would never let the later PUT overtake the earlier DELETE"

@@ -4,8 +4,8 @@ use std::ops::Range;
 use anyhow::{Result, bail};
 use byteorder::{BE, ByteOrder};
 use bytes::Bytes;
-use postgres_ffi::relfile_utils::{FSM_FORKNUM, VISIBILITYMAP_FORKNUM};
-use postgres_ffi::{Oid, RepOriginId};
+use postgres_ffi_types::forknum::{FSM_FORKNUM, VISIBILITYMAP_FORKNUM};
+use postgres_ffi_types::{Oid, RepOriginId};
 use serde::{Deserialize, Serialize};
 use utils::const_assert;
 
@@ -194,7 +194,7 @@ impl Key {
     /// will be rejected on the write path.
     #[allow(dead_code)]
     pub fn is_valid_key_on_write_path_strong(&self) -> bool {
-        use postgres_ffi::pg_constants::{DEFAULTTABLESPACE_OID, GLOBALTABLESPACE_OID};
+        use postgres_ffi_types::constants::{DEFAULTTABLESPACE_OID, GLOBALTABLESPACE_OID};
         if !self.is_i128_representable() {
             return false;
         }
@@ -911,6 +911,11 @@ impl Key {
     }
 
     #[inline(always)]
+    pub fn is_rel_block_of_rel(&self, rel: Oid) -> bool {
+        self.is_rel_block_key() && self.field4 == rel
+    }
+
+    #[inline(always)]
     pub fn is_rel_dir_key(&self) -> bool {
         self.field1 == 0x00
             && self.field2 != 0
@@ -927,7 +932,7 @@ impl Key {
 
     /// Guaranteed to return `Ok()` if [`Self::is_rel_block_key`] returns `true` for `key`.
     #[inline(always)]
-    pub fn to_rel_block(self) -> anyhow::Result<(RelTag, BlockNumber)> {
+    pub fn to_rel_block(self) -> Result<(RelTag, BlockNumber), ToRelBlockError> {
         Ok(match self.field1 {
             0x00 => (
                 RelTag {
@@ -938,7 +943,7 @@ impl Key {
                 },
                 self.field6,
             ),
-            _ => anyhow::bail!("unexpected value kind 0x{:02x}", self.field1),
+            _ => return Err(ToRelBlockError(self.field1)),
         })
     }
 }
@@ -950,6 +955,17 @@ impl std::str::FromStr for Key {
         Self::from_hex(s)
     }
 }
+
+#[derive(Debug)]
+pub struct ToRelBlockError(u8);
+
+impl fmt::Display for ToRelBlockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unexpected value kind 0x{:02x}", self.0)
+    }
+}
+
+impl std::error::Error for ToRelBlockError {}
 
 #[cfg(test)]
 mod tests {

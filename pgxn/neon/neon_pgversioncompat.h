@@ -76,9 +76,17 @@ InitBufferTag(BufferTag *tag, const RelFileNode *rnode,
 
 #define BufTagGetRelNumber(tagp) ((tagp)->rnode.relNode)
 
+#define BufTagInit(tag, relNumber, forknum, blkno, spcOid, dbOid) \
+	do { \
+		RelFileNode rnode = { .spcNode = spcOid, .dbNode = dbOid, .relNode = relNumber}; \
+		(tag).forkNum = forknum; \
+		(tag).blockNum = blkno; \
+		(tag).rnode = rnode; \
+	} while (false)
+
 #define InvalidRelFileNumber InvalidOid
 
-#define SMgrRelGetRelInfo(reln) \
+#define SMgrRelGetRelInfo(reln)				\
 	(reln->smgr_rnode.node)
 
 #define DropRelationAllLocalBuffers DropRelFileNodeAllLocalBuffers
@@ -125,11 +133,26 @@ InitBufferTag(BufferTag *tag, const RelFileNode *rnode,
 		.relNumber = (tag).relNumber, \
 	})
 
+#define BufTagInit(tag, relNumber, forknum, blkno, spcOid, dbOid) \
+	do { \
+		(tag).forkNum = forknum; \
+		(tag).blockNum = blkno; \
+		(tag).spcOid = spcOid; \
+		(tag).dbOid = dbOid; \
+		(tag).relNumber = relNumber; \
+	} while (false)
+
 #define SMgrRelGetRelInfo(reln) \
 	((reln)->smgr_rlocator)
 
 #define DropRelationAllLocalBuffers DropRelationAllLocalBuffers
 #endif
+
+#define NRelFileInfoInvalidate(rinfo) do { \
+		NInfoGetSpcOid(rinfo) = InvalidOid; \
+		NInfoGetDbOid(rinfo) = InvalidOid; \
+		NInfoGetRelNumber(rinfo) = InvalidRelFileNumber; \
+	} while (0)
 
 #if PG_MAJORVERSION_NUM < 17
 #define ProcNumber BackendId
@@ -139,6 +162,7 @@ InitBufferTag(BufferTag *tag, const RelFileNode *rnode,
 
 #if PG_MAJORVERSION_NUM < 15
 extern void InitMaterializedSRF(FunctionCallInfo fcinfo, bits32 flags);
+extern TimeLineID GetWALInsertionTimeLine(void);
 #endif
 
 #endif							/* NEON_PGVERSIONCOMPAT_H */

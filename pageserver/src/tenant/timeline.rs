@@ -14,6 +14,7 @@ pub mod span;
 pub mod uninit;
 mod walreceiver;
 
+use hashlink::LruCache;
 use std::array;
 use std::cmp::{max, min};
 use std::collections::btree_map::Entry;
@@ -34,7 +35,11 @@ use fail::fail_point;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use handle::ShardTimelineId;
-use layer_manager::Shutdown;
+use layer_manager::{
+    LayerManagerLockHolder, LayerManagerReadGuard, LayerManagerWriteGuard, LockedLayerManager,
+    Shutdown,
+};
+
 use offload::OffloadError;
 use once_cell::sync::Lazy;
 use pageserver_api::config::tenant_conf_defaults::DEFAULT_PITR_INTERVAL;
@@ -51,11 +56,9 @@ use pageserver_api::models::{
 };
 use pageserver_api::reltag::{BlockNumber, RelTag};
 use pageserver_api::shard::{ShardIdentity, ShardIndex, ShardNumber, TenantShardId};
-#[cfg(test)]
-use pageserver_api::value::Value;
 use postgres_connection::PgConnectionConfig;
 use postgres_ffi::v14::xlog_utils;
-use postgres_ffi::{WAL_SEGMENT_SIZE, to_pg_timestamp};
+use postgres_ffi::{PgMajorVersion, WAL_SEGMENT_SIZE, to_pg_timestamp};
 use rand::Rng;
 use remote_storage::DownloadError;
 use serde_with::serde_as;
@@ -76,28 +79,34 @@ use utils::seqwait::SeqWait;
 use utils::simple_rcu::{Rcu, RcuReadGuard};
 use utils::sync::gate::{Gate, GateGuard};
 use utils::{completion, critical, fs_ext, pausable_failpoint};
+#[cfg(test)]
+use wal_decoder::models::value::Value;
 use wal_decoder::serialized_batch::{SerializedValueBatch, ValueMeta};
 
 use self::delete::DeleteTimelineFlow;
 pub(super) use self::eviction_task::EvictionTaskTenantState;
 use self::eviction_task::EvictionTaskTimelineState;
-use self::layer_manager::LayerManager;
 use self::logical_size::LogicalSize;
 use self::walreceiver::{WalReceiver, WalReceiverConf};
-use super::config::TenantConf;
+use super::remote_timeline_client::RemoteTimelineClient;
 use super::remote_timeline_client::index::{GcCompactionState, IndexPart};
-use super::remote_timeline_client::{RemoteTimelineClient, WaitCompletionError};
 use super::secondary::heatmap::HeatMapLayer;
 use super::storage_layer::{LayerFringe, LayerVisibilityHint, ReadableLayer};
+use super::tasks::log_compaction_error;
 use super::upload_queue::NotInitialized;
 use super::{
-    AttachedTenantConf, GcError, HeatMapTimeline, MaybeOffloaded,
+    AttachedTenantConf, BasebackupPrepareSender, GcError, HeatMapTimeline, MaybeOffloaded,
     debug_assert_current_span_has_tenant_and_timeline_id,
 };
+use crate::PERF_TRACE_TARGET;
 use crate::aux_file::AuxFileSizeEstimator;
+use crate::basebackup_cache::BasebackupPrepareRequest;
 use crate::config::PageServerConf;
-use crate::context::{DownloadBehavior, RequestContext};
+use crate::context::{
+    DownloadBehavior, PerfInstrumentFutureExt, RequestContext, RequestContextBuilder,
+};
 use crate::disk_usage_eviction_task::{DiskUsageEvictionInfo, EvictionCandidate, finite_f32};
+use crate::feature_resolver::FeatureResolver;
 use crate::keyspace::{KeyPartitioning, KeySpace};
 use crate::l0_flush::{self, L0FlushGlobalState};
 use crate::metrics::{
@@ -110,9 +119,9 @@ use crate::pgdatadir_mapping::{
     MAX_AUX_FILE_V2_DELTAS, MetricsUpdate,
 };
 use crate::task_mgr::TaskKind;
-use crate::tenant::config::{AttachmentMode, TenantConfOpt};
+use crate::tenant::config::AttachmentMode;
 use crate::tenant::gc_result::GcResult;
-use crate::tenant::layer_map::{LayerMap, SearchResult};
+use crate::tenant::layer_map::LayerMap;
 use crate::tenant::metadata::TimelineMetadata;
 use crate::tenant::storage_layer::delta_layer::DeltaEntry;
 use crate::tenant::storage_layer::inmemory_layer::IndexEntry;
@@ -126,6 +135,7 @@ use crate::tenant::tasks::BackgroundLoopKind;
 use crate::tenant::timeline::logical_size::CurrentLogicalSize;
 use crate::virtual_file::{MaybeFatalIo, VirtualFile};
 use crate::walingest::WalLagCooldown;
+use crate::walredo::RedoAttemptType;
 use crate::{ZERO_PAGE, task_mgr, walredo};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -168,19 +178,19 @@ pub enum LastImageLayerCreationStatus {
 
 impl std::fmt::Display for ImageLayerCreationMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
 /// Temporary function for immutable storage state refactor, ensures we are dropping mutex guard instead of other things.
 /// Can be removed after all refactors are done.
-fn drop_rlock<T>(rlock: tokio::sync::RwLockReadGuard<T>) {
+fn drop_layer_manager_rlock(rlock: LayerManagerReadGuard<'_>) {
     drop(rlock)
 }
 
 /// Temporary function for immutable storage state refactor, ensures we are dropping mutex guard instead of other things.
 /// Can be removed after all refactors are done.
-fn drop_wlock<T>(rlock: tokio::sync::RwLockWriteGuard<'_, T>) {
+fn drop_layer_manager_wlock(rlock: LayerManagerWriteGuard<'_>) {
     drop(rlock)
 }
 
@@ -191,16 +201,8 @@ pub struct TimelineResources {
     pub pagestream_throttle_metrics: Arc<crate::metrics::tenant_throttling::Pagestream>,
     pub l0_compaction_trigger: Arc<Notify>,
     pub l0_flush_global_state: l0_flush::L0FlushGlobalState,
-}
-
-/// The relation size cache caches relation sizes at the end of the timeline. It speeds up WAL
-/// ingestion considerably, because WAL ingestion needs to check on most records if the record
-/// implicitly extends the relation.  At startup, `complete_as_of` is initialized to the current end
-/// of the timeline (disk_consistent_lsn).  It's used on reads of relation sizes to check if the
-/// value can be used to also update the cache, see [`Timeline::update_cached_rel_size`].
-pub(crate) struct RelSizeCache {
-    pub(crate) complete_as_of: Lsn,
-    pub(crate) map: HashMap<RelTag, (Lsn, BlockNumber)>,
+    pub basebackup_prepare_sender: BasebackupPrepareSender,
+    pub feature_resolver: FeatureResolver,
 }
 
 pub struct Timeline {
@@ -223,7 +225,7 @@ pub struct Timeline {
     /// to shards, and is constant through the lifetime of this Timeline.
     shard_identity: ShardIdentity,
 
-    pub pg_version: u32,
+    pub pg_version: PgMajorVersion,
 
     /// The tuple has two elements.
     /// 1. `LayerFileManager` keeps track of the various physical representations of the layer files (inmem, local, remote).
@@ -242,7 +244,7 @@ pub struct Timeline {
     ///
     /// In the future, we'll be able to split up the tuple of LayerMap and `LayerFileManager`,
     /// so that e.g. on-demand-download/eviction, and layer spreading, can operate just on `LayerFileManager`.
-    pub(crate) layers: tokio::sync::RwLock<LayerManager>,
+    pub(crate) layers: LockedLayerManager,
 
     last_freeze_at: AtomicLsn,
     // Atomic would be more appropriate here.
@@ -361,7 +363,8 @@ pub struct Timeline {
     pub walreceiver: Mutex<Option<WalReceiver>>,
 
     /// Relation size cache
-    pub(crate) rel_size_cache: RwLock<RelSizeCache>,
+    pub(crate) rel_size_latest_cache: RwLock<HashMap<RelTag, (Lsn, BlockNumber)>>,
+    pub(crate) rel_size_snapshot_cache: Mutex<LruCache<(Lsn, RelTag), BlockNumber>>,
 
     download_all_remote_layers_task_info: RwLock<Option<DownloadRemoteLayersTaskInfo>>,
 
@@ -408,7 +411,7 @@ pub struct Timeline {
     /// Timeline deletion will acquire both compaction and gc locks in whatever order.
     gc_lock: tokio::sync::Mutex<()>,
 
-    /// Cloned from [`super::Tenant::pagestream_throttle`] on construction.
+    /// Cloned from [`super::TenantShard::pagestream_throttle`] on construction.
     pub(crate) pagestream_throttle: Arc<crate::tenant::throttle::Throttle>,
 
     /// Size estimator for aux file v2
@@ -443,6 +446,11 @@ pub struct Timeline {
     pub(crate) rel_size_v2_status: ArcSwapOption<RelSizeMigration>,
 
     wait_lsn_log_slow: tokio::sync::Semaphore,
+
+    /// A channel to send async requests to prepare a basebackup for the basebackup cache.
+    basebackup_prepare_sender: BasebackupPrepareSender,
+
+    feature_resolver: FeatureResolver,
 }
 
 pub(crate) enum PreviousHeatmap {
@@ -533,29 +541,24 @@ impl GcInfo {
 /// The `GcInfo` component describing which Lsns need to be retained.  Functionally, this
 /// is a single number (the oldest LSN which we must retain), but it internally distinguishes
 /// between time-based and space-based retention for observability and consumption metrics purposes.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct GcCutoffs {
-    /// Calculated from the [`TenantConf::gc_horizon`], this LSN indicates how much
+    /// Calculated from the [`pageserver_api::models::TenantConfig::gc_horizon`], this LSN indicates how much
     /// history we must keep to retain a specified number of bytes of WAL.
     pub(crate) space: Lsn,
 
-    /// Calculated from [`TenantConf::pitr_interval`], this LSN indicates how much
-    /// history we must keep to enable reading back at least the PITR interval duration.
-    pub(crate) time: Lsn,
-}
-
-impl Default for GcCutoffs {
-    fn default() -> Self {
-        Self {
-            space: Lsn::INVALID,
-            time: Lsn::INVALID,
-        }
-    }
+    /// Calculated from [`pageserver_api::models::TenantConfig::pitr_interval`], this LSN indicates
+    /// how much history we must keep to enable reading back at least the PITR interval duration.
+    ///
+    /// None indicates that the PITR cutoff has not been computed. A PITR interval of 0 will yield
+    /// Some(last_record_lsn).
+    pub(crate) time: Option<Lsn>,
 }
 
 impl GcCutoffs {
     fn select_min(&self) -> Lsn {
-        std::cmp::min(self.space, self.time)
+        // NB: if we haven't computed the PITR cutoff yet, we can't GC anything.
+        self.space.min(self.time.unwrap_or_default())
     }
 }
 
@@ -581,7 +584,7 @@ pub(crate) enum PageReconstructError {
     WalRedo(anyhow::Error),
 
     #[error("{0}")]
-    MissingKey(MissingKeyError),
+    MissingKey(Box<MissingKeyError>),
 }
 
 impl From<anyhow::Error> for PageReconstructError {
@@ -629,7 +632,7 @@ pub enum ReadPathLayerId {
 impl std::fmt::Display for ReadPathLayerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReadPathLayerId::PersistentLayer(key) => write!(f, "{}", key),
+            ReadPathLayerId::PersistentLayer(key) => write!(f, "{key}"),
             ReadPathLayerId::InMemoryLayer(range) => {
                 write!(f, "in-mem {}..{}", range.start, range.end)
             }
@@ -686,19 +689,26 @@ impl std::fmt::Display for ReadPath {
 
 #[derive(thiserror::Error)]
 pub struct MissingKeyError {
-    key: Key,
+    keyspace: KeySpace,
     shard: ShardNumber,
-    cont_lsn: Lsn,
-    request_lsn: Lsn,
+    query: Option<VersionedKeySpaceQuery>,
+    // This is largest request LSN from the get page request batch
+    original_hwm_lsn: Lsn,
     ancestor_lsn: Option<Lsn>,
     /// Debug information about the read path if there's an error
     read_path: Option<ReadPath>,
     backtrace: Option<std::backtrace::Backtrace>,
 }
 
+impl MissingKeyError {
+    fn enrich(&mut self, query: VersionedKeySpaceQuery) {
+        self.query = Some(query);
+    }
+}
+
 impl std::fmt::Debug for MissingKeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -706,20 +716,24 @@ impl std::fmt::Display for MissingKeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "could not find data for key {} (shard {:?}) at LSN {}, request LSN {}",
-            self.key, self.shard, self.cont_lsn, self.request_lsn
+            "could not find data for key {} (shard {:?}), original HWM LSN {}",
+            self.keyspace, self.shard, self.original_hwm_lsn
         )?;
 
         if let Some(ref ancestor_lsn) = self.ancestor_lsn {
-            write!(f, ", ancestor {}", ancestor_lsn)?;
+            write!(f, ", ancestor {ancestor_lsn}")?;
+        }
+
+        if let Some(ref query) = self.query {
+            write!(f, ", query {query}")?;
         }
 
         if let Some(ref read_path) = self.read_path {
-            write!(f, "\n{}", read_path)?;
+            write!(f, "\n{read_path}")?;
         }
 
         if let Some(ref backtrace) = self.backtrace {
-            write!(f, "\n{}", backtrace)?;
+            write!(f, "\n{backtrace}")?;
         }
 
         Ok(())
@@ -802,18 +816,18 @@ impl From<layer_manager::Shutdown> for FlushLayerError {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub(crate) enum GetVectoredError {
+pub enum GetVectoredError {
     #[error("timeline shutting down")]
     Cancelled,
 
-    #[error("requested too many keys: {0} > {}", Timeline::MAX_GET_VECTORED_KEYS)]
-    Oversized(u64),
+    #[error("requested too many keys: {0} > {1}")]
+    Oversized(u64, u64),
 
     #[error("requested at invalid LSN: {0}")]
     InvalidLsn(Lsn),
 
     #[error("requested key not found: {0}")]
-    MissingKey(MissingKeyError),
+    MissingKey(Box<MissingKeyError>),
 
     #[error("ancestry walk")]
     GetReadyAncestorError(#[source] GetReadyAncestorError),
@@ -835,7 +849,7 @@ impl From<GetReadyAncestorError> for GetVectoredError {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub(crate) enum GetReadyAncestorError {
+pub enum GetReadyAncestorError {
     #[error("ancestor LSN wait error")]
     AncestorLsnTimeout(#[from] WaitLsnError),
 
@@ -870,9 +884,14 @@ pub(crate) enum CompactFlags {
     OnlyL0Compaction,
     EnhancedGcBottomMostCompaction,
     DryRun,
-    /// Disables compaction yielding e.g. due to high L0 count. This is set e.g. when requesting
-    /// compaction via HTTP API.
-    NoYield,
+    /// Makes image compaction yield if there's pending L0 compaction. This should always be used in
+    /// the background compaction task, since we want to aggressively compact down L0 to bound
+    /// read amplification.
+    ///
+    /// It only makes sense to use this when `compaction_l0_first` is enabled (such that we yield to
+    /// an L0 compaction pass), and without `OnlyL0Compaction` (L0 compaction shouldn't yield for L0
+    /// compaction).
+    YieldForL0,
 }
 
 #[serde_with::serde_as]
@@ -888,6 +907,12 @@ pub(crate) struct CompactRequest {
     pub sub_compaction: bool,
     /// Max job size for each subcompaction job.
     pub sub_compaction_max_job_size_mb: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct MarkInvisibleRequest {
+    #[serde(default)]
+    pub is_visible: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -913,8 +938,8 @@ impl std::fmt::Debug for Timeline {
     }
 }
 
-#[derive(thiserror::Error, Debug)]
-pub(crate) enum WaitLsnError {
+#[derive(thiserror::Error, Debug, Clone)]
+pub enum WaitLsnError {
     // Called on a timeline which is shutting down
     #[error("Shutdown")]
     Shutdown,
@@ -926,6 +951,18 @@ pub(crate) enum WaitLsnError {
     // Timeout expired while waiting for LSN to catch up with goal.
     #[error("{0}")]
     Timeout(String),
+}
+
+impl From<WaitLsnError> for tonic::Status {
+    fn from(err: WaitLsnError) -> Self {
+        use tonic::Code;
+        let code = match &err {
+            WaitLsnError::Timeout(_) => Code::Internal,
+            WaitLsnError::BadState(_) => Code::Internal,
+            WaitLsnError::Shutdown => Code::Unavailable,
+        };
+        tonic::Status::new(code, err.to_string())
+    }
 }
 
 // The impls below achieve cancellation mapping for errors.
@@ -961,6 +998,16 @@ impl From<PageReconstructError> for CreateImageLayersError {
     }
 }
 
+impl From<super::storage_layer::errors::PutError> for CreateImageLayersError {
+    fn from(e: super::storage_layer::errors::PutError) -> Self {
+        if e.is_cancel() {
+            CreateImageLayersError::Cancelled
+        } else {
+            CreateImageLayersError::Other(e.into_anyhow())
+        }
+    }
+}
+
 impl From<GetVectoredError> for CreateImageLayersError {
     fn from(e: GetVectoredError) -> Self {
         match e {
@@ -975,7 +1022,7 @@ impl From<GetVectoredError> for PageReconstructError {
         match e {
             GetVectoredError::Cancelled => PageReconstructError::Cancelled,
             GetVectoredError::InvalidLsn(_) => PageReconstructError::Other(anyhow!("Invalid LSN")),
-            err @ GetVectoredError::Oversized(_) => PageReconstructError::Other(err.into()),
+            err @ GetVectoredError::Oversized(_, _) => PageReconstructError::Other(err.into()),
             GetVectoredError::MissingKey(err) => PageReconstructError::MissingKey(err),
             GetVectoredError::GetReadyAncestorError(err) => PageReconstructError::from(err),
             GetVectoredError::Other(err) => PageReconstructError::Other(err),
@@ -1005,13 +1052,14 @@ pub(crate) enum WaitLsnWaiter<'a> {
     Tenant,
     PageService,
     HttpEndpoint,
+    BaseBackupCache,
 }
 
 /// Argument to [`Timeline::shutdown`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ShutdownMode {
-    /// Graceful shutdown, may do a lot of I/O as we flush any open layers to disk and then
-    /// also to remote storage.  This method can easily take multiple seconds for a busy timeline.
+    /// Graceful shutdown, may do a lot of I/O as we flush any open layers to disk. This method can
+    /// take multiple seconds for a busy timeline.
     ///
     /// While we are flushing, we continue to accept read I/O for LSNs ingested before
     /// the call to [`Timeline::shutdown`].
@@ -1025,6 +1073,7 @@ pub(crate) enum ShutdownMode {
     Hard,
 }
 
+#[allow(clippy::large_enum_variant, reason = "TODO")]
 enum ImageLayerCreationOutcome {
     /// We generated an image layer
     Generated {
@@ -1059,11 +1108,14 @@ impl Timeline {
     /// Get the bytes written since the PITR cutoff on this branch, and
     /// whether this branch's ancestor_lsn is within its parent's PITR.
     pub(crate) fn get_pitr_history_stats(&self) -> (u64, bool) {
+        // TODO: for backwards compatibility, we return the full history back to 0 when the PITR
+        // cutoff has not yet been initialized. This should return None instead, but this is exposed
+        // in external HTTP APIs and callers may not handle a null value.
         let gc_info = self.gc_info.read().unwrap();
         let history = self
             .get_last_record_lsn()
-            .checked_sub(gc_info.cutoffs.time)
-            .unwrap_or(Lsn(0))
+            .checked_sub(gc_info.cutoffs.time.unwrap_or_default())
+            .unwrap_or_default()
             .0;
         (history, gc_info.within_ancestor_pitr)
     }
@@ -1073,9 +1125,10 @@ impl Timeline {
         self.applied_gc_cutoff_lsn.read()
     }
 
-    /// Read timeline's planned GC cutoff: this is the logical end of history that users
-    /// are allowed to read (based on configured PITR), even if physically we have more history.
-    pub(crate) fn get_gc_cutoff_lsn(&self) -> Lsn {
+    /// Read timeline's planned GC cutoff: this is the logical end of history that users are allowed
+    /// to read (based on configured PITR), even if physically we have more history. Returns None
+    /// if the PITR cutoff has not yet been initialized.
+    pub(crate) fn get_gc_cutoff_lsn(&self) -> Option<Lsn> {
         self.gc_info.read().unwrap().cutoffs.time
     }
 
@@ -1112,14 +1165,12 @@ impl Timeline {
         // page_service.
         debug_assert!(!self.shard_identity.is_key_disposable(&key));
 
-        let keyspace = KeySpace {
-            ranges: vec![key..key.next()],
-        };
-
         let mut reconstruct_state = ValuesReconstructState::new(IoConcurrency::sequential());
 
+        let query = VersionedKeySpaceQuery::uniform(KeySpace::single(key..key.next()), lsn);
+
         let vectored_res = self
-            .get_vectored_impl(keyspace.clone(), lsn, &mut reconstruct_state, ctx)
+            .get_vectored_impl(query, &mut reconstruct_state, ctx)
             .await;
 
         let key_value = vectored_res?.pop_first();
@@ -1137,19 +1188,20 @@ impl Timeline {
                     value
                 }
             }
-            None => Err(PageReconstructError::MissingKey(MissingKeyError {
-                key,
-                shard: self.shard_identity.get_shard_number(&key),
-                cont_lsn: Lsn(0),
-                request_lsn: lsn,
-                ancestor_lsn: None,
-                backtrace: None,
-                read_path: None,
-            })),
+            None => Err(PageReconstructError::MissingKey(Box::new(
+                MissingKeyError {
+                    keyspace: KeySpace::single(key..key.next()),
+                    shard: self.shard_identity.get_shard_number(&key),
+                    original_hwm_lsn: lsn,
+                    ancestor_lsn: None,
+                    backtrace: None,
+                    read_path: None,
+                    query: None,
+                },
+            ))),
         }
     }
 
-    pub(crate) const MAX_GET_VECTORED_KEYS: u64 = 32;
     pub(crate) const LAYERS_VISITED_WARN_THRESHOLD: u32 = 100;
 
     /// Look up multiple page versions at a given LSN
@@ -1158,21 +1210,21 @@ impl Timeline {
     /// which actually vectorizes the read path.
     pub(crate) async fn get_vectored(
         &self,
-        keyspace: KeySpace,
-        lsn: Lsn,
+        query: VersionedKeySpaceQuery,
         io_concurrency: super::storage_layer::IoConcurrency,
         ctx: &RequestContext,
     ) -> Result<BTreeMap<Key, Result<Bytes, PageReconstructError>>, GetVectoredError> {
-        if !lsn.is_valid() {
-            return Err(GetVectoredError::InvalidLsn(lsn));
+        let total_keyspace = query.total_keyspace();
+
+        let key_count = total_keyspace.total_raw_size();
+        if key_count > self.conf.max_get_vectored_keys.get() {
+            return Err(GetVectoredError::Oversized(
+                key_count as u64,
+                self.conf.max_get_vectored_keys.get() as u64,
+            ));
         }
 
-        let key_count = keyspace.total_raw_size().try_into().unwrap();
-        if key_count > Timeline::MAX_GET_VECTORED_KEYS {
-            return Err(GetVectoredError::Oversized(key_count));
-        }
-
-        for range in &keyspace.ranges {
+        for range in &total_keyspace.ranges {
             let mut key = range.start;
             while key != range.end {
                 assert!(!self.shard_identity.is_key_disposable(&key));
@@ -1181,9 +1233,8 @@ impl Timeline {
         }
 
         trace!(
-            "get vectored request for {:?}@{} from task kind {:?}",
-            keyspace,
-            lsn,
+            "get vectored query {} from task kind {:?}",
+            query,
             ctx.task_kind(),
         );
 
@@ -1192,12 +1243,7 @@ impl Timeline {
             .map(|metric| (metric, Instant::now()));
 
         let res = self
-            .get_vectored_impl(
-                keyspace.clone(),
-                lsn,
-                &mut ValuesReconstructState::new(io_concurrency),
-                ctx,
-            )
+            .get_vectored_impl(query, &mut ValuesReconstructState::new(io_concurrency), ctx)
             .await;
 
         if let Some((metric, start)) = start {
@@ -1248,13 +1294,10 @@ impl Timeline {
             .for_task_kind(ctx.task_kind())
             .map(ScanLatencyOngoingRecording::start_recording);
 
+        let query = VersionedKeySpaceQuery::uniform(keyspace, lsn);
+
         let vectored_res = self
-            .get_vectored_impl(
-                keyspace.clone(),
-                lsn,
-                &mut ValuesReconstructState::new(io_concurrency),
-                ctx,
-            )
+            .get_vectored_impl(query, &mut ValuesReconstructState::new(io_concurrency), ctx)
             .await;
 
         if let Some(recording) = start {
@@ -1266,21 +1309,47 @@ impl Timeline {
 
     pub(super) async fn get_vectored_impl(
         &self,
-        keyspace: KeySpace,
-        lsn: Lsn,
+        query: VersionedKeySpaceQuery,
         reconstruct_state: &mut ValuesReconstructState,
         ctx: &RequestContext,
     ) -> Result<BTreeMap<Key, Result<Bytes, PageReconstructError>>, GetVectoredError> {
+        if query.is_empty() {
+            return Ok(BTreeMap::default());
+        }
+
         let read_path = if self.conf.enable_read_path_debugging || ctx.read_path_debug() {
-            Some(ReadPath::new(keyspace.clone(), lsn))
+            Some(ReadPath::new(
+                query.total_keyspace(),
+                query.high_watermark_lsn()?,
+            ))
         } else {
             None
         };
+
         reconstruct_state.read_path = read_path;
 
-        let traversal_res: Result<(), _> = self
-            .get_vectored_reconstruct_data(keyspace.clone(), lsn, reconstruct_state, ctx)
-            .await;
+        let redo_attempt_type = if ctx.task_kind() == TaskKind::Compaction {
+            RedoAttemptType::LegacyCompaction
+        } else {
+            RedoAttemptType::ReadPage
+        };
+
+        let traversal_res: Result<(), _> = {
+            let ctx = RequestContextBuilder::from(ctx)
+                .perf_span(|crnt_perf_span| {
+                    info_span!(
+                        target: PERF_TRACE_TARGET,
+                        parent: crnt_perf_span,
+                        "PLAN_IO",
+                    )
+                })
+                .attached_child();
+
+            self.get_vectored_reconstruct_data(query.clone(), reconstruct_state, &ctx)
+                .maybe_perf_instrument(&ctx, |crnt_perf_span| crnt_perf_span.clone())
+                .await
+        };
+
         if let Err(err) = traversal_res {
             // Wait for all the spawned IOs to complete.
             // See comments on `spawn_io` inside `storage_layer` for more details.
@@ -1289,19 +1358,60 @@ impl Timeline {
                 .map(|state| state.collect_pending_ios())
                 .collect::<FuturesUnordered<_>>();
             while collect_futs.next().await.is_some() {}
+
+            // Enrich the missing key error with the original query.
+            if let GetVectoredError::MissingKey(mut missing_err) = err {
+                missing_err.enrich(query.clone());
+                return Err(GetVectoredError::MissingKey(missing_err));
+            }
+
             return Err(err);
         };
 
         let layers_visited = reconstruct_state.get_layers_visited();
 
+        let ctx = RequestContextBuilder::from(ctx)
+            .perf_span(|crnt_perf_span| {
+                info_span!(
+                    target: PERF_TRACE_TARGET,
+                    parent: crnt_perf_span,
+                    "RECONSTRUCT",
+                )
+            })
+            .attached_child();
+
         let futs = FuturesUnordered::new();
         for (key, state) in std::mem::take(&mut reconstruct_state.keys) {
+            let req_lsn_for_key = query.map_key_to_lsn(&key);
+
             futs.push({
                 let walredo_self = self.myself.upgrade().expect("&self method holds the arc");
+                let ctx = RequestContextBuilder::from(&ctx)
+                    .perf_span(|crnt_perf_span| {
+                        info_span!(
+                            target: PERF_TRACE_TARGET,
+                            parent: crnt_perf_span,
+                            "RECONSTRUCT_KEY",
+                            key = %key,
+                        )
+                    })
+                    .attached_child();
+
                 async move {
                     assert_eq!(state.situation, ValueReconstructSituation::Complete);
 
-                    let converted = match state.collect_pending_ios().await {
+                    let res = state
+                        .collect_pending_ios()
+                        .maybe_perf_instrument(&ctx, |crnt_perf_span| {
+                            info_span!(
+                                target: PERF_TRACE_TARGET,
+                                parent: crnt_perf_span,
+                                "WAIT_FOR_IO_COMPLETIONS",
+                            )
+                        })
+                        .await;
+
+                    let converted = match res {
                         Ok(ok) => ok,
                         Err(err) => {
                             return (key, Err(err));
@@ -1318,16 +1428,27 @@ impl Timeline {
                         "{converted:?}"
                     );
 
-                    (
-                        key,
-                        walredo_self.reconstruct_value(key, lsn, converted).await,
-                    )
+                    let walredo_deltas = converted.num_deltas();
+                    let walredo_res = walredo_self
+                        .reconstruct_value(key, req_lsn_for_key, converted, redo_attempt_type)
+                        .maybe_perf_instrument(&ctx, |crnt_perf_span| {
+                            info_span!(
+                                target: PERF_TRACE_TARGET,
+                                parent: crnt_perf_span,
+                                "WALREDO",
+                                deltas = %walredo_deltas,
+                            )
+                        })
+                        .await;
+
+                    (key, walredo_res)
                 }
             });
         }
 
         let results = futs
             .collect::<BTreeMap<Key, Result<Bytes, PageReconstructError>>>()
+            .maybe_perf_instrument(&ctx, |crnt_perf_span| crnt_perf_span.clone())
             .await;
 
         // For aux file keys (v1 or v2) the vectored read path does not return an error
@@ -1336,15 +1457,18 @@ impl Timeline {
         // to avoid infinite results.
         if !results.is_empty() {
             if layers_visited >= Self::LAYERS_VISITED_WARN_THRESHOLD {
+                let total_keyspace = query.total_keyspace();
+                let max_request_lsn = query.high_watermark_lsn().expect("Validated previously");
+
                 static LOG_PACER: Lazy<Mutex<RateLimit>> =
                     Lazy::new(|| Mutex::new(RateLimit::new(Duration::from_secs(60))));
                 LOG_PACER.lock().unwrap().call(|| {
-                    let num_keys = keyspace.total_raw_size();
+                    let num_keys = total_keyspace.total_raw_size();
                     let num_pages = results.len();
                     tracing::info!(
                       shard_id = %self.tenant_shard_id.shard_slug(),
-                      lsn = %lsn,
-                      "Vectored read for {keyspace} visited {layers_visited} layers. Returned {num_pages}/{num_keys} pages.",
+                      lsn = %max_request_lsn,
+                      "Vectored read for {total_keyspace} visited {layers_visited} layers. Returned {num_pages}/{num_keys} pages.",
                     );
                 });
             }
@@ -1414,7 +1538,10 @@ impl Timeline {
     /// This method makes no distinction between local and remote layers.
     /// Hence, the result **does not represent local filesystem usage**.
     pub(crate) async fn layer_size_sum(&self) -> u64 {
-        let guard = self.layers.read().await;
+        let guard = self
+            .layers
+            .read(LayerManagerLockHolder::GetLayerMapInfo)
+            .await;
         guard.layer_size_sum()
     }
 
@@ -1457,7 +1584,8 @@ impl Timeline {
                         }
                         WaitLsnWaiter::Tenant
                         | WaitLsnWaiter::PageService
-                        | WaitLsnWaiter::HttpEndpoint => unreachable!(
+                        | WaitLsnWaiter::HttpEndpoint
+                        | WaitLsnWaiter::BaseBackupCache => unreachable!(
                             "tenant or page_service context are not expected to have task kind {:?}",
                             ctx.task_kind()
                         ),
@@ -1723,7 +1851,7 @@ impl Timeline {
         // time, and this was missed.
         // if write_guard.is_none() { return; }
 
-        let Ok(layers_guard) = self.layers.try_read() else {
+        let Ok(layers_guard) = self.layers.try_read(LayerManagerLockHolder::TryFreezeLayer) else {
             // Don't block if the layer lock is busy
             return;
         };
@@ -1774,16 +1902,11 @@ impl Timeline {
             return;
         };
 
-        let Some(current_size) = open_layer.try_len() else {
-            // Unexpected: since we hold the write guard, nobody else should be writing to this layer, so
-            // read lock to get size should always succeed.
-            tracing::warn!("Lock conflict while reading size of open layer");
-            return;
-        };
+        let current_size = open_layer.len();
 
         let current_lsn = self.get_last_record_lsn();
 
-        let checkpoint_distance_override = open_layer.tick().await;
+        let checkpoint_distance_override = open_layer.tick();
 
         if let Some(size_override) = checkpoint_distance_override {
             if current_size > size_override {
@@ -1856,18 +1979,23 @@ impl Timeline {
         flags: EnumSet<CompactFlags>,
         ctx: &RequestContext,
     ) -> Result<CompactionOutcome, CompactionError> {
-        self.compact_with_options(
-            cancel,
-            CompactOptions {
-                flags,
-                compact_key_range: None,
-                compact_lsn_range: None,
-                sub_compaction: false,
-                sub_compaction_max_job_size_mb: None,
-            },
-            ctx,
-        )
-        .await
+        let res = self
+            .compact_with_options(
+                cancel,
+                CompactOptions {
+                    flags,
+                    compact_key_range: None,
+                    compact_lsn_range: None,
+                    sub_compaction: false,
+                    sub_compaction_max_job_size_mb: None,
+                },
+                ctx,
+            )
+            .await;
+        if let Err(err) = &res {
+            log_compaction_error(err, None, cancel.is_cancelled(), false);
+        }
+        res
     }
 
     /// Outermost timeline compaction operation; downloads needed layers.
@@ -1886,18 +2014,19 @@ impl Timeline {
         // out by other background tasks (including image compaction). We request this via
         // `BackgroundLoopKind::L0Compaction`.
         //
-        // If this is a regular compaction pass, and L0-only compaction is enabled in the config,
-        // then we should yield for immediate L0 compaction if necessary while we're waiting for the
-        // background task semaphore. There's no point yielding otherwise, since we'd just end up
-        // right back here.
+        // Yield for pending L0 compaction while waiting for the semaphore.
         let is_l0_only = options.flags.contains(CompactFlags::OnlyL0Compaction);
         let semaphore_kind = match is_l0_only && self.get_compaction_l0_semaphore() {
             true => BackgroundLoopKind::L0Compaction,
             false => BackgroundLoopKind::Compaction,
         };
-        let yield_for_l0 = !is_l0_only
-            && self.get_compaction_l0_first()
-            && !options.flags.contains(CompactFlags::NoYield);
+        let yield_for_l0 = options.flags.contains(CompactFlags::YieldForL0);
+        if yield_for_l0 {
+            // If this is an L0 pass, it doesn't make sense to yield for L0.
+            debug_assert!(!is_l0_only, "YieldForL0 during L0 pass");
+            // If `compaction_l0_first` is disabled, there's no point yielding.
+            debug_assert!(self.get_compaction_l0_first(), "YieldForL0 without L0 pass");
+        }
 
         let acquire = async move {
             let guard = self.compaction_lock.lock().await;
@@ -1967,7 +2096,7 @@ impl Timeline {
 
     pub(crate) fn activate(
         self: &Arc<Self>,
-        parent: Arc<crate::tenant::Tenant>,
+        parent: Arc<crate::tenant::TenantShard>,
         broker_client: BrokerClientChannel,
         background_jobs_can_start: Option<&completion::Barrier>,
         ctx: &RequestContext,
@@ -2015,22 +2144,14 @@ impl Timeline {
         debug_assert_current_span_has_tenant_and_timeline_id();
 
         // Regardless of whether we're going to try_freeze_and_flush
-        // or not, stop ingesting any more data. Walreceiver only provides
-        // cancellation but no "wait until gone", because it uses the Timeline::gate.
-        // So, only after the self.gate.close() below will we know for sure that
-        // no walreceiver tasks are left.
-        // For `try_freeze_and_flush=true`, this means that we might still be ingesting
-        // data during the call to `self.freeze_and_flush()` below.
-        // That's not ideal, but, we don't have the concept of a ChildGuard,
-        // which is what we'd need to properly model early shutdown of the walreceiver
-        // task sub-tree before the other Timeline task sub-trees.
+        // or not, stop ingesting any more data.
         let walreceiver = self.walreceiver.lock().unwrap().take();
         tracing::debug!(
             is_some = walreceiver.is_some(),
             "Waiting for WalReceiverManager..."
         );
         if let Some(walreceiver) = walreceiver {
-            walreceiver.cancel();
+            walreceiver.shutdown().await;
         }
         // ... and inform any waiters for newer LSNs that there won't be any.
         self.last_record_lsn.shutdown();
@@ -2038,7 +2159,7 @@ impl Timeline {
         if let ShutdownMode::FreezeAndFlush = mode {
             let do_flush = if let Some((open, frozen)) = self
                 .layers
-                .read()
+                .read(LayerManagerLockHolder::Shutdown)
                 .await
                 .layer_map()
                 .map(|lm| (lm.open_layer.is_some(), lm.frozen_layers.len()))
@@ -2142,7 +2263,10 @@ impl Timeline {
             // Allow any remaining in-memory layers to do cleanup -- until that, they hold the gate
             // open.
             let mut write_guard = self.write_lock.lock().await;
-            self.layers.write().await.shutdown(&mut write_guard);
+            self.layers
+                .write(LayerManagerLockHolder::Shutdown)
+                .await
+                .shutdown(&mut write_guard);
         }
 
         // Finally wait until any gate-holders are complete.
@@ -2204,6 +2328,10 @@ impl Timeline {
         self.remote_client.is_archived()
     }
 
+    pub(crate) fn is_invisible(&self) -> Option<bool> {
+        self.remote_client.is_invisible()
+    }
+
     pub(crate) fn is_stopping(&self) -> bool {
         self.current_state() == TimelineState::Stopping
     }
@@ -2226,7 +2354,7 @@ impl Timeline {
                         .await
                         .expect("holding a reference to self");
                 }
-                TimelineState::Active { .. } => {
+                TimelineState::Active => {
                     return Ok(());
                 }
                 TimelineState::Broken { .. } | TimelineState::Stopping => {
@@ -2241,7 +2369,10 @@ impl Timeline {
         &self,
         reset: LayerAccessStatsReset,
     ) -> Result<LayerMapInfo, layer_manager::Shutdown> {
-        let guard = self.layers.read().await;
+        let guard = self
+            .layers
+            .read(LayerManagerLockHolder::GetLayerMapInfo)
+            .await;
         let layer_map = guard.layer_map()?;
         let mut in_memory_layers = Vec::with_capacity(layer_map.frozen_layers.len() + 1);
         if let Some(open_layer) = &layer_map.open_layer {
@@ -2360,6 +2491,48 @@ impl Timeline {
             false
         }
     }
+
+    pub(crate) fn is_basebackup_cache_enabled(&self) -> bool {
+        let tenant_conf = self.tenant_conf.load();
+        tenant_conf
+            .tenant_conf
+            .basebackup_cache_enabled
+            .unwrap_or(self.conf.default_tenant_conf.basebackup_cache_enabled)
+    }
+
+    /// Prepare basebackup for the given LSN and store it in the basebackup cache.
+    /// The method is asynchronous and returns immediately.
+    /// The actual basebackup preparation is performed in the background
+    /// by the basebackup cache on a best-effort basis.
+    pub(crate) fn prepare_basebackup(&self, lsn: Lsn) {
+        if !self.is_basebackup_cache_enabled() {
+            return;
+        }
+        if !self.tenant_shard_id.is_shard_zero() {
+            // In theory we should never get here, but just in case check it.
+            // Preparing basebackup doesn't make sense for shards other than shard zero.
+            return;
+        }
+        if !self.is_active() {
+            // May happen during initial timeline creation.
+            // Such timeline is not in the global timeline map yet,
+            // so basebackup cache will not be able to find it.
+            // TODO(diko): We can prepare such timelines in finish_creation().
+            return;
+        }
+
+        let res = self
+            .basebackup_prepare_sender
+            .send(BasebackupPrepareRequest {
+                tenant_shard_id: self.tenant_shard_id,
+                timeline_id: self.timeline_id,
+                lsn,
+            });
+        if let Err(e) = res {
+            // May happen during shutdown, it's not critical.
+            info!("Failed to send shutdown checkpoint: {e:#}");
+        }
+    }
 }
 
 /// Number of times we will compute partition within a checkpoint distance.
@@ -2396,6 +2569,31 @@ impl Timeline {
             .unwrap_or(self.conf.default_tenant_conf.lazy_slru_download)
     }
 
+    /// Checks if a get page request should get perf tracing
+    ///
+    /// The configuration priority is: tenant config override, default tenant config,
+    /// pageserver config.
+    pub(crate) fn is_get_page_request_sampled(&self) -> bool {
+        let tenant_conf = self.tenant_conf.load();
+        let ratio = tenant_conf
+            .tenant_conf
+            .sampling_ratio
+            .flatten()
+            .or(self.conf.default_tenant_conf.sampling_ratio)
+            .or(self.conf.tracing.as_ref().map(|t| t.sampling_ratio));
+
+        match ratio {
+            Some(r) => {
+                if r.numerator == 0 {
+                    false
+                } else {
+                    rand::thread_rng().gen_range(0..r.denominator) < r.numerator
+                }
+            }
+            None => false,
+        }
+    }
+
     fn get_checkpoint_distance(&self) -> u64 {
         let tenant_conf = self.tenant_conf.load();
         tenant_conf
@@ -2410,6 +2608,13 @@ impl Timeline {
             .tenant_conf
             .checkpoint_timeout
             .unwrap_or(self.conf.default_tenant_conf.checkpoint_timeout)
+    }
+
+    pub(crate) fn get_pitr_interval(&self) -> Duration {
+        let tenant_conf = &self.tenant_conf.load().tenant_conf;
+        tenant_conf
+            .pitr_interval
+            .unwrap_or(self.conf.default_tenant_conf.pitr_interval)
     }
 
     fn get_compaction_period(&self) -> Duration {
@@ -2557,14 +2762,6 @@ impl Timeline {
         Some(max(l0_flush_stall_threshold, compaction_threshold))
     }
 
-    fn get_l0_flush_wait_upload(&self) -> bool {
-        let tenant_conf = self.tenant_conf.load();
-        tenant_conf
-            .tenant_conf
-            .l0_flush_wait_upload
-            .unwrap_or(self.conf.default_tenant_conf.l0_flush_wait_upload)
-    }
-
     fn get_image_creation_threshold(&self) -> usize {
         let tenant_conf = self.tenant_conf.load();
         tenant_conf
@@ -2583,6 +2780,14 @@ impl Timeline {
             .clone()
     }
 
+    pub fn get_compaction_shard_ancestor(&self) -> bool {
+        let tenant_conf = self.tenant_conf.load();
+        tenant_conf
+            .tenant_conf
+            .compaction_shard_ancestor
+            .unwrap_or(self.conf.default_tenant_conf.compaction_shard_ancestor)
+    }
+
     fn get_eviction_policy(&self) -> EvictionPolicy {
         let tenant_conf = self.tenant_conf.load();
         tenant_conf
@@ -2592,8 +2797,8 @@ impl Timeline {
     }
 
     fn get_evictions_low_residence_duration_metric_threshold(
-        tenant_conf: &TenantConfOpt,
-        default_tenant_conf: &TenantConf,
+        tenant_conf: &pageserver_api::models::TenantConfig,
+        default_tenant_conf: &pageserver_api::config::TenantConfigToml,
     ) -> Duration {
         tenant_conf
             .evictions_low_residence_duration_metric_threshold
@@ -2618,6 +2823,10 @@ impl Timeline {
             .tenant_conf
             .gc_compaction_enabled
             .unwrap_or(self.conf.default_tenant_conf.gc_compaction_enabled);
+        let gc_compaction_verification = tenant_conf
+            .tenant_conf
+            .gc_compaction_verification
+            .unwrap_or(self.conf.default_tenant_conf.gc_compaction_verification);
         let gc_compaction_initial_threshold_kb = tenant_conf
             .tenant_conf
             .gc_compaction_initial_threshold_kb
@@ -2632,6 +2841,7 @@ impl Timeline {
             .unwrap_or(self.conf.default_tenant_conf.gc_compaction_ratio_percent);
         GcCompactionCombinedSettings {
             gc_compaction_enabled,
+            gc_compaction_verification,
             gc_compaction_initial_threshold_kb,
             gc_compaction_ratio_percent,
         }
@@ -2647,21 +2857,6 @@ impl Timeline {
                     .default_tenant_conf
                     .image_creation_preempt_threshold,
             )
-    }
-
-    /// Resolve the effective WAL receiver protocol to use for this tenant.
-    ///
-    /// Priority order is:
-    /// 1. Tenant config override
-    /// 2. Default value for tenant config override
-    /// 3. Pageserver config override
-    /// 4. Pageserver config default
-    pub fn resolve_wal_receiver_protocol(&self) -> PostgresClientProtocol {
-        let tenant_conf = self.tenant_conf.load().tenant_conf.clone();
-        tenant_conf
-            .wal_receiver_protocol_override
-            .or(self.conf.default_tenant_conf.wal_receiver_protocol_override)
-            .unwrap_or(self.conf.wal_receiver_protocol)
     }
 
     pub(super) fn tenant_conf_updated(&self, new_conf: &AttachedTenantConf) {
@@ -2681,6 +2876,13 @@ impl Timeline {
             let timeline_id_str = self.timeline_id.to_string();
 
             self.remote_client.update_config(&new_conf.location);
+
+            let mut rel_size_cache = self.rel_size_snapshot_cache.lock().unwrap();
+            if let Some(new_capacity) = new_conf.tenant_conf.relsize_snapshot_cache_capacity {
+                if new_capacity != rel_size_cache.capacity() {
+                    rel_size_cache.set_capacity(new_capacity);
+                }
+            }
 
             self.metrics
                 .evictions_with_low_residence_duration
@@ -2711,7 +2913,7 @@ impl Timeline {
         shard_identity: ShardIdentity,
         walredo_mgr: Option<Arc<super::WalRedoManager>>,
         resources: TimelineResources,
-        pg_version: u32,
+        pg_version: PgMajorVersion,
         state: TimelineState,
         attach_wal_lag_cooldown: Arc<OnceLock<WalLagCooldown>>,
         create_idempotency: crate::tenant::CreateTimelineIdempotency,
@@ -2739,6 +2941,14 @@ impl Timeline {
             let is_offloaded = MaybeOffloaded::No;
             ancestor_gc_info.insert_child(timeline_id, metadata.ancestor_lsn(), is_offloaded);
         }
+
+        let relsize_snapshot_cache_capacity = {
+            let loaded_tenant_conf = tenant_conf.load();
+            loaded_tenant_conf
+                .tenant_conf
+                .relsize_snapshot_cache_capacity
+                .unwrap_or(conf.default_tenant_conf.relsize_snapshot_cache_capacity)
+        };
 
         Arc::new_cyclic(|myself| {
             let metrics = Arc::new(TimelineMetrics::new(
@@ -2831,10 +3041,8 @@ impl Timeline {
                 last_image_layer_creation_check_instant: Mutex::new(None),
 
                 last_received_wal: Mutex::new(None),
-                rel_size_cache: RwLock::new(RelSizeCache {
-                    complete_as_of: disk_consistent_lsn,
-                    map: HashMap::new(),
-                }),
+                rel_size_latest_cache: RwLock::new(HashMap::new()),
+                rel_size_snapshot_cache: Mutex::new(LruCache::new(relsize_snapshot_cache_capacity)),
 
                 download_all_remote_layers_task_info: RwLock::new(None),
 
@@ -2879,6 +3087,10 @@ impl Timeline {
                 rel_size_v2_status: ArcSwapOption::from_pointee(rel_size_v2_status),
 
                 wait_lsn_log_slow: tokio::sync::Semaphore::new(1),
+
+                basebackup_prepare_sender: resources.basebackup_prepare_sender,
+
+                feature_resolver: resources.feature_resolver,
             };
 
             result.repartition_threshold =
@@ -3002,10 +3214,16 @@ impl Timeline {
             guard.is_none(),
             "multiple launches / re-launches of WAL receiver are not supported"
         );
+
+        let protocol = PostgresClientProtocol::Interpreted {
+            format: utils::postgres_client::InterpretedFormat::Protobuf,
+            compression: Some(utils::postgres_client::Compression::Zstd { level: 1 }),
+        };
+
         *guard = Some(WalReceiver::start(
             Arc::clone(self),
             WalReceiverConf {
-                protocol: self.resolve_wal_receiver_protocol(),
+                protocol,
                 wal_connect_timeout,
                 lagging_wal_timeout,
                 max_lsn_wal_lag,
@@ -3021,7 +3239,7 @@ impl Timeline {
 
     /// Initialize with an empty layer map. Used when creating a new timeline.
     pub(super) fn init_empty_layer_map(&self, start_lsn: Lsn) {
-        let mut layers = self.layers.try_write().expect(
+        let mut layers = self.layers.try_write(LayerManagerLockHolder::Init).expect(
             "in the context where we call this function, no other task has access to the object",
         );
         layers
@@ -3041,7 +3259,10 @@ impl Timeline {
         use init::Decision::*;
         use init::{Discovered, DismissedLayer};
 
-        let mut guard = self.layers.write().await;
+        let mut guard = self
+            .layers
+            .write(LayerManagerLockHolder::LoadLayerMap)
+            .await;
 
         let timer = self.metrics.load_layer_map_histo.start_timer();
 
@@ -3193,12 +3414,8 @@ impl Timeline {
         //     (1) and (4)
         // TODO: this is basically a no-op now, should we remove it?
         self.remote_client.schedule_barrier()?;
-        // Tenant::create_timeline will wait for these uploads to happen before returning, or
+        // TenantShard::create_timeline will wait for these uploads to happen before returning, or
         // on retry.
-
-        // Now that we have the full layer map, we may calculate the visibility of layers within it (a global scan)
-        drop(guard); // drop write lock, update_layer_visibility will take a read lock.
-        self.update_layer_visibility().await?;
 
         info!(
             "loaded layer map with {} layers at {}, total physical size: {}",
@@ -3392,7 +3609,7 @@ impl Timeline {
                 };
 
                 let io_concurrency = IoConcurrency::spawn_from_conf(
-                    self_ref.conf,
+                    self_ref.conf.get_vectored_concurrent_io,
                     self_ref
                         .gate
                         .enter()
@@ -3658,7 +3875,10 @@ impl Timeline {
         &self,
         layer_name: &LayerName,
     ) -> Result<Option<Layer>, layer_manager::Shutdown> {
-        let guard = self.layers.read().await;
+        let guard = self
+            .layers
+            .read(LayerManagerLockHolder::GetLayerMapInfo)
+            .await;
         let layer = guard
             .layer_map()?
             .iter_historic_layers()
@@ -3691,7 +3911,10 @@ impl Timeline {
             return None;
         }
 
-        let guard = self.layers.read().await;
+        let guard = self
+            .layers
+            .read(LayerManagerLockHolder::GenerateHeatmap)
+            .await;
 
         // Firstly, if there's any heatmap left over from when this location
         // was a secondary, take that into account. Keep layers that are:
@@ -3789,7 +4012,10 @@ impl Timeline {
     }
 
     pub(super) async fn generate_unarchival_heatmap(&self, end_lsn: Lsn) -> PreviousHeatmap {
-        let guard = self.layers.read().await;
+        let guard = self
+            .layers
+            .read(LayerManagerLockHolder::GenerateHeatmap)
+            .await;
 
         let now = SystemTime::now();
         let mut heatmap_layers = Vec::default();
@@ -3830,6 +4056,154 @@ impl Timeline {
     }
 }
 
+#[derive(Clone)]
+/// Type representing a query in the ([`Lsn`], [`Key`]) space.
+/// In other words, a set of segments in a 2D space.
+///
+/// This representation has the advatange of avoiding hash map
+/// allocations for uniform queries.
+pub(crate) enum VersionedKeySpaceQuery {
+    /// Variant for queries at a single [`Lsn`]
+    Uniform { keyspace: KeySpace, lsn: Lsn },
+    /// Variant for queries at multiple [`Lsn`]s
+    Scattered {
+        keyspaces_at_lsn: Vec<(Lsn, KeySpace)>,
+    },
+}
+
+impl VersionedKeySpaceQuery {
+    pub(crate) fn uniform(keyspace: KeySpace, lsn: Lsn) -> Self {
+        Self::Uniform { keyspace, lsn }
+    }
+
+    pub(crate) fn scattered(keyspaces_at_lsn: Vec<(Lsn, KeySpace)>) -> Self {
+        Self::Scattered { keyspaces_at_lsn }
+    }
+
+    /// Returns the most recent (largest) LSN included in the query.
+    /// If any of the LSNs included in the query are invalid, returns
+    /// an error instead.
+    fn high_watermark_lsn(&self) -> Result<Lsn, GetVectoredError> {
+        match self {
+            Self::Uniform { lsn, .. } => {
+                if !lsn.is_valid() {
+                    return Err(GetVectoredError::InvalidLsn(*lsn));
+                }
+
+                Ok(*lsn)
+            }
+            Self::Scattered { keyspaces_at_lsn } => {
+                let mut max_lsn = None;
+                for (lsn, _keyspace) in keyspaces_at_lsn.iter() {
+                    if !lsn.is_valid() {
+                        return Err(GetVectoredError::InvalidLsn(*lsn));
+                    }
+                    max_lsn = std::cmp::max(max_lsn, Some(lsn));
+                }
+
+                if let Some(computed) = max_lsn {
+                    Ok(*computed)
+                } else {
+                    Err(GetVectoredError::Other(anyhow!("empty input")))
+                }
+            }
+        }
+    }
+
+    /// Returns the total keyspace being queried: the result of projecting
+    /// everything in the key dimensions onto the key axis.
+    fn total_keyspace(&self) -> KeySpace {
+        match self {
+            Self::Uniform { keyspace, .. } => keyspace.clone(),
+            Self::Scattered { keyspaces_at_lsn } => keyspaces_at_lsn
+                .iter()
+                .map(|(_lsn, keyspace)| keyspace)
+                .fold(KeySpace::default(), |mut acc, v| {
+                    acc.merge(v);
+                    acc
+                }),
+        }
+    }
+
+    /// Returns LSN for a specific key.
+    ///
+    /// Invariant: requested key must be part of [`Self::total_keyspace`]
+    pub(super) fn map_key_to_lsn(&self, key: &Key) -> Lsn {
+        match self {
+            Self::Uniform { lsn, .. } => *lsn,
+            Self::Scattered { keyspaces_at_lsn } => {
+                keyspaces_at_lsn
+                    .iter()
+                    .find(|(_lsn, keyspace)| keyspace.contains(key))
+                    .expect("Returned key was requested")
+                    .0
+            }
+        }
+    }
+
+    /// Remove any parts of the query (segments) which overlap with the provided
+    /// key space (also segments).
+    fn remove_overlapping_with(&mut self, to_remove: &KeySpace) -> KeySpace {
+        match self {
+            Self::Uniform { keyspace, .. } => keyspace.remove_overlapping_with(to_remove),
+            Self::Scattered { keyspaces_at_lsn } => {
+                let mut removed_accum = KeySpaceRandomAccum::new();
+                keyspaces_at_lsn.iter_mut().for_each(|(_lsn, keyspace)| {
+                    let removed = keyspace.remove_overlapping_with(to_remove);
+                    removed_accum.add_keyspace(removed);
+                });
+
+                removed_accum.to_keyspace()
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Uniform { keyspace, .. } => keyspace.is_empty(),
+            Self::Scattered { keyspaces_at_lsn } => keyspaces_at_lsn
+                .iter()
+                .all(|(_lsn, keyspace)| keyspace.is_empty()),
+        }
+    }
+
+    /// "Lower" the query on the LSN dimension
+    fn lower(&mut self, to: Lsn) {
+        match self {
+            Self::Uniform { lsn, .. } => {
+                // If the originally requested LSN is smaller than the starting
+                // LSN of the ancestor we are descending into, we need to respect that.
+                // Hence the min.
+                *lsn = std::cmp::min(*lsn, to);
+            }
+            Self::Scattered { keyspaces_at_lsn } => {
+                keyspaces_at_lsn.iter_mut().for_each(|(lsn, _keyspace)| {
+                    *lsn = std::cmp::min(*lsn, to);
+                });
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for VersionedKeySpaceQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[")?;
+
+        match self {
+            VersionedKeySpaceQuery::Uniform { keyspace, lsn } => {
+                write!(f, "{keyspace} @ {lsn}")?;
+            }
+            VersionedKeySpaceQuery::Scattered { keyspaces_at_lsn } => {
+                for (lsn, keyspace) in keyspaces_at_lsn.iter() {
+                    write!(f, "{keyspace} @ {lsn},")?;
+                }
+            }
+        }
+
+        write!(f, "]")
+    }
+}
+
 impl Timeline {
     #[allow(clippy::doc_lazy_continuation)]
     /// Get the data needed to reconstruct all keys in the provided keyspace
@@ -3844,15 +4218,14 @@ impl Timeline {
     /// 2.4. If the fringe is empty, go back to 1
     async fn get_vectored_reconstruct_data(
         &self,
-        mut keyspace: KeySpace,
-        request_lsn: Lsn,
+        mut query: VersionedKeySpaceQuery,
         reconstruct_state: &mut ValuesReconstructState,
         ctx: &RequestContext,
     ) -> Result<(), GetVectoredError> {
+        let original_hwm_lsn = query.high_watermark_lsn().unwrap();
+
         let mut timeline_owned: Arc<Timeline>;
         let mut timeline = self;
-
-        let mut cont_lsn = Lsn(request_lsn.0 + 1);
 
         let missing_keyspace = loop {
             if self.cancel.is_cancelled() {
@@ -3862,33 +4235,47 @@ impl Timeline {
             let TimelineVisitOutcome {
                 completed_keyspace: completed,
                 image_covered_keyspace,
-            } = Self::get_vectored_reconstruct_data_timeline(
-                timeline,
-                keyspace.clone(),
-                cont_lsn,
-                reconstruct_state,
-                &self.cancel,
-                ctx,
-            )
-            .await?;
+            } = {
+                let ctx = RequestContextBuilder::from(ctx)
+                    .perf_span(|crnt_perf_span| {
+                        info_span!(
+                            target: PERF_TRACE_TARGET,
+                            parent: crnt_perf_span,
+                            "PLAN_IO_TIMELINE",
+                            timeline = %timeline.timeline_id,
+                            high_watermark_lsn = %query.high_watermark_lsn().unwrap(),
+                        )
+                    })
+                    .attached_child();
 
-            keyspace.remove_overlapping_with(&completed);
+                Self::get_vectored_reconstruct_data_timeline(
+                    timeline,
+                    &query,
+                    reconstruct_state,
+                    &self.cancel,
+                    &ctx,
+                )
+                .maybe_perf_instrument(&ctx, |crnt_perf_span| crnt_perf_span.clone())
+                .await?
+            };
+
+            query.remove_overlapping_with(&completed);
 
             // Do not descend into the ancestor timeline for aux files.
             // We don't return a blanket [`GetVectoredError::MissingKey`] to avoid
             // stalling compaction.
-            keyspace.remove_overlapping_with(&KeySpace {
+            query.remove_overlapping_with(&KeySpace {
                 ranges: vec![NON_INHERITED_RANGE, Key::sparse_non_inherited_keyspace()],
             });
 
             // Keyspace is fully retrieved
-            if keyspace.is_empty() {
+            if query.is_empty() {
                 break None;
             }
 
             let Some(ancestor_timeline) = timeline.ancestor_timeline.as_ref() else {
                 // Not fully retrieved but no ancestor timeline.
-                break Some(keyspace);
+                break Some(query.total_keyspace());
             };
 
             // Now we see if there are keys covered by the image layer but does not exist in the
@@ -3899,7 +4286,7 @@ impl Timeline {
             // keys from `keyspace`, we expect there to be no overlap between it and the image covered key
             // space. If that's not the case, we had at least one key encounter a gap in the image layer
             // and stop the search as a result of that.
-            let mut removed = keyspace.remove_overlapping_with(&image_covered_keyspace);
+            let mut removed = query.remove_overlapping_with(&image_covered_keyspace);
             // Do not fire missing key error and end early for sparse keys. Note that we hava already removed
             // non-inherited keyspaces before, so we can safely do a full `SPARSE_RANGE` remove instead of
             // figuring out what is the inherited key range and do a fine-grained pruning.
@@ -3909,13 +4296,28 @@ impl Timeline {
             if !removed.is_empty() {
                 break Some(removed);
             }
-            // If we reached this point, `remove_overlapping_with` should not have made any change to the
-            // keyspace.
 
-            // Take the min to avoid reconstructing a page with data newer than request Lsn.
-            cont_lsn = std::cmp::min(Lsn(request_lsn.0 + 1), Lsn(timeline.ancestor_lsn.0 + 1));
+            // Each key range in the original query is at some point in the LSN space.
+            // When descending into the ancestor, lower all ranges in the LSN space
+            // such that new changes on the parent timeline are not visible.
+            query.lower(timeline.ancestor_lsn);
+
+            let ctx = RequestContextBuilder::from(ctx)
+                .perf_span(|crnt_perf_span| {
+                    info_span!(
+                        target: PERF_TRACE_TARGET,
+                        parent: crnt_perf_span,
+                        "GET_ANCESTOR",
+                        timeline = %timeline.timeline_id,
+                        ancestor = %ancestor_timeline.timeline_id,
+                        ancestor_lsn = %timeline.ancestor_lsn
+                    )
+                })
+                .attached_child();
+
             timeline_owned = timeline
-                .get_ready_ancestor_timeline(ancestor_timeline, ctx)
+                .get_ready_ancestor_timeline(ancestor_timeline, &ctx)
+                .maybe_perf_instrument(&ctx, |crnt_perf_span| crnt_perf_span.clone())
                 .await?;
             timeline = &*timeline_owned;
         };
@@ -3936,20 +4338,45 @@ impl Timeline {
         };
 
         if let Some(missing_keyspace) = missing_keyspace {
-            return Err(GetVectoredError::MissingKey(MissingKeyError {
-                key: missing_keyspace.start().unwrap(), /* better if we can store the full keyspace */
-                shard: self
-                    .shard_identity
-                    .get_shard_number(&missing_keyspace.start().unwrap()),
-                cont_lsn,
-                request_lsn,
+            return Err(GetVectoredError::MissingKey(Box::new(MissingKeyError {
+                keyspace: missing_keyspace, /* better if we can store the full keyspace */
+                shard: self.shard_identity.number,
+                original_hwm_lsn,
                 ancestor_lsn: Some(timeline.ancestor_lsn),
                 backtrace: None,
                 read_path: std::mem::take(&mut reconstruct_state.read_path),
-            }));
+                query: None,
+            })));
         }
 
         Ok(())
+    }
+
+    async fn get_vectored_init_fringe(
+        &self,
+        query: &VersionedKeySpaceQuery,
+    ) -> Result<LayerFringe, GetVectoredError> {
+        let mut fringe = LayerFringe::new();
+        let guard = self.layers.read(LayerManagerLockHolder::GetPage).await;
+
+        match query {
+            VersionedKeySpaceQuery::Uniform { keyspace, lsn } => {
+                // LSNs requested by the compute or determined by the pageserver
+                // are inclusive. Queries to the layer map use exclusive LSNs.
+                // Hence, bump the value before the query - same in the other
+                // match arm.
+                let cont_lsn = Lsn(lsn.0 + 1);
+                guard.update_search_fringe(keyspace, cont_lsn, &mut fringe)?;
+            }
+            VersionedKeySpaceQuery::Scattered { keyspaces_at_lsn } => {
+                for (lsn, keyspace) in keyspaces_at_lsn.iter() {
+                    let cont_lsn_for_keyspace = Lsn(lsn.0 + 1);
+                    guard.update_search_fringe(keyspace, cont_lsn_for_keyspace, &mut fringe)?;
+                }
+            }
+        }
+
+        Ok(fringe)
     }
 
     /// Collect the reconstruct data for a keyspace from the specified timeline.
@@ -3970,18 +4397,11 @@ impl Timeline {
     /// decides how to deal with these two keyspaces.
     async fn get_vectored_reconstruct_data_timeline(
         timeline: &Timeline,
-        keyspace: KeySpace,
-        mut cont_lsn: Lsn,
+        query: &VersionedKeySpaceQuery,
         reconstruct_state: &mut ValuesReconstructState,
         cancel: &CancellationToken,
         ctx: &RequestContext,
     ) -> Result<TimelineVisitOutcome, GetVectoredError> {
-        let mut unmapped_keyspace = keyspace.clone();
-        let mut fringe = LayerFringe::new();
-
-        let mut completed_keyspace = KeySpace::default();
-        let mut image_covered_keyspace = KeySpaceRandomAccum::new();
-
         // Prevent GC from progressing while visiting the current timeline.
         // If we are GC-ing because a new image layer was added while traversing
         // the timeline, then it will remove layers that are required for fulfilling
@@ -3992,10 +4412,36 @@ impl Timeline {
         // See `compaction::compact_with_gc` for why we need this.
         let _guard = timeline.gc_compaction_layer_update_lock.read().await;
 
-        loop {
+        // Initialize the fringe
+        let mut fringe = timeline.get_vectored_init_fringe(query).await?;
+
+        let mut completed_keyspace = KeySpace::default();
+        let mut image_covered_keyspace = KeySpaceRandomAccum::new();
+
+        while let Some((layer_to_read, keyspace_to_read, lsn_range)) = fringe.next_layer() {
             if cancel.is_cancelled() {
                 return Err(GetVectoredError::Cancelled);
             }
+
+            if let Some(ref mut read_path) = reconstruct_state.read_path {
+                read_path.record_layer_visit(&layer_to_read, &keyspace_to_read, &lsn_range);
+            }
+
+            // Visit the layer and plan IOs for it
+            let next_cont_lsn = lsn_range.start;
+            layer_to_read
+                .get_values_reconstruct_data(
+                    keyspace_to_read.clone(),
+                    lsn_range,
+                    reconstruct_state,
+                    ctx,
+                )
+                .await?;
+
+            let mut unmapped_keyspace = keyspace_to_read;
+            let cont_lsn = next_cont_lsn;
+
+            reconstruct_state.on_layer_visited(&layer_to_read);
 
             let (keys_done_last_step, keys_with_image_coverage) =
                 reconstruct_state.consume_done_keys();
@@ -4007,31 +4453,15 @@ impl Timeline {
                 image_covered_keyspace.add_range(keys_with_image_coverage);
             }
 
+            // Query the layer map for the next layers to read.
+            //
             // Do not descent any further if the last layer we visited
             // completed all keys in the keyspace it inspected. This is not
             // required for correctness, but avoids visiting extra layers
             // which turns out to be a perf bottleneck in some cases.
             if !unmapped_keyspace.is_empty() {
-                let guard = timeline.layers.read().await;
-                let layers = guard.layer_map()?;
-
-                for range in unmapped_keyspace.ranges.iter() {
-                    let results = layers.range_search(range.clone(), cont_lsn);
-
-                    results
-                        .found
-                        .into_iter()
-                        .map(|(SearchResult { layer, lsn_floor }, keyspace_accum)| {
-                            (
-                                guard.upgrade(layer),
-                                keyspace_accum.to_keyspace(),
-                                lsn_floor..cont_lsn,
-                            )
-                        })
-                        .for_each(|(layer, keyspace, lsn_range)| {
-                            fringe.update(layer, keyspace, lsn_range)
-                        });
-                }
+                let guard = timeline.layers.read(LayerManagerLockHolder::GetPage).await;
+                guard.update_search_fringe(&unmapped_keyspace, cont_lsn, &mut fringe)?;
 
                 // It's safe to drop the layer map lock after planning the next round of reads.
                 // The fringe keeps readable handles for the layers which are safe to read even
@@ -4044,28 +4474,6 @@ impl Timeline {
                 // range at *a particular point in time*. It is fine for the answer to be different
                 // at two different time points.
                 drop(guard);
-            }
-
-            if let Some((layer_to_read, keyspace_to_read, lsn_range)) = fringe.next_layer() {
-                if let Some(ref mut read_path) = reconstruct_state.read_path {
-                    read_path.record_layer_visit(&layer_to_read, &keyspace_to_read, &lsn_range);
-                }
-                let next_cont_lsn = lsn_range.start;
-                layer_to_read
-                    .get_values_reconstruct_data(
-                        keyspace_to_read.clone(),
-                        lsn_range,
-                        reconstruct_state,
-                        ctx,
-                    )
-                    .await?;
-
-                unmapped_keyspace = keyspace_to_read;
-                cont_lsn = next_cont_lsn;
-
-                reconstruct_state.on_layer_visited(&layer_to_read);
-            } else {
-                break;
             }
         }
 
@@ -4162,7 +4570,10 @@ impl Timeline {
         _guard: &tokio::sync::MutexGuard<'_, Option<TimelineWriterState>>,
         ctx: &RequestContext,
     ) -> anyhow::Result<Arc<InMemoryLayer>> {
-        let mut guard = self.layers.write().await;
+        let mut guard = self
+            .layers
+            .write(LayerManagerLockHolder::GetLayerForWrite)
+            .await;
 
         let last_record_lsn = self.get_last_record_lsn();
         ensure!(
@@ -4180,6 +4591,7 @@ impl Timeline {
                 self.timeline_id,
                 self.tenant_shard_id,
                 &self.gate,
+                &self.cancel,
                 ctx,
             )
             .await?;
@@ -4203,7 +4615,10 @@ impl Timeline {
         write_lock: &mut tokio::sync::MutexGuard<'_, Option<TimelineWriterState>>,
     ) -> Result<u64, FlushLayerError> {
         let frozen = {
-            let mut guard = self.layers.write().await;
+            let mut guard = self
+                .layers
+                .write(LayerManagerLockHolder::TryFreezeLayer)
+                .await;
             guard
                 .open_mut()?
                 .try_freeze_in_memory_layer(at, &self.last_freeze_at, write_lock, &self.metrics)
@@ -4244,7 +4659,12 @@ impl Timeline {
         ctx: &RequestContext,
     ) {
         // Subscribe to L0 delta layer updates, for compaction backpressure.
-        let mut watch_l0 = match self.layers.read().await.layer_map() {
+        let mut watch_l0 = match self
+            .layers
+            .read(LayerManagerLockHolder::FlushLoop)
+            .await
+            .layer_map()
+        {
             Ok(lm) => lm.watch_level0_deltas(),
             Err(Shutdown) => return,
         };
@@ -4281,7 +4701,7 @@ impl Timeline {
 
                 // Fetch the next layer to flush, if any.
                 let (layer, l0_count, frozen_count, frozen_size) = {
-                    let layers = self.layers.read().await;
+                    let layers = self.layers.read(LayerManagerLockHolder::FlushLoop).await;
                     let Ok(lm) = layers.layer_map() else {
                         info!("dropping out of flush loop for timeline shutdown");
                         return;
@@ -4385,7 +4805,10 @@ impl Timeline {
                     || !flushed_to_lsn.is_valid()
             );
 
-            if flushed_to_lsn < frozen_to_lsn && self.shard_identity.count.count() > 1 {
+            if flushed_to_lsn < frozen_to_lsn
+                && self.shard_identity.count.count() > 1
+                && result.is_ok()
+            {
                 // If our layer flushes didn't carry disk_consistent_lsn up to the `to_lsn` advertised
                 // to us via layer_flush_start_rx, then advance it here.
                 //
@@ -4530,6 +4953,7 @@ impl Timeline {
                     LastImageLayerCreationStatus::Initial,
                     false, // don't yield for L0, we're flushing L0
                 )
+                .instrument(info_span!("create_image_layers", mode = %ImageLayerCreationMode::Initial, partition_mode = "initial", lsn = %self.initdb_lsn))
                 .await?;
             debug_assert!(
                 matches!(is_complete, LastImageLayerCreationStatus::Complete),
@@ -4563,13 +4987,20 @@ impl Timeline {
             return Err(FlushLayerError::Cancelled);
         }
 
+        fail_point!("flush-layer-before-update-remote-consistent-lsn", |_| {
+            Err(FlushLayerError::Other(anyhow!("failpoint").into()))
+        });
+
         let disk_consistent_lsn = Lsn(lsn_range.end.0 - 1);
 
         // The new on-disk layers are now in the layer map. We can remove the
         // in-memory layer from the map now. The flushed layer is stored in
         // the mapping in `create_delta_layer`.
         {
-            let mut guard = self.layers.write().await;
+            let mut guard = self
+                .layers
+                .write(LayerManagerLockHolder::FlushFrozenLayer)
+                .await;
 
             guard.open_mut()?.finish_flush_l0_layer(
                 delta_layer_to_add.as_ref(),
@@ -4584,27 +5015,6 @@ impl Timeline {
             }
             // release lock on 'layers'
         };
-
-        // Backpressure mechanism: wait with continuation of the flush loop until we have uploaded all layer files.
-        // This makes us refuse ingest until the new layers have been persisted to the remote
-        // TODO: remove this, and rely on l0_flush_{delay,stall}_threshold instead.
-        if self.get_l0_flush_wait_upload() {
-            let start = Instant::now();
-            self.remote_client
-                .wait_completion()
-                .await
-                .map_err(|e| match e {
-                    WaitCompletionError::UploadQueueShutDownOrStopped
-                    | WaitCompletionError::NotInitialized(
-                        NotInitialized::ShuttingDown | NotInitialized::Stopped,
-                    ) => FlushLayerError::Cancelled,
-                    WaitCompletionError::NotInitialized(NotInitialized::Uninitialized) => {
-                        FlushLayerError::Other(anyhow!(e).into())
-                    }
-                })?;
-            let duration = start.elapsed().as_secs_f64();
-            self.metrics.flush_wait_upload_time_gauge_add(duration);
-        }
 
         // FIXME: between create_delta_layer and the scheduling of the upload in `update_metadata_file`,
         // a compaction can delete the file and then it won't be available for uploads any more.
@@ -4700,7 +5110,13 @@ impl Timeline {
         let ctx = ctx.attached_child();
         let work = async move {
             let Some((desc, path)) = frozen_layer
-                .write_to_disk(&ctx, key_range, self_clone.l0_flush_global_state.inner())
+                .write_to_disk(
+                    &ctx,
+                    key_range,
+                    self_clone.l0_flush_global_state.inner(),
+                    &self_clone.gate,
+                    self_clone.cancel.clone(),
+                )
                 .await?
             else {
                 return Ok(None);
@@ -4786,7 +5202,11 @@ impl Timeline {
         }
 
         let (dense_ks, sparse_ks) = self.collect_keyspace(lsn, ctx).await?;
-        let dense_partitioning = dense_ks.partition(&self.shard_identity, partition_size);
+        let dense_partitioning = dense_ks.partition(
+            &self.shard_identity,
+            partition_size,
+            postgres_ffi::BLCKSZ as u64,
+        );
         let sparse_partitioning = SparseKeyPartitioning {
             parts: vec![sparse_ks],
         }; // no partitioning for metadata keys for now
@@ -4799,7 +5219,7 @@ impl Timeline {
     async fn time_for_new_image_layer(&self, partition: &KeySpace, lsn: Lsn) -> bool {
         let threshold = self.get_image_creation_threshold();
 
-        let guard = self.layers.read().await;
+        let guard = self.layers.read(LayerManagerLockHolder::Compaction).await;
         let Ok(layers) = guard.layer_map() else {
             return false;
         };
@@ -4883,16 +5303,14 @@ impl Timeline {
                 key = key.next();
 
                 // Maybe flush `key_rest_accum`
-                if key_request_accum.raw_size() >= Timeline::MAX_GET_VECTORED_KEYS
+                if key_request_accum.raw_size() >= self.conf.max_get_vectored_keys.get() as u64
                     || (last_key_in_range && key_request_accum.raw_size() > 0)
                 {
+                    let query =
+                        VersionedKeySpaceQuery::uniform(key_request_accum.consume_keyspace(), lsn);
+
                     let results = self
-                        .get_vectored(
-                            key_request_accum.consume_keyspace(),
-                            lsn,
-                            io_concurrency.clone(),
-                            ctx,
-                        )
+                        .get_vectored(query, io_concurrency.clone(), ctx)
                         .await?;
 
                     if self.cancel.is_cancelled() {
@@ -4981,7 +5399,11 @@ impl Timeline {
         // Directly use `get_vectored_impl` to skip the max_vectored_read_key limit check. Note that the keyspace should
         // not contain too many keys, otherwise this takes a lot of memory.
         let data = self
-            .get_vectored_impl(partition.clone(), lsn, &mut reconstruct_state, ctx)
+            .get_vectored_impl(
+                VersionedKeySpaceQuery::uniform(partition.clone(), lsn),
+                &mut reconstruct_state,
+                ctx,
+            )
             .await?;
         let (data, total_kb_retrieved, total_keys_retrieved) = {
             let mut new_data = BTreeMap::new();
@@ -5099,7 +5521,8 @@ impl Timeline {
 
     /// Returns the image layers generated and an enum indicating whether the process is fully completed.
     /// true = we have generate all image layers, false = we preempt the process for L0 compaction.
-    #[tracing::instrument(skip_all, fields(%lsn, %mode))]
+    ///
+    /// `partition_mode` is only for logging purpose and is not used anywhere in this function.
     async fn create_image_layers(
         self: &Arc<Timeline>,
         partitioning: &KeyPartitioning,
@@ -5214,7 +5637,7 @@ impl Timeline {
             if let ImageLayerCreationMode::Force = mode {
                 // When forced to create image layers, we might try and create them where they already
                 // exist.  This mode is only used in tests/debug.
-                let layers = self.layers.read().await;
+                let layers = self.layers.read(LayerManagerLockHolder::Compaction).await;
                 if layers.contains_key(&PersistentLayerKey {
                     key_range: img_range.clone(),
                     lsn_range: PersistentLayerDesc::image_layer_lsn_range(lsn),
@@ -5238,6 +5661,8 @@ impl Timeline {
                 self.tenant_shard_id,
                 &img_range,
                 lsn,
+                &self.gate,
+                self.cancel.clone(),
                 ctx,
             )
             .await?;
@@ -5249,7 +5674,7 @@ impl Timeline {
             });
 
             let io_concurrency = IoConcurrency::spawn_from_conf(
-                self.conf,
+                self.conf.get_vectored_concurrent_io,
                 self.gate
                     .enter()
                     .map_err(|_| CreateImageLayersError::Cancelled)?,
@@ -5337,7 +5762,7 @@ impl Timeline {
 
         let image_layers = batch_image_writer.finish(self, ctx).await?;
 
-        let mut guard = self.layers.write().await;
+        let mut guard = self.layers.write(LayerManagerLockHolder::Compaction).await;
 
         // FIXME: we could add the images to be uploaded *before* returning from here, but right
         // now they are being scheduled outside of write lock; current way is inconsistent with
@@ -5345,7 +5770,7 @@ impl Timeline {
         guard
             .open_mut()?
             .track_new_image_layers(&image_layers, &self.metrics);
-        drop_wlock(guard);
+        drop_layer_manager_wlock(guard);
         let duration = timer.stop_and_record();
 
         // Creating image layers may have caused some previously visible layers to be covered
@@ -5406,6 +5831,12 @@ impl Timeline {
             return;
         }
 
+        if self.cancel.is_cancelled() {
+            // We already requested stopping the tenant, so we cannot wait for the logical size
+            // calculation to complete given the task might have been already cancelled.
+            return;
+        }
+
         if let Some(await_bg_cancel) = self
             .current_logical_size
             .cancel_wait_for_background_loop_concurrency_limit_semaphore
@@ -5444,7 +5875,7 @@ impl Timeline {
     /// from our ancestor to be branches of this timeline.
     pub(crate) async fn prepare_to_detach_from_ancestor(
         self: &Arc<Timeline>,
-        tenant: &crate::tenant::Tenant,
+        tenant: &crate::tenant::TenantShard,
         options: detach_ancestor::Options,
         behavior: DetachBehavior,
         ctx: &RequestContext,
@@ -5463,7 +5894,7 @@ impl Timeline {
     /// resetting the tenant.
     pub(crate) async fn detach_from_ancestor_and_reparent(
         self: &Arc<Timeline>,
-        tenant: &crate::tenant::Tenant,
+        tenant: &crate::tenant::TenantShard,
         prepared: detach_ancestor::PreparedTimelineDetach,
         ancestor_timeline_id: TimelineId,
         ancestor_lsn: Lsn,
@@ -5487,7 +5918,7 @@ impl Timeline {
     /// The tenant must've been reset if ancestry was modified previously (in tenant manager).
     pub(crate) async fn complete_detaching_timeline_ancestor(
         self: &Arc<Timeline>,
-        tenant: &crate::tenant::Tenant,
+        tenant: &crate::tenant::TenantShard,
         attempt: detach_ancestor::Attempt,
         ctx: &RequestContext,
     ) -> Result<(), detach_ancestor::Error> {
@@ -5503,7 +5934,7 @@ impl Drop for Timeline {
             if let Ok(mut gc_info) = ancestor.gc_info.write() {
                 if !gc_info.remove_child_not_offloaded(self.timeline_id) {
                     tracing::error!(tenant_id = %self.tenant_shard_id.tenant_id, shard_id = %self.tenant_shard_id.shard_slug(), timeline_id = %self.timeline_id,
-                        "Couldn't remove retain_lsn entry from offloaded timeline's parent: already removed");
+                        "Couldn't remove retain_lsn entry from timeline's parent on drop: already removed");
                 }
             }
         }
@@ -5609,6 +6040,16 @@ impl From<layer_manager::Shutdown> for CompactionError {
     }
 }
 
+impl From<super::storage_layer::errors::PutError> for CompactionError {
+    fn from(e: super::storage_layer::errors::PutError) -> Self {
+        if e.is_cancel() {
+            CompactionError::ShuttingDown
+        } else {
+            CompactionError::Other(e.into_anyhow())
+        }
+    }
+}
+
 #[serde_as]
 #[derive(serde::Serialize)]
 struct RecordedDuration(#[serde_as(as = "serde_with::DurationMicroSeconds")] Duration);
@@ -5699,7 +6140,7 @@ impl Timeline {
         layers_to_remove: &[Layer],
     ) -> Result<(), CompactionError> {
         let mut guard = tokio::select! {
-            guard = self.layers.write() => guard,
+            guard = self.layers.write(LayerManagerLockHolder::Compaction) => guard,
             _ = self.cancel.cancelled() => {
                 return Err(CompactionError::ShuttingDown);
             }
@@ -5748,7 +6189,7 @@ impl Timeline {
         self.remote_client
             .schedule_compaction_update(&remove_layers, new_deltas)?;
 
-        drop_wlock(guard);
+        drop_layer_manager_wlock(guard);
 
         Ok(())
     }
@@ -5758,7 +6199,7 @@ impl Timeline {
         mut replace_layers: Vec<(Layer, ResidentLayer)>,
         mut drop_layers: Vec<Layer>,
     ) -> Result<(), CompactionError> {
-        let mut guard = self.layers.write().await;
+        let mut guard = self.layers.write(LayerManagerLockHolder::Compaction).await;
 
         // Trim our lists in case our caller (compaction) raced with someone else (GC) removing layers: we want
         // to avoid double-removing, and avoid rewriting something that was removed.
@@ -5904,14 +6345,12 @@ impl Timeline {
 
         pausable_failpoint!("Timeline::find_gc_cutoffs-pausable");
 
-        if cfg!(test) {
+        if cfg!(test) && pitr == Duration::ZERO {
             // Unit tests which specify zero PITR interval expect to avoid doing any I/O for timestamp lookup
-            if pitr == Duration::ZERO {
-                return Ok(GcCutoffs {
-                    time: self.get_last_record_lsn(),
-                    space: space_cutoff,
-                });
-            }
+            return Ok(GcCutoffs {
+                time: Some(self.get_last_record_lsn()),
+                space: space_cutoff,
+            });
         }
 
         // Calculate a time-based limit on how much to retain:
@@ -5925,14 +6364,14 @@ impl Timeline {
                 // PITR is not set. Retain the size-based limit, or the default time retention,
                 // whichever requires less data.
                 GcCutoffs {
-                    time: self.get_last_record_lsn(),
+                    time: Some(self.get_last_record_lsn()),
                     space: std::cmp::max(time_cutoff, space_cutoff),
                 }
             }
             (Duration::ZERO, None) => {
                 // PITR is not set, and time lookup failed
                 GcCutoffs {
-                    time: self.get_last_record_lsn(),
+                    time: Some(self.get_last_record_lsn()),
                     space: space_cutoff,
                 }
             }
@@ -5940,7 +6379,7 @@ impl Timeline {
                 // PITR interval is set & we didn't look up a timestamp successfully.  Conservatively assume PITR
                 // cannot advance beyond what was already GC'd, and respect space-based retention
                 GcCutoffs {
-                    time: *self.get_applied_gc_cutoff_lsn(),
+                    time: Some(*self.get_applied_gc_cutoff_lsn()),
                     space: space_cutoff,
                 }
             }
@@ -5948,7 +6387,7 @@ impl Timeline {
                 // PITR interval is set and we looked up timestamp successfully.  Ignore
                 // size based retention and make time cutoff authoritative
                 GcCutoffs {
-                    time: time_cutoff,
+                    time: Some(time_cutoff),
                     space: time_cutoff,
                 }
             }
@@ -6001,7 +6440,7 @@ impl Timeline {
             )
         };
 
-        let mut new_gc_cutoff = Lsn::min(space_cutoff, time_cutoff);
+        let mut new_gc_cutoff = space_cutoff.min(time_cutoff.unwrap_or_default());
         let standby_horizon = self.standby_horizon.load();
         // Hold GC for the standby, but as a safety guard do it only within some
         // reasonable lag.
@@ -6050,7 +6489,7 @@ impl Timeline {
     async fn gc_timeline(
         &self,
         space_cutoff: Lsn,
-        time_cutoff: Lsn,
+        time_cutoff: Option<Lsn>, // None if uninitialized
         retain_lsns: Vec<Lsn>,
         max_lsn_with_valid_lease: Option<Lsn>,
         new_gc_cutoff: Lsn,
@@ -6068,6 +6507,12 @@ impl Timeline {
             );
             return Ok(result);
         }
+
+        let Some(time_cutoff) = time_cutoff else {
+            // The GC cutoff should have been computed by now, but let's be defensive.
+            info!("Nothing to GC: time_cutoff not yet computed");
+            return Ok(result);
+        };
 
         // We need to ensure that no one tries to read page versions or create
         // branches at a point before latest_gc_cutoff_lsn. See branch_timeline()
@@ -6093,7 +6538,7 @@ impl Timeline {
 
         debug!("retain_lsns: {:?}", retain_lsns);
 
-        let mut layers_to_remove = Vec::new();
+        let max_retain_lsn = retain_lsns.iter().max();
 
         // Scan all layers in the timeline (remote or on-disk).
         //
@@ -6103,105 +6548,110 @@ impl Timeline {
         // 3. it doesn't need to be retained for 'retain_lsns';
         // 4. it does not need to be kept for LSNs holding valid leases.
         // 5. newer on-disk image layers cover the layer's whole key range
-        //
-        // TODO holding a write lock is too agressive and avoidable
-        let mut guard = self.layers.write().await;
-        let layers = guard.layer_map()?;
-        'outer: for l in layers.iter_historic_layers() {
-            result.layers_total += 1;
+        let layers_to_remove = {
+            let mut layers_to_remove = Vec::new();
 
-            // 1. Is it newer than GC horizon cutoff point?
-            if l.get_lsn_range().end > space_cutoff {
-                info!(
-                    "keeping {} because it's newer than space_cutoff {}",
-                    l.layer_name(),
-                    space_cutoff,
-                );
-                result.layers_needed_by_cutoff += 1;
-                continue 'outer;
-            }
+            let guard = self
+                .layers
+                .read(LayerManagerLockHolder::GarbageCollection)
+                .await;
+            let layers = guard.layer_map()?;
+            'outer: for l in layers.iter_historic_layers() {
+                result.layers_total += 1;
 
-            // 2. It is newer than PiTR cutoff point?
-            if l.get_lsn_range().end > time_cutoff {
-                info!(
-                    "keeping {} because it's newer than time_cutoff {}",
-                    l.layer_name(),
-                    time_cutoff,
-                );
-                result.layers_needed_by_pitr += 1;
-                continue 'outer;
-            }
-
-            // 3. Is it needed by a child branch?
-            // NOTE With that we would keep data that
-            // might be referenced by child branches forever.
-            // We can track this in child timeline GC and delete parent layers when
-            // they are no longer needed. This might be complicated with long inheritance chains.
-            //
-            // TODO Vec is not a great choice for `retain_lsns`
-            for retain_lsn in &retain_lsns {
-                // start_lsn is inclusive
-                if &l.get_lsn_range().start <= retain_lsn {
-                    info!(
-                        "keeping {} because it's still might be referenced by child branch forked at {} is_dropped: xx is_incremental: {}",
+                // 1. Is it newer than GC horizon cutoff point?
+                if l.get_lsn_range().end > space_cutoff {
+                    debug!(
+                        "keeping {} because it's newer than space_cutoff {}",
                         l.layer_name(),
-                        retain_lsn,
-                        l.is_incremental(),
+                        space_cutoff,
                     );
-                    result.layers_needed_by_branches += 1;
+                    result.layers_needed_by_cutoff += 1;
                     continue 'outer;
                 }
-            }
 
-            // 4. Is there a valid lease that requires us to keep this layer?
-            if let Some(lsn) = &max_lsn_with_valid_lease {
-                // keep if layer start <= any of the lease
-                if &l.get_lsn_range().start <= lsn {
-                    info!(
-                        "keeping {} because there is a valid lease preventing GC at {}",
+                // 2. It is newer than PiTR cutoff point?
+                if l.get_lsn_range().end > time_cutoff {
+                    debug!(
+                        "keeping {} because it's newer than time_cutoff {}",
                         l.layer_name(),
-                        lsn,
+                        time_cutoff,
                     );
-                    result.layers_needed_by_leases += 1;
+                    result.layers_needed_by_pitr += 1;
                     continue 'outer;
                 }
+
+                // 3. Is it needed by a child branch?
+                // NOTE With that we would keep data that
+                // might be referenced by child branches forever.
+                // We can track this in child timeline GC and delete parent layers when
+                // they are no longer needed. This might be complicated with long inheritance chains.
+                if let Some(retain_lsn) = max_retain_lsn {
+                    // start_lsn is inclusive
+                    if &l.get_lsn_range().start <= retain_lsn {
+                        debug!(
+                            "keeping {} because it's still might be referenced by child branch forked at {} is_dropped: xx is_incremental: {}",
+                            l.layer_name(),
+                            retain_lsn,
+                            l.is_incremental(),
+                        );
+                        result.layers_needed_by_branches += 1;
+                        continue 'outer;
+                    }
+                }
+
+                // 4. Is there a valid lease that requires us to keep this layer?
+                if let Some(lsn) = &max_lsn_with_valid_lease {
+                    // keep if layer start <= any of the lease
+                    if &l.get_lsn_range().start <= lsn {
+                        debug!(
+                            "keeping {} because there is a valid lease preventing GC at {}",
+                            l.layer_name(),
+                            lsn,
+                        );
+                        result.layers_needed_by_leases += 1;
+                        continue 'outer;
+                    }
+                }
+
+                // 5. Is there a later on-disk layer for this relation?
+                //
+                // The end-LSN is exclusive, while disk_consistent_lsn is
+                // inclusive. For example, if disk_consistent_lsn is 100, it is
+                // OK for a delta layer to have end LSN 101, but if the end LSN
+                // is 102, then it might not have been fully flushed to disk
+                // before crash.
+                //
+                // For example, imagine that the following layers exist:
+                //
+                // 1000      - image (A)
+                // 1000-2000 - delta (B)
+                // 2000      - image (C)
+                // 2000-3000 - delta (D)
+                // 3000      - image (E)
+                //
+                // If GC horizon is at 2500, we can remove layers A and B, but
+                // we cannot remove C, even though it's older than 2500, because
+                // the delta layer 2000-3000 depends on it.
+                if !layers
+                    .image_layer_exists(&l.get_key_range(), &(l.get_lsn_range().end..new_gc_cutoff))
+                {
+                    debug!("keeping {} because it is the latest layer", l.layer_name());
+                    result.layers_not_updated += 1;
+                    continue 'outer;
+                }
+
+                // We didn't find any reason to keep this file, so remove it.
+                info!(
+                    "garbage collecting {} is_dropped: xx is_incremental: {}",
+                    l.layer_name(),
+                    l.is_incremental(),
+                );
+                layers_to_remove.push(l);
             }
 
-            // 5. Is there a later on-disk layer for this relation?
-            //
-            // The end-LSN is exclusive, while disk_consistent_lsn is
-            // inclusive. For example, if disk_consistent_lsn is 100, it is
-            // OK for a delta layer to have end LSN 101, but if the end LSN
-            // is 102, then it might not have been fully flushed to disk
-            // before crash.
-            //
-            // For example, imagine that the following layers exist:
-            //
-            // 1000      - image (A)
-            // 1000-2000 - delta (B)
-            // 2000      - image (C)
-            // 2000-3000 - delta (D)
-            // 3000      - image (E)
-            //
-            // If GC horizon is at 2500, we can remove layers A and B, but
-            // we cannot remove C, even though it's older than 2500, because
-            // the delta layer 2000-3000 depends on it.
-            if !layers
-                .image_layer_exists(&l.get_key_range(), &(l.get_lsn_range().end..new_gc_cutoff))
-            {
-                info!("keeping {} because it is the latest layer", l.layer_name());
-                result.layers_not_updated += 1;
-                continue 'outer;
-            }
-
-            // We didn't find any reason to keep this file, so remove it.
-            info!(
-                "garbage collecting {} is_dropped: xx is_incremental: {}",
-                l.layer_name(),
-                l.is_incremental(),
-            );
-            layers_to_remove.push(l);
-        }
+            layers_to_remove
+        };
 
         if !layers_to_remove.is_empty() {
             // Persist the new GC cutoff value before we actually remove anything.
@@ -6217,15 +6667,19 @@ impl Timeline {
                     }
                 })?;
 
+            let mut guard = self
+                .layers
+                .write(LayerManagerLockHolder::GarbageCollection)
+                .await;
+
             let gc_layers = layers_to_remove
                 .iter()
-                .map(|x| guard.get_from_desc(x))
+                .flat_map(|desc| guard.try_get_from_key(&desc.key()).cloned())
                 .collect::<Vec<Layer>>();
 
             result.layers_removed = gc_layers.len() as u64;
 
             self.remote_client.schedule_gc_update(&gc_layers)?;
-
             guard.open_mut()?.finish_gc_timeline(&gc_layers);
 
             #[cfg(feature = "testing")]
@@ -6249,9 +6703,16 @@ impl Timeline {
         key: Key,
         request_lsn: Lsn,
         mut data: ValueReconstructState,
+        redo_attempt_type: RedoAttemptType,
     ) -> Result<Bytes, PageReconstructError> {
         // Perform WAL redo if needed
         data.records.reverse();
+
+        let fire_critical_error = match redo_attempt_type {
+            RedoAttemptType::ReadPage => true,
+            RedoAttemptType::LegacyCompaction => true,
+            RedoAttemptType::GcCompaction => false,
+        };
 
         // If we have a page image, and no WAL, we're all set
         if data.records.is_empty() {
@@ -6299,13 +6760,22 @@ impl Timeline {
                     .as_ref()
                     .context("timeline has no walredo manager")
                     .map_err(PageReconstructError::WalRedo)?
-                    .request_redo(key, request_lsn, data.img, data.records, self.pg_version)
+                    .request_redo(
+                        key,
+                        request_lsn,
+                        data.img,
+                        data.records,
+                        self.pg_version,
+                        redo_attempt_type,
+                    )
                     .await;
                 let img = match res {
                     Ok(img) => img,
                     Err(walredo::Error::Cancelled) => return Err(PageReconstructError::Cancelled),
                     Err(walredo::Error::Other(err)) => {
-                        critical!("walredo failure during page reconstruction: {err:?}");
+                        if fire_critical_error {
+                            critical!("walredo failure during page reconstruction: {err:?}");
+                        }
                         return Err(PageReconstructError::WalRedo(
                             err.context("reconstruct a page image"),
                         ));
@@ -6391,7 +6861,10 @@ impl Timeline {
         use pageserver_api::models::DownloadRemoteLayersTaskState;
 
         let remaining = {
-            let guard = self.layers.read().await;
+            let guard = self
+                .layers
+                .read(LayerManagerLockHolder::GetLayerMapInfo)
+                .await;
             let Ok(lm) = guard.layer_map() else {
                 // technically here we could look into iterating accessible layers, but downloading
                 // all layers of a shutdown timeline makes no sense regardless.
@@ -6497,7 +6970,7 @@ impl Timeline {
 impl Timeline {
     /// Returns non-remote layers for eviction.
     pub(crate) async fn get_local_layers_for_disk_usage_eviction(&self) -> DiskUsageEvictionInfo {
-        let guard = self.layers.read().await;
+        let guard = self.layers.read(LayerManagerLockHolder::Eviction).await;
         let mut max_layer_size: Option<u64> = None;
 
         let resident_layers = guard
@@ -6533,14 +7006,14 @@ impl Timeline {
     /// Persistently blocks gc for `Manual` reason.
     ///
     /// Returns true if no such block existed before, false otherwise.
-    pub(crate) async fn block_gc(&self, tenant: &super::Tenant) -> anyhow::Result<bool> {
+    pub(crate) async fn block_gc(&self, tenant: &super::TenantShard) -> anyhow::Result<bool> {
         use crate::tenant::remote_timeline_client::index::GcBlockingReason;
         assert_eq!(self.tenant_shard_id, tenant.tenant_shard_id);
         tenant.gc_block.insert(self, GcBlockingReason::Manual).await
     }
 
     /// Persistently unblocks gc for `Manual` reason.
-    pub(crate) async fn unblock_gc(&self, tenant: &super::Tenant) -> anyhow::Result<()> {
+    pub(crate) async fn unblock_gc(&self, tenant: &super::TenantShard) -> anyhow::Result<()> {
         use crate::tenant::remote_timeline_client::index::GcBlockingReason;
         assert_eq!(self.tenant_shard_id, tenant.tenant_shard_id);
         tenant.gc_block.remove(self, GcBlockingReason::Manual).await
@@ -6558,8 +7031,8 @@ impl Timeline {
 
     /// Force create an image layer and place it into the layer map.
     ///
-    /// DO NOT use this function directly. Use [`Tenant::branch_timeline_test_with_layers`]
-    /// or [`Tenant::create_test_timeline_with_layers`] to ensure all these layers are
+    /// DO NOT use this function directly. Use [`TenantShard::branch_timeline_test_with_layers`]
+    /// or [`TenantShard::create_test_timeline_with_layers`] to ensure all these layers are
     /// placed into the layer map in one run AND be validated.
     #[cfg(test)]
     pub(super) async fn force_create_image_layer(
@@ -6586,6 +7059,8 @@ impl Timeline {
             self.tenant_shard_id,
             &(min_key..end_key),
             lsn,
+            &self.gate,
+            self.cancel.clone(),
             ctx,
         )
         .await?;
@@ -6596,7 +7071,7 @@ impl Timeline {
         let image_layer = Layer::finish_creating(self.conf, self, desc, &path)?;
         info!("force created image layer {}", image_layer.local_path());
         {
-            let mut guard = self.layers.write().await;
+            let mut guard = self.layers.write(LayerManagerLockHolder::Testing).await;
             guard
                 .open_mut()
                 .unwrap()
@@ -6613,8 +7088,8 @@ impl Timeline {
 
     /// Force create a delta layer and place it into the layer map.
     ///
-    /// DO NOT use this function directly. Use [`Tenant::branch_timeline_test_with_layers`]
-    /// or [`Tenant::create_test_timeline_with_layers`] to ensure all these layers are
+    /// DO NOT use this function directly. Use [`TenantShard::branch_timeline_test_with_layers`]
+    /// or [`TenantShard::create_test_timeline_with_layers`] to ensure all these layers are
     /// placed into the layer map in one run AND be validated.
     #[cfg(test)]
     pub(super) async fn force_create_delta_layer(
@@ -6647,6 +7122,8 @@ impl Timeline {
             self.tenant_shard_id,
             deltas.key_range.start,
             deltas.lsn_range,
+            &self.gate,
+            self.cancel.clone(),
             ctx,
         )
         .await?;
@@ -6657,7 +7134,7 @@ impl Timeline {
         let delta_layer = Layer::finish_creating(self.conf, self, desc, &path)?;
         info!("force created delta layer {}", delta_layer.local_path());
         {
-            let mut guard = self.layers.write().await;
+            let mut guard = self.layers.write(LayerManagerLockHolder::Testing).await;
             guard
                 .open_mut()
                 .unwrap()
@@ -6702,9 +7179,7 @@ impl Timeline {
         if let Some(end) = layer_end_lsn {
             assert!(
                 end <= last_record_lsn,
-                "advance last record lsn before inserting a layer, end_lsn={}, last_record_lsn={}",
-                end,
-                last_record_lsn,
+                "advance last record lsn before inserting a layer, end_lsn={end}, last_record_lsn={last_record_lsn}",
             );
         }
 
@@ -6736,6 +7211,8 @@ impl Timeline {
             self.tenant_shard_id,
             in_memory.lsn_range.start,
             &self.gate,
+            // TODO: if we ever use this function in production code, we need to pass the real cancellation token
+            &CancellationToken::new(),
             ctx,
         )
         .await
@@ -6750,7 +7227,7 @@ impl Timeline {
 
         // Link the layer to the layer map
         {
-            let mut guard = self.layers.write().await;
+            let mut guard = self.layers.write(LayerManagerLockHolder::Testing).await;
             let layer_map = guard.open_mut().unwrap();
             layer_map.force_insert_in_memory_layer(Arc::new(layer));
         }
@@ -6767,7 +7244,7 @@ impl Timeline {
         io_concurrency: IoConcurrency,
     ) -> anyhow::Result<Vec<(Key, Bytes)>> {
         let mut all_data = Vec::new();
-        let guard = self.layers.read().await;
+        let guard = self.layers.read(LayerManagerLockHolder::Testing).await;
         for layer in guard.layer_map()?.iter_historic_layers() {
             if !layer.is_delta() && layer.image_layer_lsn() == lsn {
                 let layer = guard.get_from_desc(&layer);
@@ -6796,7 +7273,7 @@ impl Timeline {
         self: &Arc<Timeline>,
     ) -> anyhow::Result<Vec<super::storage_layer::PersistentLayerKey>> {
         let mut layers = Vec::new();
-        let guard = self.layers.read().await;
+        let guard = self.layers.read(LayerManagerLockHolder::Testing).await;
         for layer in guard.layer_map()?.iter_historic_layers() {
             layers.push(layer.key());
         }
@@ -6888,7 +7365,7 @@ impl TimelineWriter<'_> {
             .tl
             .get_layer_for_write(at, &self.write_guard, ctx)
             .await?;
-        let initial_size = layer.size().await?;
+        let initial_size = layer.len();
 
         let last_freeze_at = self.last_freeze_at.load();
         self.write_guard.replace(TimelineWriterState::new(
@@ -6908,7 +7385,7 @@ impl TimelineWriter<'_> {
         let l0_count = self
             .tl
             .layers
-            .read()
+            .read(LayerManagerLockHolder::GetLayerMapInfo)
             .await
             .layer_map()?
             .level0_deltas()
@@ -7116,17 +7593,19 @@ mod tests {
     use std::sync::Arc;
 
     use pageserver_api::key::Key;
-    use pageserver_api::value::Value;
+    use postgres_ffi::PgMajorVersion;
     use std::iter::Iterator;
     use tracing::Instrument;
     use utils::id::TimelineId;
     use utils::lsn::Lsn;
+    use wal_decoder::models::value::Value;
 
     use super::HeatMapTimeline;
     use crate::context::RequestContextBuilder;
     use crate::tenant::harness::{TenantHarness, test_img};
     use crate::tenant::layer_map::LayerMap;
     use crate::tenant::storage_layer::{Layer, LayerName, LayerVisibilityHint};
+    use crate::tenant::timeline::layer_manager::LayerManagerLockHolder;
     use crate::tenant::timeline::{DeltaLayerTestDesc, EvictionError};
     use crate::tenant::{PreviousHeatmap, Timeline};
 
@@ -7189,7 +7668,7 @@ mod tests {
             .create_test_timeline_with_layers(
                 TimelineId::generate(),
                 Lsn(0x10),
-                14,
+                PgMajorVersion::PG14,
                 &ctx,
                 Vec::new(), // in-memory layers
                 delta_layers,
@@ -7234,7 +7713,7 @@ mod tests {
         // Evict all the layers and stash the old heatmap in the timeline.
         // This simulates a migration to a cold secondary location.
 
-        let guard = timeline.layers.read().await;
+        let guard = timeline.layers.read(LayerManagerLockHolder::Testing).await;
         let mut all_layers = Vec::new();
         let forever = std::time::Duration::from_secs(120);
         for layer in guard.likely_resident_layers() {
@@ -7264,9 +7743,9 @@ mod tests {
 
             eprintln!("Downloading {layer} and re-generating heatmap");
 
-            let ctx = &RequestContextBuilder::extend(ctx)
+            let ctx = &RequestContextBuilder::from(ctx)
                 .download_behavior(crate::context::DownloadBehavior::Download)
-                .build();
+                .attached_child();
 
             let _resident = layer
                 .download_and_keep_resident(ctx)
@@ -7325,7 +7804,7 @@ mod tests {
             .create_test_timeline_with_layers(
                 TimelineId::generate(),
                 Lsn(0x10),
-                14,
+                PgMajorVersion::PG14,
                 &ctx,
                 Vec::new(), // in-memory layers
                 delta_layers,
@@ -7356,7 +7835,7 @@ mod tests {
             })));
 
         // Evict all the layers in the previous heatmap
-        let guard = timeline.layers.read().await;
+        let guard = timeline.layers.read(LayerManagerLockHolder::Testing).await;
         let forever = std::time::Duration::from_secs(120);
         for layer in guard.likely_resident_layers() {
             layer.evict_and_wait(forever).await.unwrap();
@@ -7385,7 +7864,12 @@ mod tests {
 
         let (tenant, ctx) = harness.load().await;
         let timeline = tenant
-            .create_test_timeline(TimelineId::generate(), Lsn(0x10), 14, &ctx)
+            .create_test_timeline(
+                TimelineId::generate(),
+                Lsn(0x10),
+                PgMajorVersion::PG14,
+                &ctx,
+            )
             .await
             .unwrap();
 
@@ -7419,7 +7903,10 @@ mod tests {
     }
 
     async fn find_some_layer(timeline: &Timeline) -> Layer {
-        let layers = timeline.layers.read().await;
+        let layers = timeline
+            .layers
+            .read(LayerManagerLockHolder::GetLayerMapInfo)
+            .await;
         let desc = layers
             .layer_map()
             .unwrap()

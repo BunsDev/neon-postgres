@@ -4,7 +4,6 @@ import json
 import os
 import random
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -15,6 +14,7 @@ from fixtures.neon_fixtures import (
     NeonEnvBuilder,
     NeonPageserver,
     StorageControllerMigrationConfig,
+    flush_ep_to_pageserver,
 )
 from fixtures.pageserver.common_types import parse_layer_file_name
 from fixtures.pageserver.utils import (
@@ -24,11 +24,13 @@ from fixtures.pageserver.utils import (
 from fixtures.remote_storage import LocalFsStorage, RemoteStorageKind, S3Storage, s3_storage
 from fixtures.utils import run_only_on_default_postgres, skip_in_debug_build, wait_until
 from fixtures.workload import Workload
-from werkzeug.wrappers.request import Request
 from werkzeug.wrappers.response import Response
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from typing import Any
+
+    from werkzeug.wrappers.request import Request
 
 
 # A tenant configuration that is convenient for generating uploads and deletions
@@ -60,7 +62,7 @@ def evict_random_layers(
     )
     client = pageserver.http_client()
     for layer in initial_local_layers:
-        if "ephemeral" in layer.name or "temp_download" in layer.name:
+        if "ephemeral" in layer.name or "temp_download" in layer.name or ".___temp" in layer.name:
             continue
 
         layer_name = parse_layer_file_name(layer.name)
@@ -91,6 +93,8 @@ def test_location_conf_churn(neon_env_builder: NeonEnvBuilder, make_httpserver, 
         f"http://{make_httpserver.host}:{make_httpserver.port}/"
     )
 
+    neon_env_builder.storage_controller_config = {"use_local_compute_notifications": False}
+
     def ignore_notify(request: Request):
         # This test does all its own compute configuration (by passing explicit pageserver ID to Workload functions),
         # so we send controller notifications to /dev/null to prevent it fighting the test for control of the compute.
@@ -120,6 +124,9 @@ def test_location_conf_churn(neon_env_builder: NeonEnvBuilder, make_httpserver, 
                 ".*downloading failed, possibly for shutdown",
                 # {tenant_id=... timeline_id=...}:handle_pagerequests:handle_get_page_at_lsn_request{rel=1664/0/1260 blkno=0 req_lsn=0/149F0D8}: error reading relation or page version: Not found: will not become active.  Current state: Stopping\n'
                 ".*page_service.*will not become active.*",
+                # the following errors are possible when pageserver tries to ingest wal records despite being in unreadable state
+                ".*wal_connection_manager.*layer file download failed: No file found.*",
+                ".*wal_connection_manager.*could not ingest record.*",
             ]
         )
 
@@ -151,6 +158,45 @@ def test_location_conf_churn(neon_env_builder: NeonEnvBuilder, make_httpserver, 
         env.pageservers[1].id: ("Detached", None),
         env.pageservers[2].id: ("Detached", None),
     }
+
+    # Track all the attached locations with mode and generation
+    history: list[tuple[int, str, int | None]] = []
+
+    def may_read(pageserver: NeonPageserver, mode: str, generation: int | None) -> bool:
+        # Rules for when a pageserver may read:
+        # - our generation is higher than any previous
+        # - our generation is equal to previous, but no other pageserver
+        #   in that generation has been AttachedSingle (i.e. allowed to compact/GC)
+        # - our generation is equal to previous, and the previous holder of this
+        #   generation was the same node as we're attaching now.
+        #
+        # If these conditions are not met, then a read _might_ work, but the pageserver might
+        # also hit errors trying to download layers.
+        highest_historic_generation = max([i[2] for i in history if i[2] is not None], default=None)
+
+        if generation is None:
+            # We're not in an attached state, we may not read
+            return False
+        elif highest_historic_generation is not None and generation < highest_historic_generation:
+            # We are in an outdated generation, we may not read
+            return False
+        elif highest_historic_generation is not None and generation == highest_historic_generation:
+            # We are re-using a generation: if any pageserver other than this one
+            # has held AttachedSingle mode, this node may not read (because some other
+            # node may be doing GC/compaction).
+            if any(
+                i[1] == "AttachedSingle"
+                and i[2] == highest_historic_generation
+                and i[0] != pageserver.id
+                for i in history
+            ):
+                log.info(
+                    f"Skipping read on {pageserver.id} because other pageserver has been in AttachedSingle mode in generation {highest_historic_generation}"
+                )
+                return False
+
+        # Fall through: we have passed conditions for readability
+        return True
 
     latest_attached = env.pageservers[0].id
 
@@ -195,9 +241,10 @@ def test_location_conf_churn(neon_env_builder: NeonEnvBuilder, make_httpserver, 
                 assert len(tenants) == 1
                 assert tenants[0]["generation"] == new_generation
 
-                log.info("Entering postgres...")
-                workload.churn_rows(rng.randint(128, 256), pageserver.id)
-                workload.validate(pageserver.id)
+                if may_read(pageserver, last_state_ps[0], last_state_ps[1]):
+                    log.info("Entering postgres...")
+                    workload.churn_rows(rng.randint(128, 256), pageserver.id)
+                    workload.validate(pageserver.id)
             elif last_state_ps[0].startswith("Attached"):
                 # The `storage_controller` will only re-attach on startup when a pageserver was the
                 # holder of the latest generation: otherwise the pageserver will revert to detached
@@ -237,12 +284,16 @@ def test_location_conf_churn(neon_env_builder: NeonEnvBuilder, make_httpserver, 
             location_conf["generation"] = generation
 
             pageserver.tenant_location_configure(tenant_id, location_conf)
+
             last_state[pageserver.id] = (mode, generation)
 
-            if mode.startswith("Attached"):
-                # This is a basic test: we are validating that he endpoint works properly _between_
-                # configuration changes.  A stronger test would be to validate that clients see
-                # no errors while we are making the changes.
+            may_read_this_generation = may_read(pageserver, mode, generation)
+            history.append((pageserver.id, mode, generation))
+
+            # This is a basic test: we are validating that he endpoint works properly _between_
+            # configuration changes.  A stronger test would be to validate that clients see
+            # no errors while we are making the changes.
+            if may_read_this_generation:
                 workload.churn_rows(
                     rng.randint(128, 256), pageserver.id, upload=mode != "AttachedStale"
                 )
@@ -255,9 +306,16 @@ def test_location_conf_churn(neon_env_builder: NeonEnvBuilder, make_httpserver, 
     assert gc_summary["remote_storage_errors"] == 0
     assert gc_summary["indices_deleted"] > 0
 
-    # Attach all pageservers
+    # Attach all pageservers, in a higher generation than any previous.  We will use the same
+    # gen for all, and AttachedMulti mode so that they do not interfere with one another.
+    generation = env.storage_controller.attach_hook_issue(tenant_id, env.pageservers[0].id)
     for ps in env.pageservers:
-        location_conf = {"mode": "AttachedMulti", "secondary_conf": None, "tenant_conf": {}}
+        location_conf = {
+            "mode": "AttachedMulti",
+            "secondary_conf": None,
+            "tenant_conf": {},
+            "generation": generation,
+        }
         ps.tenant_location_configure(tenant_id, location_conf)
 
     # Confirm that all are readable
@@ -500,7 +558,7 @@ def list_elegible_layers(
         except KeyError:
             # Unexpected: tests should call this when pageservers are in a quiet state such that the layer map
             # matches what's on disk.
-            log.warn(f"Lookup {layer_file_name} from {list(visible_map.keys())}")
+            log.warning(f"Lookup {layer_file_name} from {list(visible_map.keys())}")
             raise
 
     return list(c for c in candidates if is_visible(c))
@@ -626,7 +684,7 @@ def test_secondary_downloads(neon_env_builder: NeonEnvBuilder):
     except:
         # On assertion failures, log some details to help with debugging
         heatmap = env.pageserver_remote_storage.heatmap_content(tenant_id)
-        log.warn(f"heatmap contents: {json.dumps(heatmap,indent=2)}")
+        log.warning(f"heatmap contents: {json.dumps(heatmap, indent=2)}")
         raise
 
     # Scrub the remote storage
@@ -988,10 +1046,6 @@ def test_migration_to_cold_secondary(neon_env_builder: NeonEnvBuilder):
     ps_secondary.http_client().tenant_heatmap_upload(tenant_id)
     heatmap_after_migration = timeline_heatmap(timeline_id)
 
-    local_layers = ps_secondary.list_layers(tenant_id, timeline_id)
-    # We download 1 layer per second and give up within 5 seconds.
-    assert len(local_layers) < 10
-
     after_migration_heatmap_layers_count = len(heatmap_after_migration["layers"])
     log.info(f"Heatmap size after cold migration is {after_migration_heatmap_layers_count}")
 
@@ -1029,8 +1083,13 @@ def test_migration_to_cold_secondary(neon_env_builder: NeonEnvBuilder):
         .value
     )
 
-    workload.stop()
     assert before == after
+
+    # Stop the endpoint and wait until any finally written WAL propagates to
+    # the pageserver and is uploaded to remote storage.
+    flush_ep_to_pageserver(env, workload.endpoint(), tenant_id, timeline_id)
+    ps_secondary.http_client().timeline_checkpoint(tenant_id, timeline_id, wait_until_uploaded=True)
+    workload.stop()
 
     # Now simulate the case where a child timeline is archived, parent layers
     # are evicted and the child is unarchived. When the child is unarchived,
@@ -1096,3 +1155,70 @@ def test_migration_to_cold_secondary(neon_env_builder: NeonEnvBuilder):
     # Warm up the current secondary.
     ps_attached.http_client().tenant_secondary_download(tenant_id, wait_ms=100)
     wait_until(lambda: all_layers_downloaded(ps_secondary, expected_locally))
+
+
+@run_only_on_default_postgres("PG version is not interesting here")
+@pytest.mark.parametrize("action", ["delete_timeline", "detach"])
+def test_io_metrics_match_secondary_timeline_lifecycle(
+    neon_env_builder: NeonEnvBuilder, action: str
+):
+    """
+    Check that IO metrics for secondary timelines are de-registered when the timeline
+    is removed
+    """
+    neon_env_builder.num_pageservers = 2
+    env = neon_env_builder.init_configs()
+    env.start()
+
+    tenant_id = TenantId.generate()
+    parent_timeline_id = TimelineId.generate()
+
+    # We do heatmap uploads and pulls manually
+    tenant_conf = {"heatmap_period": "0s"}
+    env.create_tenant(
+        tenant_id, parent_timeline_id, conf=tenant_conf, placement_policy='{"Attached":1}'
+    )
+
+    child_timeline_id = env.create_branch("foo", tenant_id)
+
+    attached_to_id = env.storage_controller.locate(tenant_id)[0]["node_id"]
+    ps_attached = env.get_pageserver(attached_to_id)
+    ps_secondary = next(p for p in env.pageservers if p != ps_attached)
+
+    ps_attached.http_client().tenant_heatmap_upload(tenant_id)
+    status, _ = ps_secondary.http_client().tenant_secondary_download(tenant_id, wait_ms=5000)
+    assert status == 200
+
+    labels = {
+        "operation": "write",
+        "tenant_id": str(tenant_id),
+        "timeline_id": str(child_timeline_id),
+    }
+    bytes_written = (
+        ps_secondary.http_client()
+        .get_metrics()
+        .query_one("pageserver_io_operations_bytes_total", labels)
+        .value
+    )
+
+    assert bytes_written == 0
+
+    if action == "delete_timeline":
+        env.storage_controller.pageserver_api().timeline_delete(tenant_id, child_timeline_id)
+        ps_attached.http_client().tenant_heatmap_upload(tenant_id)
+        status, _ = ps_secondary.http_client().tenant_secondary_download(tenant_id, wait_ms=5000)
+        assert status == 200
+    elif action == "detach":
+        env.storage_controller.tenant_policy_update(tenant_id, {"placement": {"Attached": 0}})
+        env.storage_controller.reconcile_until_idle()
+    else:
+        raise Exception("Unexpected action")
+
+    assert (
+        len(
+            ps_secondary.http_client()
+            .get_metrics()
+            .query_all("pageserver_io_operations_bytes_total", labels)
+        )
+        == 0
+    )

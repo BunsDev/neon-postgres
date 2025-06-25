@@ -1,7 +1,6 @@
 //
 // Main entry point for the safekeeper executable
 //
-use std::env::{VarError, var};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::str::FromStr;
@@ -14,18 +13,19 @@ use clap::{ArgAction, Parser};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
+use http_utils::tls_certs::ReloadingCertificateResolver;
 use metrics::set_build_info_metric;
 use remote_storage::RemoteStorageConfig;
-use reqwest::Certificate;
 use safekeeper::defaults::{
     DEFAULT_CONTROL_FILE_SAVE_INTERVAL, DEFAULT_EVICTION_MIN_RESIDENT, DEFAULT_HEARTBEAT_TIMEOUT,
     DEFAULT_HTTP_LISTEN_ADDR, DEFAULT_MAX_OFFLOADER_LAG_BYTES, DEFAULT_PARTIAL_BACKUP_CONCURRENCY,
     DEFAULT_PARTIAL_BACKUP_TIMEOUT, DEFAULT_PG_LISTEN_ADDR, DEFAULT_SSL_CERT_FILE,
-    DEFAULT_SSL_KEY_FILE,
+    DEFAULT_SSL_CERT_RELOAD_PERIOD, DEFAULT_SSL_KEY_FILE,
 };
+use safekeeper::wal_backup::WalBackup;
 use safekeeper::{
-    BROKER_RUNTIME, GlobalTimelines, HTTP_RUNTIME, SafeKeeperConf, WAL_SERVICE_RUNTIME, broker,
-    control_file, http, wal_backup, wal_service,
+    BACKGROUND_RUNTIME, BROKER_RUNTIME, GlobalTimelines, HTTP_RUNTIME, SafeKeeperConf,
+    WAL_SERVICE_RUNTIME, broker, control_file, http, wal_service,
 };
 use sd_notify::NotifyState;
 use storage_broker::{DEFAULT_ENDPOINT, Uri};
@@ -214,9 +214,28 @@ struct Args {
     /// Path to a file with a X509 certificate for https API.
     #[arg(long, default_value = DEFAULT_SSL_CERT_FILE)]
     ssl_cert_file: Utf8PathBuf,
-    /// Trusted root CA certificate to use in https APIs.
+    /// Period to reload certificate and private key from files.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_SSL_CERT_RELOAD_PERIOD)]
+    ssl_cert_reload_period: Duration,
+    /// Trusted root CA certificates to use in https APIs.
     #[arg(long)]
     ssl_ca_file: Option<Utf8PathBuf>,
+    /// Flag to use https for requests to peer's safekeeper API.
+    #[arg(long)]
+    use_https_safekeeper_api: bool,
+    /// Path to the JWT auth token used to authenticate with other safekeepers.
+    #[arg(long)]
+    auth_token_path: Option<Utf8PathBuf>,
+
+    /// Enable TLS in WAL service API.
+    /// Does not force TLS: the client negotiates TLS usage during the handshake.
+    /// Uses key and certificate from ssl_key_file/ssl_cert_file.
+    #[arg(long)]
+    enable_tls_wal_service_api: bool,
+
+    /// Run in development mode (disables security checks)
+    #[arg(long, help = "Run in development mode (disables security checks)")]
+    dev: bool,
 }
 
 // Like PathBufValueParser, but allows empty string.
@@ -335,28 +354,25 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Load JWT auth token to connect to other safekeepers for pull_timeline.
-    let sk_auth_token = match var("SAFEKEEPER_AUTH_TOKEN") {
-        Ok(v) => {
-            info!("loaded JWT token for authentication with safekeepers");
-            Some(SecretString::from(v))
-        }
-        Err(VarError::NotPresent) => {
-            info!("no JWT token for authentication with safekeepers detected");
-            None
-        }
-        Err(_) => {
-            warn!("JWT token for authentication with safekeepers is not unicode");
-            None
-        }
+    let sk_auth_token = if let Some(auth_token_path) = args.auth_token_path.as_ref() {
+        info!("loading JWT token for authentication with safekeepers from {auth_token_path}");
+        let auth_token = tokio::fs::read_to_string(auth_token_path).await?;
+        Some(SecretString::from(auth_token.trim().to_owned()))
+    } else {
+        info!("no JWT token for authentication with safekeepers detected");
+        None
     };
 
-    let ssl_ca_cert = match args.ssl_ca_file.as_ref() {
+    let ssl_ca_certs = match args.ssl_ca_file.as_ref() {
         Some(ssl_ca_file) => {
             tracing::info!("Using ssl root CA file: {ssl_ca_file:?}");
             let buf = tokio::fs::read(ssl_ca_file).await?;
-            Some(Certificate::from_pem(&buf)?)
+            pem::parse_many(&buf)?
+                .into_iter()
+                .filter(|pem| pem.tag() == "CERTIFICATE")
+                .collect()
         }
-        None => None,
+        None => Vec::new(),
     };
 
     let conf = Arc::new(SafeKeeperConf {
@@ -394,7 +410,10 @@ async fn main() -> anyhow::Result<()> {
         max_delta_for_fanout: args.max_delta_for_fanout,
         ssl_key_file: args.ssl_key_file,
         ssl_cert_file: args.ssl_cert_file,
-        ssl_ca_cert,
+        ssl_cert_reload_period: args.ssl_cert_reload_period,
+        ssl_ca_certs,
+        use_https_safekeeper_api: args.use_https_safekeeper_api,
+        enable_tls_wal_service_api: args.enable_tls_wal_service_api,
     });
 
     // initialize sentry if SENTRY_DSN is provided
@@ -466,14 +485,14 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
         None => None,
     };
 
-    let global_timelines = Arc::new(GlobalTimelines::new(conf.clone()));
+    let wal_backup = Arc::new(WalBackup::new(&conf).await?);
+
+    let global_timelines = Arc::new(GlobalTimelines::new(conf.clone(), wal_backup.clone()));
 
     // Register metrics collector for active timelines. It's important to do this
     // after daemonizing, otherwise process collector will be upset.
     let timeline_collector = safekeeper::metrics::TimelineCollector::new(global_timelines.clone());
     metrics::register_internal(Box::new(timeline_collector))?;
-
-    wal_backup::init_remote_storage(&conf).await;
 
     // Keep handles to main tasks to die if any of them disappears.
     let mut tasks_handles: FuturesUnordered<BoxFuture<(String, JoinTaskRes)>> =
@@ -494,6 +513,36 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
         info!("running in current thread runtime");
     }
 
+    let tls_server_config = if conf.listen_https_addr.is_some() || conf.enable_tls_wal_service_api {
+        let ssl_key_file = conf.ssl_key_file.clone();
+        let ssl_cert_file = conf.ssl_cert_file.clone();
+        let ssl_cert_reload_period = conf.ssl_cert_reload_period;
+
+        // Create resolver in BACKGROUND_RUNTIME, so the background certificate reloading
+        // task is run in this runtime.
+        let cert_resolver = current_thread_rt
+            .as_ref()
+            .unwrap_or_else(|| BACKGROUND_RUNTIME.handle())
+            .spawn(async move {
+                ReloadingCertificateResolver::new(
+                    "main",
+                    &ssl_key_file,
+                    &ssl_cert_file,
+                    ssl_cert_reload_period,
+                )
+                .await
+            })
+            .await??;
+
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(cert_resolver);
+
+        Some(Arc::new(config))
+    } else {
+        None
+    };
+
     let wal_service_handle = current_thread_rt
         .as_ref()
         .unwrap_or_else(|| WAL_SERVICE_RUNTIME.handle())
@@ -501,6 +550,9 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
             conf.clone(),
             pg_listener,
             Scope::SafekeeperData,
+            conf.enable_tls_wal_service_api
+                .then(|| tls_server_config.clone())
+                .flatten(),
             global_timelines.clone(),
         ))
         // wrap with task name for error reporting
@@ -529,6 +581,9 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
                 conf.clone(),
                 pg_listener_tenant_only,
                 Scope::Tenant,
+                conf.enable_tls_wal_service_api
+                    .then(|| tls_server_config.clone())
+                    .flatten(),
                 global_timelines.clone(),
             ))
             // wrap with task name for error reporting
@@ -554,6 +609,7 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
             .spawn(http::task_main_https(
                 conf.clone(),
                 https_listener,
+                tls_server_config.expect("tls_server_config is set earlier if https is enabled"),
                 global_timelines.clone(),
             ))
             .map(|res| ("HTTPS service main".to_owned(), res));

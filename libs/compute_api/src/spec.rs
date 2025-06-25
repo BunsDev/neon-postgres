@@ -1,8 +1,8 @@
-//! `ComputeSpec` represents the contents of the spec.json file.
-//!
-//! The spec.json file is used to pass information to 'compute_ctl'. It contains
-//! all the information needed to start up the right version of PostgreSQL,
-//! and connect it to the storage nodes.
+//! The ComputeSpec contains all the information needed to start up
+//! the right version of PostgreSQL, and connect it to the storage nodes.
+//! It can be passed as part of the `config.json`, or the control plane can
+//! provide it by calling the compute_ctl's `/compute_ctl` endpoint, or
+//! compute_ctl can fetch it by calling the control plane's API.
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
@@ -104,6 +104,12 @@ pub struct ComputeSpec {
     pub timeline_id: Option<TimelineId>,
     pub pageserver_connstring: Option<String>,
 
+    // More neon ids that we expose to the compute_ctl
+    // and to postgres as neon extension GUCs.
+    pub project_id: Option<String>,
+    pub branch_id: Option<String>,
+    pub endpoint_id: Option<String>,
+
     /// Safekeeper membership config generation. It is put in
     /// neon.safekeepers GUC and serves two purposes:
     /// 1) Non zero value forces walproposer to use membership configurations.
@@ -159,15 +165,22 @@ pub struct ComputeSpec {
     #[serde(default)] // Default false
     pub drop_subscriptions_before_start: bool,
 
-    /// Log level for audit logging:
-    ///
-    /// Disabled - no audit logging. This is the default.
-    /// log - log masked statements to the postgres log using pgaudit extension
-    /// hipaa - log unmasked statements to the file using pgaudit and pgauditlogtofile extension
-    ///
-    /// Extensions should be present in shared_preload_libraries
+    /// Log level for compute audit logging
     #[serde(default)]
     pub audit_log_level: ComputeAudit,
+
+    /// Hostname and the port of the otel collector. Leave empty to disable Postgres logs forwarding.
+    /// Example: config-shy-breeze-123-collector-monitoring.neon-telemetry.svc.cluster.local:10514
+    pub logs_export_host: Option<String>,
+
+    /// Address of endpoint storage service
+    pub endpoint_storage_addr: Option<String>,
+    /// JWT for authorizing requests to endpoint storage service
+    pub endpoint_storage_token: Option<String>,
+
+    /// Download LFC state from endpoint_storage and pass it to Postgres on startup
+    #[serde(default)]
+    pub autoprewarm: bool,
 }
 
 /// Feature flag to signal `compute_ctl` to enable certain experimental functionality.
@@ -179,11 +192,8 @@ pub enum ComputeFeature {
     /// track short-lived connections as user activity.
     ActivityMonitorExperimental,
 
-    /// Pre-install and initialize anon extension for every database in the cluster
-    AnonExtension,
-
-    /// Allow to configure rsyslog for Postgres logs export
-    PostgresLogsExport,
+    /// Enable TLS functionality.
+    TlsExperimental,
 
     /// This is a special feature flag that is used to represent unknown feature flags.
     /// Basically all unknown to enum flags are represented as this one. See unit test
@@ -243,24 +253,43 @@ impl RemoteExtSpec {
         }
 
         match self.extension_data.get(real_ext_name) {
-            Some(_ext_data) => {
-                // Construct the path to the extension archive
-                // BUILD_TAG/PG_MAJOR_VERSION/extensions/EXTENSION_NAME.tar.zst
-                //
-                // Keep it in sync with path generation in
-                // https://github.com/neondatabase/build-custom-extensions/tree/main
-                let archive_path_str =
-                    format!("{build_tag}/{pg_major_version}/extensions/{real_ext_name}.tar.zst");
-                Ok((
-                    real_ext_name.to_string(),
-                    RemotePath::from_string(&archive_path_str)?,
-                ))
-            }
+            Some(_ext_data) => Ok((
+                real_ext_name.to_string(),
+                Self::build_remote_path(build_tag, pg_major_version, real_ext_name)?,
+            )),
             None => Err(anyhow::anyhow!(
                 "real_ext_name {} is not found",
                 real_ext_name
             )),
         }
+    }
+
+    /// Get the architecture-specific portion of the remote extension path. We
+    /// use the Go naming convention due to Kubernetes.
+    fn get_arch() -> &'static str {
+        match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            arch => arch,
+        }
+    }
+
+    /// Build a [`RemotePath`] for an extension.
+    fn build_remote_path(
+        build_tag: &str,
+        pg_major_version: &str,
+        ext_name: &str,
+    ) -> anyhow::Result<RemotePath> {
+        let arch = Self::get_arch();
+
+        // Construct the path to the extension archive
+        // BUILD_TAG/PG_MAJOR_VERSION/extensions/EXTENSION_NAME.tar.zst
+        //
+        // Keep it in sync with path generation in
+        // https://github.com/neondatabase/build-custom-extensions/tree/main
+        RemotePath::from_string(&format!(
+            "{build_tag}/{arch}/{pg_major_version}/extensions/{ext_name}.tar.zst"
+        ))
     }
 }
 
@@ -278,15 +307,38 @@ pub enum ComputeMode {
     Replica,
 }
 
+impl ComputeMode {
+    /// Convert the compute mode to a string that can be used to identify the type of compute,
+    /// which means that if it's a static compute, the LSN will not be included.
+    pub fn to_type_str(&self) -> &'static str {
+        match self {
+            ComputeMode::Primary => "primary",
+            ComputeMode::Static(_) => "static",
+            ComputeMode::Replica => "replica",
+        }
+    }
+}
+
 /// Log level for audit logging
-/// Disabled, log, hipaa
-/// Default is Disabled
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub enum ComputeAudit {
     #[default]
     Disabled,
+    // Deprecated, use Base instead
     Log,
+    // (pgaudit.log = 'ddl', pgaudit.log_parameter='off')
+    // logged to the standard postgresql log stream
+    Base,
+    // Deprecated, use Full or Extended instead
     Hipaa,
+    // (pgaudit.log = 'all, -misc', pgaudit.log_parameter='off')
+    // logged to separate files collected by rsyslog
+    // into dedicated log storage with strict access
+    Extended,
+    // (pgaudit.log='all', pgaudit.log_parameter='on'),
+    // logged to separate files collected by rsyslog
+    // into dedicated log storage with strict access.
+    Full,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -477,6 +529,37 @@ mod tests {
         rspec
             .get_ext("extlib", true, "latest", "v17")
             .expect("Library should be found");
+    }
+
+    #[test]
+    fn remote_extension_path() {
+        let rspec: RemoteExtSpec = serde_json::from_value(serde_json::json!({
+            "public_extensions": ["ext"],
+            "custom_extensions": [],
+            "library_index": {
+                "extlib": "ext",
+            },
+            "extension_data": {
+                "ext": {
+                    "control_data": {
+                        "ext.control": ""
+                    },
+                    "archive_path": ""
+                }
+            },
+        }))
+        .unwrap();
+
+        let (_ext_name, ext_path) = rspec
+            .get_ext("ext", false, "latest", "v17")
+            .expect("Extension should be found");
+        // Starting with a forward slash would have consequences for the
+        // Url::join() that occurs when downloading a remote extension.
+        assert!(!ext_path.to_string().starts_with("/"));
+        assert_eq!(
+            ext_path,
+            RemoteExtSpec::build_remote_path("latest", "v17", "ext").unwrap()
+        );
     }
 
     #[test]

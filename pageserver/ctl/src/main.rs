@@ -176,9 +176,11 @@ async fn main() -> anyhow::Result<()> {
             let config = RemoteStorageConfig::from_toml_str(&cmd.config_toml_str)?;
             let storage = remote_storage::GenericRemoteStorage::from_config(&config).await;
             let cancel = CancellationToken::new();
+            // Complexity limit: as we are running this command locally, we should have a lot of memory available, and we do not
+            // need to limit the number of versions we are going to delete.
             storage
                 .unwrap()
-                .time_travel_recover(Some(&prefix), timestamp, done_if_after, &cancel)
+                .time_travel_recover(Some(&prefix), timestamp, done_if_after, &cancel, None)
                 .await?;
         }
         Commands::Key(dkc) => dkc.execute(),
@@ -208,7 +210,8 @@ async fn print_layerfile(path: &Utf8Path) -> anyhow::Result<()> {
         virtual_file::SyncMode::Sync,
     );
     page_cache::init(100);
-    let ctx = RequestContext::new(TaskKind::DebugTool, DownloadBehavior::Error);
+    let ctx =
+        RequestContext::new(TaskKind::DebugTool, DownloadBehavior::Error).with_scope_debug_tools();
     dump_layerfile_from_path(path, true, &ctx).await
 }
 

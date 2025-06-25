@@ -3,15 +3,18 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import pytest
 from fixtures.log_helper import log
-from fixtures.neon_fixtures import (
-    LogCursor,
-    NeonEnvBuilder,
-    NeonPageserver,
-)
 from fixtures.pageserver.utils import wait_timeline_detail_404
+
+if TYPE_CHECKING:
+    from fixtures.neon_fixtures import (
+        LogCursor,
+        NeonEnvBuilder,
+        NeonPageserver,
+    )
 
 
 @pytest.mark.parametrize("sharded", [True, False])
@@ -21,6 +24,10 @@ def test_gc_blocking_by_timeline(neon_env_builder: NeonEnvBuilder, sharded: bool
         initial_tenant_conf={"gc_period": "1s", "lsn_lease_length": "0s"},
         initial_tenant_shard_count=2 if sharded else None,
     )
+    for ps in env.pageservers:
+        ps.allowed_errors.extend(
+            [".*Timeline.* has been deleted.*", ".*Timeline.*was cancelled and cannot be used"]
+        )
 
     if sharded:
         http = env.storage_controller.pageserver_api()
