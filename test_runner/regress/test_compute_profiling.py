@@ -2,12 +2,13 @@ import threading
 import time
 
 import pytest
-from data import profile_pb2
+from data.profile_pb2 import Profile  # type: ignore
 from fixtures.endpoint.http import EndpointHttpClient
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnv
 from google.protobuf.message import Message
 from requests import HTTPError
+from typing import Any
 
 
 def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | None):
@@ -22,7 +23,7 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
         status, response = client.start_profiling_cpu(100, 3)
         if status == 200:
             log.info("CPU profiling finished")
-            profile = profile_pb2.Profile()
+            profile: Any = Profile()
             Message.ParseFromString(profile, response)
             return profile
         elif status == 204:
