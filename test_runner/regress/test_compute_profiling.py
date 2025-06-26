@@ -35,6 +35,7 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
         log.error(f"Error finishing CPU profiling: {e}")
         raise
 
+
 def _stop_profiling_cpu(client: EndpointHttpClient, event: threading.Event | None):
     """
     Stop CPU profiling for the compute node.
@@ -55,6 +56,7 @@ def _stop_profiling_cpu(client: EndpointHttpClient, event: threading.Event | Non
     except Exception as e:
         log.error(f"Error stopping CPU profiling: {e}")
         raise
+
 
 def _wait_and_assert_cpu_profiling(http_client: EndpointHttpClient, event: threading.Event | None):
     profile = _start_profiling_cpu(http_client, event)
@@ -118,6 +120,7 @@ def test_compute_profiling_cpu_with_timeout(neon_simple_env: NeonEnv):
 
     endpoint.stop()
     endpoint.start()
+
 
 def test_compute_profiling_cpu_start_and_stop(neon_simple_env: NeonEnv):
     """
@@ -197,6 +200,7 @@ def test_compute_profiling_cpu_conflict(neon_simple_env: NeonEnv):
     endpoint.stop()
     endpoint.start()
 
+
 def test_compute_profiling_cpu_stop_when_not_running(neon_simple_env: NeonEnv):
     """
     Test that CPU profiling throws the expected error when is attempted
@@ -210,6 +214,7 @@ def test_compute_profiling_cpu_stop_when_not_running(neon_simple_env: NeonEnv):
         with pytest.raises(HTTPError) as exc_info:
             _stop_profiling_cpu(http_client, None)
         assert exc_info.value.response.status_code == 412
+
 
 def test_compute_profiling_cpu_start_arguments_validation_works(neon_simple_env: NeonEnv):
     """
