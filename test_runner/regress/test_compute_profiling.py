@@ -1,5 +1,6 @@
 import threading
 import time
+from typing import Any
 
 import pytest
 from data.profile_pb2 import Profile  # type: ignore
@@ -8,7 +9,6 @@ from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnv
 from google.protobuf.message import Message
 from requests import HTTPError
-from typing import Any
 
 
 def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | None):
