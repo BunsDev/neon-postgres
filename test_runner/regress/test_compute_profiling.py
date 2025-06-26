@@ -1,16 +1,19 @@
+from __future__ import annotations
+
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from data.profile_pb2 import Profile  # type: ignore
-from fixtures.endpoint.http import EndpointHttpClient
 from fixtures.log_helper import log
-from fixtures.neon_fixtures import NeonEnv
+from fixtures.utils import run_only_on_default_postgres
 from google.protobuf.message import Message
 from requests import HTTPError
 
-from compute.test_runner.fixtures.utils import run_only_on_default_postgres
+if TYPE_CHECKING:
+    from fixtures.endpoint.http import EndpointHttpClient
+    from fixtures.neon_fixtures import NeonEnv
 
 
 def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | None):
@@ -18,6 +21,7 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
     Start CPU profiling for the compute node.
     """
     log.info("Starting CPU profiling...")
+
     try:
         if event is not None:
             event.set()
@@ -25,21 +29,21 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
         status, response = client.start_profiling_cpu(100, 3)
         match status:
             case 200:
-                log.info("CPU profiling finished")
+                log.debug("CPU profiling finished")
                 profile: Any = Profile()
                 Message.ParseFromString(profile, response)
                 return profile
             case 204:
-                log.error("CPU profiling was stopped")
+                log.debug("CPU profiling was stopped")
                 raise HTTPError("Failed to finish CPU profiling: was stopped.")
             case 208:
-                log.error("CPU profiling is already in progress, nothing to do")
+                log.debug("CPU profiling is already in progress, nothing to do")
                 raise HTTPError("Failed to finish CPU profiling: profiling is already in progress.")
             case _:
                 log.error(f"Failed to finish CPU profiling, unexpected status {status}")
                 raise HTTPError(f"Failed to finish CPU profiling, unexpected status: {status}")
     except Exception as e:
-        log.error(f"Error finishing CPU profiling: {e}")
+        log.debug(f"Error finishing CPU profiling: {e}")
         raise
 
 
@@ -48,20 +52,22 @@ def _stop_profiling_cpu(client: EndpointHttpClient, event: threading.Event | Non
     Stop CPU profiling for the compute node.
     """
     log.info("Manually stopping CPU profiling...")
+
     try:
         if event is not None:
             event.set()
 
         status = client.stop_profiling_cpu()
-        if status == 200:
-            log.info("CPU profiling stopped successfully")
-        elif status == 412:
-            log.info("CPU profiling is not running, nothing to do")
-        else:
-            log.error(f"Failed to stop CPU profiling: {status}")
-            raise HTTPError(f"Failed to stop CPU profiling: {status}")
+        match status:
+            case 200:
+                log.debug("CPU profiling stopped successfully")
+            case 412:
+                log.debug("CPU profiling is not running, nothing to do")
+            case _:
+                log.error(f"Failed to stop CPU profiling: {status}")
+                raise HTTPError(f"Failed to stop CPU profiling: {status}")
     except Exception as e:
-        log.error(f"Error stopping CPU profiling: {e}")
+        log.debug(f"Error stopping CPU profiling: {e}")
         raise
 
 
@@ -130,6 +136,7 @@ def test_compute_profiling_cpu_with_timeout(neon_simple_env: NeonEnv):
     endpoint.start()
 
 
+@run_only_on_default_postgres(reason="test doesn't use postgres")
 def test_compute_profiling_cpu_start_and_stop(neon_simple_env: NeonEnv):
     """
     Test that CPU profiling can be started and stopped correctly.
@@ -162,6 +169,7 @@ def test_compute_profiling_cpu_start_and_stop(neon_simple_env: NeonEnv):
     endpoint.start()
 
 
+@run_only_on_default_postgres(reason="test doesn't use postgres")
 def test_compute_profiling_cpu_conflict(neon_simple_env: NeonEnv):
     """
     Test that CPU profiling can be started and stopped correctly.
@@ -193,10 +201,12 @@ def test_compute_profiling_cpu_conflict(neon_simple_env: NeonEnv):
         log.info(f"Inserted {n_records} rows")
 
     thread2 = threading.Thread(target=insert_rows)
-    thread2.start()
 
     event.wait()  # Wait for profiling to be ready to start
     time.sleep(1)  # Give some time for the profiling to start
+
+    thread2.start()
+
     # Should raise as the profiling is already in progress.
     with pytest.raises(HTTPError) as _:
         _start_profiling_cpu(http_client, None)
@@ -209,6 +219,7 @@ def test_compute_profiling_cpu_conflict(neon_simple_env: NeonEnv):
     endpoint.start()
 
 
+@run_only_on_default_postgres(reason="test doesn't use postgres")
 def test_compute_profiling_cpu_stop_when_not_running(neon_simple_env: NeonEnv):
     """
     Test that CPU profiling throws the expected error when is attempted
@@ -224,6 +235,7 @@ def test_compute_profiling_cpu_stop_when_not_running(neon_simple_env: NeonEnv):
         assert exc_info.value.response.status_code == 412
 
 
+@run_only_on_default_postgres(reason="test doesn't use postgres")
 def test_compute_profiling_cpu_start_arguments_validation_works(neon_simple_env: NeonEnv):
     """
     Test that CPU profiling start request properly validated the

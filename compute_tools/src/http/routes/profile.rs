@@ -129,6 +129,9 @@ pub(in crate::http) async fn profile_start(
     let pg_pid = Pid::from_raw(crate::compute::PG_PID.load(Ordering::SeqCst) as _);
 
     let options = crate::profiling::ProfileGenerationOptions {
+        #[cfg(feature = "testing")]
+        run_with_sudo: false,
+        #[cfg(not(feature = "testing"))]
         run_with_sudo: true,
         perf_binary_path: None,
         process_pid: pg_pid,
@@ -153,7 +156,7 @@ pub(in crate::http) async fn profile_start(
     let pprof_data = match pprof_data {
         Ok(data) => data,
         Err(e) => {
-            tracing::error!(%e, "failed to generate pprof data");
+            // tracing::error!(%e, "failed to generate pprof data");
             return JsonResponse::create_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to generate pprof data: {e}"),
