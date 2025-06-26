@@ -82,8 +82,12 @@ impl From<&Server> for Router<Arc<ComputeNode>> {
             Server::External {
                 config, compute_id, ..
             } => {
-                let unauthenticated_router =
-                    Router::<Arc<ComputeNode>>::new().route("/metrics", get(metrics::get_metrics));
+                let unauthenticated_router = Router::<Arc<ComputeNode>>::new()
+                    .route("/metrics", get(metrics::get_metrics))
+                    .route(
+                        "/profile/cpu",
+                        get(profile::profile_start).delete(profile::profile_stop),
+                    );
 
                 let authenticated_router = Router::<Arc<ComputeNode>>::new()
                     .route("/lfc/prewarm", get(lfc::prewarm_state).post(lfc::prewarm))
@@ -96,10 +100,6 @@ impl From<&Server> for Router<Arc<ComputeNode>> {
                     .route("/metrics.json", get(metrics_json::get_metrics))
                     .route("/status", get(status::get_status))
                     .route("/terminate", post(terminate::terminate))
-                    .route(
-                        "/profile/cpu",
-                        get(profile::profile_start).delete(profile::profile_stop),
-                    )
                     .layer(AsyncRequireAuthorizationLayer::new(Authorize::new(
                         compute_id.clone(),
                         config.jwks.clone(),

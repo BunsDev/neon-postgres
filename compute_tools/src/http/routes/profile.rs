@@ -4,7 +4,7 @@
 //! postgres processes.
 //!
 //! The profiling is done using the `perf` tool, which is expected to be
-//! available at `/usr/bin/perf`.
+//! available somewhere in `$PATH`.
 use std::sync::atomic::Ordering;
 
 use axum::extract::Query;
@@ -15,8 +15,6 @@ use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 
 use crate::http::JsonResponse;
-
-const PERF_BINARY_PATH: &str = "/usr/bin/perf";
 
 static CANCEL_CHANNEL: Lazy<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
     Lazy::new(|| Mutex::new(None));
@@ -131,8 +129,8 @@ pub(in crate::http) async fn profile_start(
     let pg_pid = Pid::from_raw(crate::compute::PG_PID.load(Ordering::SeqCst) as _);
 
     let options = crate::profiling::ProfileGenerationOptions {
-        run_with_sudo: false,
-        perf_binary_path: Some(PERF_BINARY_PATH.as_ref()),
+        run_with_sudo: true,
+        perf_binary_path: None,
         process_pid: pg_pid,
         follow_forks: true,
         sampling_frequency: request.sampling_frequency as u32,

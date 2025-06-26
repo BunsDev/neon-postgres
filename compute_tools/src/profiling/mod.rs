@@ -215,36 +215,18 @@ pub async fn generate_pprof_using_perf<S: AsRef<str>>(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    // std::thread::spawn(async move || {
-    //     if let Some(mut rx) = options.should_stop {
-    //         tokio::select! {
-    //             _ = &mut rx => {
-    //                 tracing::debug!("Received shutdown signal, stopping perf...");
-    //             }
-    //             _ = tokio::time::sleep(options.timeout) => {
-    //                 tracing::debug!("Timeout reached, stopping perf...");
-    //             }
-    //         }
-    //     } else {
-    //         std::thread::sleep(options.timeout);
-    //         tracing::debug!("Timeout reached, stopping perf...");
-    //     }
-
-    //     let _ = perf_record_command.kill();
-    // });
-
     if let Some(mut rx) = options.should_stop {
         tokio::select! {
             _ = &mut rx => {
-                println!("Received shutdown signal, stopping perf...");
+                tracing::trace!("Received shutdown signal, stopping perf...");
             }
             _ = tokio::time::sleep(options.timeout) => {
-                println!("Timeout reached, stopping perf...");
+                tracing::trace!("Timeout reached, stopping perf...");
             }
         }
     } else {
         tokio::time::sleep(options.timeout).await;
-        println!("Timeout reached, stopping perf...");
+        tracing::trace!("Timeout reached, stopping perf...");
     }
 
     let _ = perf_record_command.kill();
