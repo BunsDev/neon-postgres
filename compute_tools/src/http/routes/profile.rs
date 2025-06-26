@@ -153,7 +153,7 @@ pub(in crate::http) async fn profile_start(
     let pprof_data = match pprof_data {
         Ok(data) => data,
         Err(e) => {
-            tracing::error!("Failed to generate pprof data: {e}");
+            tracing::error!(%e, "failed to generate pprof data");
             return JsonResponse::create_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to generate pprof data: {e}"),

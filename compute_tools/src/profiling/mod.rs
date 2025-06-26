@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use flate2::{Compression, write::GzEncoder};
 use inferno::collapse::Collapse;
 use nix::{libc::pid_t, unistd::Pid};
@@ -156,7 +156,7 @@ pub async fn generate_pprof_using_perf<S: AsRef<str>>(
     check_perf_runs(
         perf_binary_path
             .to_str()
-            .ok_or(anyhow!("Couldn't reconstruct perf binary path as string."))?,
+            .context("Couldn't reconstruct perf binary path as string.")?,
         options.run_with_sudo,
     )?;
 

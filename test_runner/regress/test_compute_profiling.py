@@ -10,6 +10,8 @@ from fixtures.neon_fixtures import NeonEnv
 from google.protobuf.message import Message
 from requests import HTTPError
 
+from compute.test_runner.fixtures.utils import run_only_on_default_postgres
+
 
 def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | None):
     """
@@ -21,17 +23,21 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
             event.set()
 
         status, response = client.start_profiling_cpu(100, 3)
-        if status == 200:
-            log.info("CPU profiling finished")
-            profile: Any = Profile()
-            Message.ParseFromString(profile, response)
-            return profile
-        elif status == 204:
-            log.error("CPU profiling was stopped")
-            raise HTTPError("Failed to finish CPU profiling: was stopped.")
-        elif status == 208:
-            log.error("CPU profiling is already in progress, nothing to do")
-            raise HTTPError("Failed to finish CPU profiling: profiling is already in progress.")
+        match status:
+            case 200:
+                log.info("CPU profiling finished")
+                profile: Any = Profile()
+                Message.ParseFromString(profile, response)
+                return profile
+            case 204:
+                log.error("CPU profiling was stopped")
+                raise HTTPError("Failed to finish CPU profiling: was stopped.")
+            case 208:
+                log.error("CPU profiling is already in progress, nothing to do")
+                raise HTTPError("Failed to finish CPU profiling: profiling is already in progress.")
+            case _:
+                log.error(f"Failed to finish CPU profiling, unexpected status {status}")
+                raise HTTPError(f"Failed to finish CPU profiling, unexpected status: {status}")
     except Exception as e:
         log.error(f"Error finishing CPU profiling: {e}")
         raise
@@ -83,6 +89,7 @@ def _wait_and_assert_cpu_profiling(http_client: EndpointHttpClient, event: threa
         )
 
 
+@run_only_on_default_postgres(reason="test doesn't use postgres")
 def test_compute_profiling_cpu_with_timeout(neon_simple_env: NeonEnv):
     """
     Test that CPU profiling works correctly with timeout.
