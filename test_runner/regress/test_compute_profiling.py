@@ -1,14 +1,13 @@
 import threading
-import pytest
 import time
 
-from requests import HTTPError
-
+import pytest
+from data import profile_pb2
 from fixtures.endpoint.http import EndpointHttpClient
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnv
 from google.protobuf.message import Message
-from data import profile_pb2
+from requests import HTTPError
 
 
 def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | None):
@@ -28,10 +27,10 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
             return profile
         elif status == 204:
             log.error("CPU profiling was stopped")
-            raise HTTPError(f"Failed to finish CPU profiling: was stopped.")
+            raise HTTPError("Failed to finish CPU profiling: was stopped.")
         elif status == 208:
             log.error("CPU profiling is already in progress, nothing to do")
-            raise HTTPError(f"Failed to finish CPU profiling: profiling is already in progress.")
+            raise HTTPError("Failed to finish CPU profiling: profiling is already in progress.")
     except Exception as e:
         log.error(f"Error finishing CPU profiling: {e}")
         raise

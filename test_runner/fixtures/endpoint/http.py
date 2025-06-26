@@ -1,5 +1,4 @@
 from __future__ import annotations
-from typing import Tuple
 
 import urllib.parse
 from enum import StrEnum
@@ -97,7 +96,7 @@ class EndpointHttpClient(requests.Session):
 
     def start_profiling_cpu(
         self, sampling_frequency: int, timeout_seconds: int
-    ) -> Tuple[int, bytes]:
+    ) -> tuple[int, bytes]:
         url = f"http://localhost:{self.external_port}/profile/cpu"
         params = {
             "sampling_frequency": sampling_frequency,
