@@ -1595,36 +1595,31 @@ neon_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, const vo
 {
 	XLogRecPtr	lsn;
 	RelKindEntry *entry;
-	bool unlogged;
-	uint8 flags = 0;
+	RelKind relkind = RELKIND_UNKNOWN;
 
 	switch (reln->smgr_relpersistence)
 	{
 		case 0:
-			entry = get_cached_relkind(InfoFromSMgrRel(reln), &flags);
+			entry = get_cached_relkind(InfoFromSMgrRel(reln), &relkind);
 			if (entry)
 			{
 				/* We do not know relation persistence: let's determine it */
 #ifndef DEBUG_COMPARE_LOCAL
 				/* This is a bit tricky. Check if the relation exists locally */
-				unlogged = mdexists(reln, forknum);
+				relkind = mdexists(reln, forknum) ? RELKIND_UNLOGGED : RELKIND_PERMANENT;
 #else
-				unlogged = mdexists(reln, INIT_FORKNUM);
+				relkind = mdexists(reln, INIT_FORKNUM) ? RELKIND_UNLOGGED : RELKIND_PERMANENT;
 #endif
-				store_cached_relkind(entry, unlogged ? RELKIND_UNLOGGED : 0);
+				store_cached_relkind(entry, relkind);
 			}
-			else
-			{
-				unlogged = (flags & (RELKIND_UNLOGGED_BUILD|RELKIND_UNLOGGED)) != 0;
-			}
-			if (unlogged)
+			if (relkind == RELKIND_UNLOGGED || relkind == RELKIND_UNLOGGED_BUILD)
 			{
 #if PG_MAJORVERSION_NUM >= 17
 				mdwritev(reln, forknum, blocknum, &buffer, 1, skipFsync);
 #else
 				mdwrite(reln, forknum, blocknum, buffer, skipFsync);
 #endif
-				if (flags & RELKIND_UNLOGGED_BUILD)
+				if (relkind == RELKIND_UNLOGGED_BUILD)
 				{
 					unlock_cached_relkind();
 				}
@@ -1687,33 +1682,27 @@ neon_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			 const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
 	RelKindEntry *entry;
-	bool unlogged;
-	uint8 flags = 0;
-
+	RelKind relkind = RELKIND_UNKNOWN;
 	switch (reln->smgr_relpersistence)
 	{
 		case 0:
-			entry = get_cached_relkind(InfoFromSMgrRel(reln), &flags);
+			entry = get_cached_relkind(InfoFromSMgrRel(reln), &relkind);
 			if (entry)
 			{
 				/* We do not know relation persistence: let's determine it */
 #ifndef DEBUG_COMPARE_LOCAL
 				/* This is a bit tricky. Check if the relation exists locally */
-				unlogged = mdexists(reln, forknum);
+				relkind = mdexists(reln, forknum) ? RELKIND_UNLOGGED : RELKIND_PERMANENT;
 #else
-				unlogged = mdexists(reln, INIT_FORKNUM);
+				relkind = mdexists(reln, INIT_FORKNUM) ? RELKIND_UNLOGGED : RELKIND_PERMANENT;
 #endif
-				store_cached_relkind(entry, unlogged ? RELKIND_UNLOGGED : 0);
+				store_cached_relkind(entry, relkind);
 			}
-			else
-			{
-				unlogged = (flags & (RELKIND_UNLOGGED_BUILD|RELKIND_UNLOGGED)) != 0;
-			}
-			if (unlogged)
+			if (relkind == RELKIND_UNLOGGED || relkind == RELKIND_UNLOGGED_BUILD)
 			{
 				/* It exists locally. Guess it's unlogged then. */
 				mdwritev(reln, forknum, blkno, buffers, nblocks, skipFsync);
-				if (flags & RELKIND_UNLOGGED_BUILD)
+				if (relkind == RELKIND_UNLOGGED_BUILD)
 				{
 					unlock_cached_relkind();
 				}
@@ -2000,7 +1989,7 @@ neon_start_unlogged_build(SMgrRelation reln)
 		case RELPERSISTENCE_TEMP:
 		case RELPERSISTENCE_UNLOGGED:
 			unlogged_build_rel_info = InfoFromSMgrRel(reln);
-			unlogged_build_rel_entry = set_cached_relkind(unlogged_build_rel_info, RELKIND_UNLOGGED|RELKIND_UNLOGGED_BUILD);
+			unlogged_build_rel_entry = set_cached_relkind(unlogged_build_rel_info, RELKIND_UNLOGGED);
 			unlogged_build_phase = UNLOGGED_BUILD_NOT_PERMANENT;
 #ifdef DEBUG_COMPARE_LOCAL
 			if (!IsParallelWorker())
@@ -2129,7 +2118,7 @@ neon_end_unlogged_build(SMgrRelation reln)
 								InfoFromNInfoB(rinfob),
 								MAIN_FORKNUM);
 
-		clear_cached_relkind_flags(unlogged_build_rel_entry, RELKIND_UNLOGGED_BUILD);
+		update_cached_relkind(unlogged_build_rel_entry, RELKIND_PERMANENT);
 
 		/* Remove local copy */
 		for (int forknum = 0; forknum <= MAX_FORKNUM; forknum++)
