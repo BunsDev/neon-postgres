@@ -115,7 +115,6 @@ def test_compute_profiling_cpu_with_timeout(neon_simple_env: NeonEnv):
     thread.start()
 
     def insert_rows():
-        event.wait()  # Wait for profiling to be ready to start
         lfc_conn = endpoint.connect(dbname="profiling_test")
         lfc_cur = lfc_conn.cursor()
         n_records = 10000
@@ -127,6 +126,9 @@ def test_compute_profiling_cpu_with_timeout(neon_simple_env: NeonEnv):
         log.info(f"Inserted {n_records} rows")
 
     thread2 = threading.Thread(target=insert_rows)
+
+    event.wait()  # Wait for profiling to be ready to start
+    time.sleep(4) # Give some time for the profiling to start
     thread2.start()
 
     thread.join(timeout=60)
