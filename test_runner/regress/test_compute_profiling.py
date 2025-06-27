@@ -26,7 +26,7 @@ def _start_profiling_cpu(client: EndpointHttpClient, event: threading.Event | No
         if event is not None:
             event.set()
 
-        status, response = client.start_profiling_cpu(100, 3)
+        status, response = client.start_profiling_cpu(100, 10)
         match status:
             case 200:
                 log.debug("CPU profiling finished")
@@ -155,7 +155,7 @@ def test_compute_profiling_cpu_start_and_stop(neon_simple_env: NeonEnv):
     thread.start()
 
     event.wait()  # Wait for profiling to be ready to start
-    time.sleep(1)  # Give some time for the profiling to start
+    time.sleep(4)  # Give some time for the profiling to start
     _stop_profiling_cpu(http_client, None)
 
     # Should raise as the profiling is already stopped.
@@ -172,7 +172,8 @@ def test_compute_profiling_cpu_start_and_stop(neon_simple_env: NeonEnv):
 @run_only_on_default_postgres(reason="test doesn't use postgres")
 def test_compute_profiling_cpu_conflict(neon_simple_env: NeonEnv):
     """
-    Test that CPU profiling can be started and stopped correctly.
+    Test that CPU profiling can be started once and the second time
+    it will throw an error as it is already running.
     """
     env = neon_simple_env
     endpoint = env.endpoints.create_start("main")
@@ -203,7 +204,7 @@ def test_compute_profiling_cpu_conflict(neon_simple_env: NeonEnv):
     thread2 = threading.Thread(target=insert_rows)
 
     event.wait()  # Wait for profiling to be ready to start
-    time.sleep(1)  # Give some time for the profiling to start
+    time.sleep(4)  # Give some time for the profiling to start
 
     thread2.start()
 
